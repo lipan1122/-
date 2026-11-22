@@ -1,0 +1,56 @@
+<!--*
+ * 绑定手机号
+ *
+ * 接口：POST /api/mini/bind（需要 Bearer token）
+ *   入参：{ mobile, guestName }
+ *   服务端用手机号匹配酒店既有客史（匹配不到就新建一条），再绑定到当前 openid。
+ -->
+<view class="container">
+  <view class="card">
+    <text class="title">绑定手机号</text>
+    <view class="muted gap-top">
+      绑定后可以查看会员等级、储值余额、积分与历史订单。手机号只用于匹配酒店会员档案。
+    </view>
+
+    <view class="divider"></view>
+
+    <view class="field">
+      <text class="field-label">姓名</text>
+      <input
+        class="field-input"
+        placeholder="请填写姓名（与入住登记一致）"
+        placeholder-class="field-input-placeholder"
+        value="{{guestName}}"
+        maxlength="30"
+        bindinput="onNameInput"
+      />
+    </view>
+    <view class="field">
+      <text class="field-label">手机号</text>
+      <input
+        class="field-input"
+        type="number"
+        placeholder="11 位手机号"
+        placeholder-class="field-input-placeholder"
+        value="{{mobile}}"
+        maxlength="11"
+        bindinput="onMobileInput"
+      />
+    </view>
+  </view>
+
+  <view wx:if="{{error}}" class="error-box">{{error}}</view>
+
+  <view wx:if="{{tip}}" class="card">
+    <text class="chip chip-green">已绑定</text>
+    <view class="gap-top subtitle">{{tip}}</view>
+  </view>
+
+  <button class="btn" bindtap="onSubmit" disabled="{{submitting}}">
+    {{submitting ? '绑定中…' : '确认绑定'}}
+  </button>
+
+  <view class="muted gap-top" style="text-align: center; padding-top: 8rpx;">
+    一个微信只能绑定一个手机号，换号请重新绑定一次
+  </view>
+</view>

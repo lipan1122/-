@@ -1,0 +1,40 @@
+# 依赖与构建产物
+node_modules/
+.next/
+*.tsbuildinfo
+dist/
+.tmp/
+
+# 本地数据与密钥（含客人资料和密码哈希，绝不能提交）
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.db-journal
+# 数据库备份：`cp pms.db pms.db.bak-<日期>` 是运维常用操作，文件名不带 .db 后缀，
+# 上面那三条通配符必然漏掉（整改清单 P1-35）。备份里同样有客人资料与密码哈希。
+data/*.bak-*
+# 环境变量：`.env.production` / `.env.development` / `.env.staging` 这类
+# 带环境名的文件原来一条都没盖住（只忽略了 .env / .env.local / .env.*.local），
+# 而 .env.production 恰恰最可能装着真实的生产库路径与密钥。
+.env
+.env.local
+.env.*.local
+.env.*
+# 但模板必须留在仓库里，否则新同事不知道该配哪些变量
+!.env.example
+
+# 部署与工具产物
+.vercel/
+dsh-home.*.vercel.cli/
+.src-backup-*/
+# 同类备份目录：改功能前 cp -r src 留下的快照。
+# 原来只排除了 .src-backup-*，workbuddy / before-clean / before-bizdate 这些
+# 名字不同的备份全都漏了，一 git add 就会把三份完整旧源码（约 500 个文件）推进仓库。
+.src-workbuddy-*/
+.src-before-*/
+/.src-*/
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db

@@ -1,0 +1,86 @@
+<!--*
+ * 首页：查房 + 房型列表
+ *
+ * 数据来源：GET /api/mini/rooms?checkIn=&checkOut=
+ * 不需要登录 —— 客人打开小程序第一屏就能看到房价房量。
+ -->
+<view class="container">
+  <!-- 查房条件 -->
+  <view class="card">
+    <view class="row">
+      <text class="title">选择入住日期</text>
+      <text class="chip">{{nights}} 晚</text>
+    </view>
+
+    <view class="date-row gap-top">
+      <picker mode="date" value="{{checkIn}}" start="{{minDate}}" bindchange="onCheckInChange">
+        <view class="date-box">
+          <text class="muted">入住</text>
+          <text class="date-value">{{checkIn}}</text>
+        </view>
+      </picker>
+      <text class="date-arrow">→</text>
+      <picker mode="date" value="{{checkOut}}" start="{{minDate}}" bindchange="onCheckOutChange">
+        <view class="date-box">
+          <text class="muted">离店</text>
+          <text class="date-value">{{checkOut}}</text>
+        </view>
+      </picker>
+    </view>
+
+    <button class="btn" bindtap="onQuery" disabled="{{loading}}">
+      {{loading ? '查询中…' : '查询房量'}}
+    </button>
+  </view>
+
+  <!-- 错误提示（网络 / 服务端地址 / 日期非法） -->
+  <view wx:if="{{error}}" class="error-box">{{error}}</view>
+
+  <!-- 房型列表 -->
+  <view wx:if="{{loading}}" class="loading-box">正在查询实时房量…</view>
+
+  <view wx:elif="{{roomTypes.length === 0}}" class="card empty">
+    该日期暂无可用房型
+    <view class="muted gap-top">换个日期再试，或直接联系酒店前台</view>
+  </view>
+
+  <block wx:else>
+    <view class="card" wx:for="{{roomTypes}}" wx:key="roomTypeId">
+      <view class="row row-start">
+        <view class="room-main">
+          <text class="title">{{item.name}}</text>
+          <view class="muted gap-top">
+            <text wx:if="{{item.bedType}}">{{item.bedType}}</text>
+            <text wx:if="{{item.maxOccupancy}}"> · 可住 {{item.maxOccupancy}} 人</text>
+            <text> · 剩 {{item.remainingRooms}} 间</text>
+          </view>
+        </view>
+        <view class="room-price">
+          <text class="price">¥{{item.totalPriceText}}</text>
+          <text class="price-unit">/{{nights}}晚</text>
+          <view class="muted">¥{{item.avgPriceText}}/晚</view>
+        </view>
+      </view>
+
+      <view class="row gap-top">
+        <text class="chip {{item.soldOut ? 'chip-gray' : 'chip-green'}}">
+          {{item.soldOut ? '已售完' : '可预订'}}
+        </text>
+        <button
+          class="btn-small"
+          data-id="{{item.roomTypeId}}"
+          data-name="{{item.name}}"
+          data-total="{{item.totalPrice}}"
+          data-remaining="{{item.remainingRooms}}"
+          bindtap="onBook"
+          disabled="{{item.soldOut}}"
+        >
+          立即预订
+        </button>
+      </view>
+    </view>
+    <view class="muted" style="text-align: center; padding: 8rpx 0 24rpx;">
+      房量为实时计算，最终以到店确认为准
+    </view>
+  </block>
+</view>

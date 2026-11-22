@@ -1,0 +1,13 @@
+/* 我的订单专有样式 */
+
+.order-type {
+  font-size: 30rpx;
+  font-weight: 500;
+  color: #1c1c1e;
+}
+
+.order-amount {
+  font-size: 30rpx;
+  font-weight: 600;
+  color: #1c1c1e;
+}

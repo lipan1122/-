@@ -1,0 +1,23 @@
+node_modules
+.next
+.vercel
+.tmp
+dist
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.db-journal
+# 数据库备份（整改清单 P1-35）：pms.db.bak-<日期> 不在 data/*.db 通配范围内，
+# 但它和 .db 一样含客人资料与密码哈希，不能被打进镜像层。
+data/*.bak-*
+*.tsbuildinfo
+*.log
+.git
+.src-backup-*
+dsh-home.*.vercel.cli
+.env
+.env.local
+.env.*.local
+# 带环境名的 env 文件（.env.production 等）同样不能进镜像
+.env.*
+!.env.example

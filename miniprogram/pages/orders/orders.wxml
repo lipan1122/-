@@ -1,0 +1,47 @@
+<!--*
+ * 我的订单
+ *
+ * 数据来源：GET /api/mini/bookings（需要 Bearer token）
+ * 服务端按「绑定客史 guest_id」或「小程序用户手机号」匹配订单。
+ -->
+<view class="container">
+  <view wx:if="{{loading}}" class="loading-box">正在加载订单…</view>
+
+  <view wx:if="{{error}}" class="error-box">{{error}}</view>
+
+  <!-- 三种状态：未绑定身份 / 已绑定但无订单 / 有订单列表 -->
+  <block wx:if="{{!loading}}">
+    <view wx:if="{{!bound}}" class="card empty">
+      还没有关联的身份信息
+      <view class="muted gap-top">绑定手机号后可以查看历史订单</view>
+      <button class="btn" bindtap="goBind">去绑定手机号</button>
+    </view>
+
+    <view wx:elif="{{bookings.length === 0}}" class="card empty">
+      暂无订单
+      <view class="muted gap-top">去首页选一个房型下单吧</view>
+      <button class="btn" bindtap="goBook">去查房</button>
+    </view>
+    <block wx:else>
+      <view class="card" wx:for="{{bookings}}" wx:key="bookingId">
+        <view class="row">
+          <text class="subtitle">{{item.bookingNo}}</text>
+          <text class="chip {{item.chipClass}}">{{item.statusLabel}}</text>
+        </view>
+        <view class="divider"></view>
+        <view class="row">
+          <text class="order-type">{{item.roomTypeName}}</text>
+          <text class="muted">{{item.roomCount}} 间 · {{item.nights}} 晚</text>
+        </view>
+        <view class="row gap-top">
+          <text class="muted">{{item.checkInDate}} → {{item.checkOutDate}}</text>
+          <text class="order-amount">¥{{item.amountText}}</text>
+        </view>
+        <view class="row gap-top">
+          <text class="muted">下单时间 {{item.createdAtText}}</text>
+          <text class="muted">{{item.guestName}}</text>
+        </view>
+      </view>
+    </block>
+  </block>
+</view>

@@ -1,0 +1,39 @@
+{
+  "pages": [
+    "pages/index/index",
+    "pages/booking/booking",
+    "pages/orders/orders",
+    "pages/member/member",
+    "pages/bind/bind"
+  ],
+  "window": {
+    "navigationBarTitleText": "酒店预订",
+    "navigationBarBackgroundColor": "#ffffff",
+    "navigationBarTextStyle": "black",
+    "backgroundColor": "#f2f2f7",
+    "backgroundTextStyle": "dark"
+  },
+  "tabBar": {
+    "color": "#8e8e93",
+    "selectedColor": "#007aff",
+    "backgroundColor": "#ffffff",
+    "borderStyle": "white",
+    "list": [
+      {
+        "pagePath": "pages/index/index",
+        "text": "查房预订"
+      },
+      {
+        "pagePath": "pages/orders/orders",
+        "text": "我的订单"
+      },
+      {
+        "pagePath": "pages/member/member",
+        "text": "会员中心"
+      }
+    ]
+  },
+  "style": "v2",
+  "sitemapLocation": "sitemap.json",
+  "lazyCodeLoading": "requiredComponents"
+}

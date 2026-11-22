@@ -1,0 +1,82 @@
+<!--*
+ * 会员中心
+ *
+ * 数据来源：GET /api/mini/member（需要 Bearer token）
+ *   未绑定手机号时返回 code = NOT_BOUND，页面引导去绑定
+ *   等级取 guests.vip_level，储值余额取 member_wallet_ledger 求和，积分取 score_records
+ -->
+<view class="container">
+  <view wx:if="{{loading}}" class="loading-box">正在加载会员信息…</view>
+
+  <view wx:if="{{error}}" class="error-box">{{error}}</view>
+
+  <!-- 未绑定 -->
+  <block wx:if="{{!loading && !bound}}">
+    <view class="card">
+      <text class="title">还没绑定会员信息</text>
+      <view class="muted gap-top">绑定手机号后，可以查看会员等级、储值余额、积分与历史订单</view>
+      <button class="btn" bindtap="goBind">绑定手机号</button>
+    </view>
+  </block>
+
+  <!-- 已绑定 -->
+  <block wx:if="{{!loading && bound}}">
+    <view class="card profile">
+      <view class="row">
+        <view>
+          <text class="title">{{member.guestName}}</text>
+          <view class="muted gap-top">{{member.mobile || '未留手机号'}}</view>
+        </view>
+        <text class="chip chip-green">{{member.levelLabel}}</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row">
+        <text class="muted">会员卡</text>
+        <text class="subtitle">{{member.cardText}}</text>
+      </view>
+    </view>
+
+    <!-- 四个指标 -->
+    <view class="card">
+      <view class="stat-grid">
+        <view class="stat">
+          <text class="stat-value">¥{{member.balanceText}}</text>
+          <text class="muted">储值余额</text>
+        </view>
+        <view class="stat">
+          <text class="stat-value">{{member.points}}</text>
+          <text class="muted">可用积分</text>
+        </view>
+        <view class="stat">
+          <text class="stat-value">¥{{member.totalSpendText}}</text>
+          <text class="muted">累计消费</text>
+        </view>
+        <view class="stat">
+          <text class="stat-value">{{member.stayCount}}</text>
+          <text class="muted">入住次数</text>
+        </view>
+      </view>
+    </view>
+
+    <view class="card">
+      <view class="row" bindtap="goOrders">
+        <text class="subtitle">我的订单</text>
+        <text class="muted">查看 ›</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row" bindtap="goBind">
+        <text class="subtitle">更换绑定手机号</text>
+        <text class="muted">去修改 ›</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row" bindtap="onLogout">
+        <text class="subtitle" style="color: #e0453c;">退出登录</text>
+        <text class="muted">清除本机登录状态 ›</text>
+      </view>
+    </view>
+
+    <view class="muted" style="text-align: center; padding: 8rpx 0 24rpx;">
+      储值余额与积分以酒店前台系统为准
+    </view>
+  </block>
+</view>

@@ -1,0 +1,11 @@
+/* 下单页专有样式：picker 行与合计区 */
+
+.picker-value {
+  font-size: 28rpx;
+  color: #1c1c1e;
+  text-align: right;
+}
+
+.field .picker-value {
+  flex: 1;
+}

@@ -1,0 +1,222 @@
+/**
+ * 全局样式：iOS 风格卡片
+ *
+ * 约定：
+ *   · 背景 #f2f2f7（iOS 系统分组背景），卡片纯白 + 圆角 20rpx
+ *   · 主色 #007aff（iOS 蓝），价格/警示 #ff3b30
+ *   · 字号只用 22 / 24 / 26 / 28 / 32 / 36 rpx 六档，避免页面之间不一致
+ *
+ * 页面级 wxss 只写该页特有的布局，通用卡片 / 按钮 / 表单行一律用这里的类。
+ */
+
+page {
+  background: #f2f2f7;
+  color: #1c1c1e;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", Helvetica, sans-serif;
+  font-size: 28rpx;
+  line-height: 1.5;
+}
+
+/* ---------- 布局 ---------- */
+.container {
+  padding: 24rpx 24rpx 40rpx;
+}
+
+.card {
+  background: #ffffff;
+  border-radius: 20rpx;
+  padding: 28rpx;
+  margin-bottom: 20rpx;
+  box-shadow: 0 2rpx 10rpx rgba(0, 0, 0, 0.04);
+}
+
+.card-tight {
+  padding: 0;
+  overflow: hidden;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.row-start {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.gap-top {
+  margin-top: 16rpx;
+}
+
+.muted {
+  color: #8e8e93;
+  font-size: 24rpx;
+}
+
+/* ---------- 文本 ---------- */
+.title {
+  font-size: 32rpx;
+  font-weight: 600;
+  color: #1c1c1e;
+}
+
+.subtitle {
+  font-size: 26rpx;
+  color: #3a3a3c;
+  font-weight: 500;
+}
+
+.price {
+  color: #ff3b30;
+  font-size: 34rpx;
+  font-weight: 600;
+}
+
+.price-unit {
+  font-size: 22rpx;
+  color: #8e8e93;
+  font-weight: 400;
+  margin-left: 4rpx;
+}
+
+/* ---------- 标签 ---------- */
+.chip {
+  display: inline-block;
+  padding: 4rpx 16rpx;
+  border-radius: 999rpx;
+  font-size: 22rpx;
+  background: #eef4ff;
+  color: #007aff;
+}
+
+.chip-gray {
+  background: #f2f2f7;
+  color: #8e8e93;
+}
+
+.chip-green {
+  background: #e8f8ec;
+  color: #1c9e4a;
+}
+
+.chip-orange {
+  background: #fff3e6;
+  color: #c26a00;
+}
+
+.chip-red {
+  background: #ffeceb;
+  color: #e0453c;
+}
+
+/* ---------- 按钮 ---------- */
+.btn {
+  height: 80rpx;
+  line-height: 80rpx;
+  text-align: center;
+  border-radius: 16rpx;
+  background: #007aff;
+  color: #ffffff;
+  font-size: 30rpx;
+  font-weight: 500;
+  margin-top: 20rpx;
+}
+
+.btn::after {
+  border: none;
+}
+
+.btn-ghost {
+  background: #ffffff;
+  color: #007aff;
+  border: 1rpx solid #cfe3ff;
+}
+
+.btn[disabled] {
+  background: #c7c7cc;
+  color: #ffffff;
+}
+
+.btn-small {
+  height: 64rpx;
+  line-height: 64rpx;
+  font-size: 26rpx;
+  padding: 0 28rpx;
+  border-radius: 999rpx;
+  background: #007aff;
+  color: #ffffff;
+  margin: 0;
+}
+
+.btn-small::after {
+  border: none;
+}
+
+/* ---------- 表单 ---------- */
+.field {
+  display: flex;
+  align-items: center;
+  min-height: 96rpx;
+  border-bottom: 1rpx solid #f0f0f2;
+}
+
+.field:last-child {
+  border-bottom: none;
+}
+
+.field-label {
+  width: 170rpx;
+  flex-shrink: 0;
+  color: #3a3a3c;
+  font-size: 28rpx;
+}
+
+.field-input {
+  flex: 1;
+  font-size: 28rpx;
+  color: #1c1c1e;
+  height: 60rpx;
+}
+
+.field-input-placeholder {
+  color: #c7c7cc;
+}
+
+/* ---------- 状态 ---------- */
+.empty {
+  padding: 100rpx 0;
+  text-align: center;
+  color: #8e8e93;
+  font-size: 26rpx;
+}
+
+.error-box {
+  margin-bottom: 20rpx;
+  padding: 20rpx 24rpx;
+  border-radius: 16rpx;
+  background: #ffeceb;
+  color: #c0392b;
+  font-size: 26rpx;
+}
+
+.loading-box {
+  padding: 60rpx 0;
+  text-align: center;
+  color: #8e8e93;
+  font-size: 26rpx;
+}
+
+.divider {
+  height: 1rpx;
+  background: #f0f0f2;
+  margin: 20rpx 0;
+}
+
+/* 底部安全区：iPhone 有 Home Indicator 时按钮不被遮住 */
+.safe-bottom {
+  padding-bottom: calc(24rpx + constant(safe-area-inset-bottom));
+  padding-bottom: calc(24rpx + env(safe-area-inset-bottom));
+}

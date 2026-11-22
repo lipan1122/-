@@ -1,0 +1,1092 @@
+"use client";
+
+import Link from "next/link";
+import type { ReactNode, RefObject } from "react";
+import { useActionState, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { checkInAction } from "@/app/(main)/frontdesk/actions";
+import type { CheckInState } from "@/app/(main)/frontdesk/actions";
+import { addDays, fmtMoney, nightsBetween, todayStr } from "@/lib/utils";
+
+export type VacantRoom = {
+  id: number;
+  room_no: string;
+  floor: number | null;
+  status: string;
+};
+
+export type RoomTypeGroup = {
+  id: number;
+  name: string;
+  base_price: number;
+  max_occupancy: number | null;
+  rooms: VacantRoom[];
+};
+
+export type ChannelOption = { id: number; name: string };
+
+export type CompanyOption = { id: number; name: string };
+
+export type MemberOption = {
+  id: number;
+  name: string;
+  mobile: string;
+  idNo: string;
+  vipLevel: number;
+};
+
+export type SalesmanOption = { name: string; role: string };
+
+export type BookingPrefill = {
+  id: number;
+  bookingNo: string;
+  guestName: string;
+  mobile: string;
+  checkInDate: string;
+  checkOutDate: string;
+  nights: number;
+  rate: number;
+  deposit: number;
+  guestCount: number;
+  channelId: number | null;
+  channelName: string | null;
+  roomTypeId: number | null;
+  roomTypeName: string | null;
+  roomIds: number[];
+  teamName: string;
+  memberCard: string;
+  rateCode: string;
+  companyName: string;
+  salesman: string;
+  packageCode: string;
+  invoiceParty: string;
+  payType: string;
+  breakfast: number;
+  channelOrderNo: string;
+};
+
+export type CheckInMode = "day" | "hour";
+
+type Props = {
+  mode: CheckInMode;
+  roomTypes: RoomTypeGroup[];
+  channels: ChannelOption[];
+  companies: CompanyOption[];
+  members: MemberOption[];
+  salesmen: SalesmanOption[];
+  prefill: BookingPrefill | null;
+  defaultRoomIds: number[];
+  today: string;
+  nowTime: string;
+  checkOutTimeDefault: string;
+  querySuffix: string;
+};
+
+type FlatRoom = VacantRoom & {
+  room_type_id: number;
+  room_type_name: string;
+  base_price: number;
+};
+
+type GuestDraft = {
+  name: string;
+  mobile: string;
+  idType: string;
+  idNo: string;
+  gender: string;
+  breakfast: string;
+};
+
+/** 房价代码：与 actions.ts 中的 RATE_FACTORS 保持一致 */
+const RATE_CODES = [
+  { value: "门市价", label: "门市价", factor: 1 },
+  { value: "协议价", label: "协议价（9 折）", factor: 0.9 },
+  { value: "会员价", label: "会员价（85 折）", factor: 0.85 },
+] as const;
+
+const PAY_TYPES = ["到店付款", "预付", "挂账"];
+const INVOICE_PARTIES = ["酒店", "个人"];
+const ID_TYPES = ["身份证", "护照", "其他"];
+const GENDERS = ["男", "女"];
+const BREAKFASTS = ["0", "1", "2", "3"];
+const HOUR_OPTIONS = [2, 4, 6];
+/** 钟点房每小时按门店基准价的 15% 计费（与 actions.ts 一致） */
+const HOURLY_FACTOR = 0.15;
+
+/** 房态色点：空净绿、空脏黄 */
+const STATUS_DOT: Record<string, string> = {
+  VC: "bg-emerald-500",
+  VD: "bg-amber-500",
+};
+
+function round2(n: number): number {
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+function emptyGuest(): GuestDraft {
+  return { name: "", mobile: "", idType: "身份证", idNo: "", gender: "男", breakfast: "0" };
+}
+
+/** 入住时间 + 时长 → 预计离店时间（仅用于钟点房提示） */
+function addHoursText(time: string, hours: number): string {
+  const [rawHour, rawMinute] = time.split(":");
+  const hour = Number(rawHour);
+  const minute = Number(rawMinute);
+  const total =
+    (((Number.isFinite(hour) ? hour : 0) * 60 + (Number.isFinite(minute) ? minute : 0) + hours * 60) %
+      (24 * 60) +
+      24 * 60) %
+    (24 * 60);
+  return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+}
+
+function vipText(vipLevel: number): string {
+  return vipLevel > 0 ? `VIP${Math.min(3, vipLevel)}` : "普通";
+}
+
+function TabLink({ href, active, label }: { href: string; active: boolean; label: string }) {
+  return (
+    <Link
+                prefetch={false}
+      href={href}
+      className={`-mb-px border-b-2 px-1 pb-2 text-[14px] transition-colors ${
+        active
+          ? "border-[#3fa855] font-medium text-[#2e8b46]"
+          : "border-transparent text-gray-500 hover:text-gray-700"
+      }`}
+    >
+      {label}
+    </Link>
+  );
+}
+
+/**
+ * 表单行（整改 P2-26a）：外层改成包裹式 `<label>`，
+ * 标签文字与内部控件自动建立隐式关联；原来只有 `<span>`，读屏读不到字段名。
+ */
+function Field({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <label className="flex min-w-0 items-center gap-2">
+      <span className="w-[64px] shrink-0 text-[12px] text-gray-500">{label}</span>
+      <div className="flex min-w-0 flex-1 items-center">{children}</div>
+    </label>
+  );
+}
+
+function HomeIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="h-3.5 w-3.5 fill-current" aria-hidden="true">
+      <path d="M12 3 2 12h3v9h6v-6h2v6h6v-9h3L12 3z" />
+    </svg>
+  );
+}
+
+function focusRef(ref: RefObject<HTMLInputElement | null>): void {
+  ref.current?.focus();
+  ref.current?.select();
+}
+
+export default function CheckInForm({
+  mode,
+  roomTypes,
+  channels,
+  companies,
+  members,
+  salesmen,
+  prefill,
+  defaultRoomIds,
+  today,
+  nowTime,
+  checkOutTimeDefault,
+  querySuffix,
+}: Props) {
+  const allRooms = useMemo<FlatRoom[]>(
+    () =>
+      roomTypes.flatMap((t) =>
+        t.rooms.map((r) => ({
+          ...r,
+          room_type_id: t.id,
+          room_type_name: t.name,
+          base_price: t.base_price,
+        }))
+      ),
+    [roomTypes]
+  );
+
+  const timeOptions = useMemo(() => {
+    const list: string[] = [];
+    for (let h = 0; h < 24; h += 1) {
+      for (const m of ["00", "15", "30", "45"]) {
+        list.push(`${String(h).padStart(2, "0")}:${m}`);
+      }
+    }
+    if (!list.includes(nowTime)) list.push(nowTime);
+    return list.sort();
+  }, [nowTime]);
+
+  const [state, formAction, pending] = useActionState<CheckInState, FormData>(checkInAction, {});
+  const router = useRouter();
+  // 入住成功后由客户端跳转到在住单列表（action 里 redirect 会被 useActionState 当成错误）
+  useEffect(() => {
+    if (!state.ok) return;
+    const t = setTimeout(() => {
+      router.push("/inhouse");
+      router.refresh();
+    }, 800);
+    return () => clearTimeout(t);
+  }, [state.ok, router]);
+
+  // 排房
+  const [selectedRoomIds, setSelectedRoomIds] = useState<number[]>(defaultRoomIds);
+  const [roomPanelOpen, setRoomPanelOpen] = useState(false);
+
+  // 本地模式（与 props.mode 同源初始化，快捷按钮可在页内切换）
+  const [localMode, setLocalMode] = useState<CheckInMode>(mode);
+
+  // 订单信息
+  const [teamName, setTeamName] = useState(prefill?.teamName ?? "");
+  const [memberCard, setMemberCard] = useState(prefill?.memberCard ?? "");
+  const [checkInDate, setCheckInDate] = useState(prefill?.checkInDate || today);
+  const [checkInTime, setCheckInTime] = useState(nowTime);
+  const initialNights = prefill && prefill.nights > 0 ? prefill.nights : 1;
+  const [nights, setNights] = useState(initialNights);
+  const [checkOutDate, setCheckOutDate] = useState(
+    prefill?.checkOutDate || todayStr(addDays(prefill?.checkInDate || today, initialNights))
+  );
+  const [checkOutTime, setCheckOutTime] = useState(checkOutTimeDefault);
+  const [hours, setHours] = useState(4);
+  const [company, setCompany] = useState(prefill?.companyName ?? "");
+  const [salesman, setSalesman] = useState(prefill?.salesman ?? "");
+  const [rateCode, setRateCode] = useState(prefill?.rateCode || "门市价");
+  const [channelId, setChannelId] = useState(
+    prefill?.channelId != null ? String(prefill.channelId) : ""
+  );
+  const [channelOrderNo, setChannelOrderNo] = useState(prefill?.channelOrderNo ?? "");
+  const [payType, setPayType] = useState(prefill?.payType || "到店付款");
+  const [packageCode, setPackageCode] = useState(prefill?.packageCode ?? "");
+  const [invoiceParty, setInvoiceParty] = useState(prefill?.invoiceParty || "酒店");
+  const [deposit, setDeposit] = useState(
+    prefill && prefill.deposit > 0 ? String(prefill.deposit) : ""
+  );
+  const [remark, setRemark] = useState("");
+
+  // 住客
+  const [guestDrafts, setGuestDrafts] = useState<GuestDraft[]>(() => [
+    {
+      name: prefill?.guestName ?? "",
+      mobile: prefill?.mobile ?? "",
+      idType: "身份证",
+      idNo: "",
+      gender: "男",
+      breakfast: String(prefill?.breakfast ?? 0),
+    },
+  ]);
+
+  // 字段聚焦引用
+  const teamRef = useRef<HTMLInputElement | null>(null);
+  const idNoRef = useRef<HTMLInputElement | null>(null);
+
+  // 提交后才展示字段级红字校验
+  const [submitted, setSubmitted] = useState(false);
+  const primaryName = guestDrafts[0]?.name.trim() ?? "";
+  const roomError = selectedRoomIds.length === 0;
+  const nameError = primaryName === "";
+  const showRoomError = submitted && roomError;
+  const showNameError = submitted && nameError;
+
+  const selectedSet = useMemo(() => new Set(selectedRoomIds), [selectedRoomIds]);
+  const selectedRooms = useMemo(
+    () => allRooms.filter((r) => selectedSet.has(r.id)),
+    [allRooms, selectedSet]
+  );
+
+  const matchedMember = useMemo(() => {
+    const q = memberCard.trim();
+    if (!q) return null;
+    const lq = q.toLowerCase();
+    return (
+      members.find(
+        (m) =>
+          String(m.id) === q ||
+          (m.mobile !== "" && m.mobile === q) ||
+          (m.idNo !== "" && m.idNo.toLowerCase() === lq)
+      ) ??
+      members.find((m) => (m.mobile !== "" && m.mobile.includes(q)) || m.name === q) ??
+      null
+    );
+  }, [memberCard, members]);
+
+  const rateFactor = RATE_CODES.find((r) => r.value === rateCode)?.factor ?? 1;
+  const rateOf = (basePrice: number) =>
+    round2(basePrice * rateFactor * (localMode === "hour" ? HOURLY_FACTOR * hours : 1));
+
+  const roomFee = selectedRooms.reduce(
+    (sum, room) => sum + rateOf(room.base_price) * (localMode === "hour" ? 1 : nights),
+    0
+  );
+  const depositNum = Math.max(0, Number(deposit) || 0);
+  const totalDeposit = depositNum * selectedRooms.length;
+
+  function countOf(typeId: number): number {
+    return selectedRooms.filter((r) => r.room_type_id === typeId).length;
+  }
+
+  function setTypeCount(type: RoomTypeGroup, next: number): void {
+    const limit = Math.max(
+      0,
+      Math.min(Math.trunc(Number.isFinite(next) ? next : 0), type.rooms.length)
+    );
+    setSelectedRoomIds((prev) => {
+      const others = prev.filter((id) => !type.rooms.some((r) => r.id === id));
+      return [...others, ...type.rooms.slice(0, limit).map((r) => r.id)];
+    });
+  }
+
+  function toggleRoom(roomId: number): void {
+    setSelectedRoomIds((prev) =>
+      prev.includes(roomId) ? prev.filter((id) => id !== roomId) : [...prev, roomId]
+    );
+  }
+
+  function changeNights(next: number): void {
+    const value = Math.min(365, Math.max(1, Math.trunc(Number.isFinite(next) ? next : 1)));
+    setNights(value);
+    setCheckOutDate(todayStr(addDays(checkInDate || today, value)));
+  }
+
+  function changeCheckInDate(value: string): void {
+    setCheckInDate(value);
+    if (value) setCheckOutDate(todayStr(addDays(value, nights)));
+  }
+
+  function changeCheckOutDate(value: string): void {
+    setCheckOutDate(value);
+    if (value && checkInDate && value > checkInDate) {
+      setNights(Math.max(1, nightsBetween(checkInDate, value)));
+    }
+  }
+
+  function updateGuest(index: number, patch: Partial<GuestDraft>): void {
+    setGuestDrafts((prev) => prev.map((g, i) => (i === index ? { ...g, ...patch } : g)));
+  }
+
+  function addGuest(): void {
+    setGuestDrafts((prev) => (prev.length >= 9 ? prev : [...prev, emptyGuest()]));
+  }
+
+  function removeGuest(index: number): void {
+    setGuestDrafts((prev) => (prev.length <= 1 ? prev : prev.filter((_, i) => i !== index)));
+  }
+
+  /** 快捷：切到钟点房并预设 4 小时 */
+  function startHourMode(): void {
+    setLocalMode("hour");
+    setHours(4);
+  }
+
+  const availableCount = allRooms.length;
+  const modeLabel = localMode === "hour" ? `${hours} 小时` : `${nights} 晚`;
+  const quickBtn =
+    "card flex flex-col items-start gap-1 px-3 py-2.5 text-left transition-colors hover:border-emerald-400";
+
+  return (
+    <form
+      action={formAction}
+      className="space-y-4"
+      onSubmit={() => setSubmitted(true)}
+    >
+      <input type="hidden" name="mode" value={localMode} />
+      {prefill && <input type="hidden" name="booking_id" value={prefill.id} />}
+      <input type="hidden" name="guest_count" value={guestDrafts.length} />
+      {selectedRooms.map((room) => (
+        <input key={room.id} type="hidden" name="room_id" value={room.id} />
+      ))}
+      {companies.length > 0 && (
+        <datalist id="company-options">
+          {companies.map((c) => (
+            <option key={c.id} value={c.name} />
+          ))}
+        </datalist>
+      )}
+
+      {/* 右侧悬浮入口：对齐去呼呼「今日房价 / 库存」 */}
+      <Link
+                prefetch={false}
+        href="/settings?tab=rates"
+        title="今日房价 / 库存"
+        className="fixed right-0 top-1/3 z-20 hidden select-none rounded-l-[4px] bg-[#58bc62] px-1.5 py-3 text-[12px] leading-[18px] text-white shadow-sm [writing-mode:vertical-rl] hover:bg-[#4fae59] lg:block"
+      >
+        今日房价/库存
+      </Link>
+
+      {/* 快捷入住条 */}
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+        <button type="button" onClick={() => focusRef(idNoRef)} className={quickBtn}>
+          <span className="text-[13px] font-semibold text-gray-800">扫码 / 身份证入住</span>
+          <span className="text-[11px] text-gray-400">聚焦证件号码输入框</span>
+        </button>
+        <button type="button" onClick={startHourMode} className={quickBtn}>
+          <span className="text-[13px] font-semibold text-gray-800">钟点房 4 小时</span>
+          <span className="text-[11px] text-gray-400">切换钟点房模式并预设 4 小时</span>
+        </button>
+        <button type="button" onClick={() => focusRef(teamRef)} className={quickBtn}>
+          <span className="text-[13px] font-semibold text-gray-800">团队入住</span>
+          <span className="text-[11px] text-gray-400">聚焦团队名称输入框</span>
+        </button>
+      </div>
+
+      <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_300px]">
+        <div className="space-y-4">
+          {/* 第一块：tab + 订单基础信息 */}
+          <div className="card overflow-hidden">
+            <div className="flex items-end gap-5 border-b border-gray-200 px-4 pt-2.5">
+              <TabLink
+                href={`/frontdesk?mode=day${querySuffix}`}
+                active={localMode === "day"}
+                label="日租入住"
+              />
+              <TabLink
+                href={`/frontdesk?mode=hour${querySuffix}`}
+                active={localMode === "hour"}
+                label="钟点房"
+              />
+              <span className="ml-auto pb-2 text-[11px] text-gray-400">
+                散客步入 · 当前可售 <b className="font-medium text-gray-600">{availableCount}</b> 间
+              </span>
+            </div>
+
+            <div className="space-y-3 p-4">
+              <div className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2 xl:grid-cols-4">
+                <Field label="团队名称">
+                  <input
+                    ref={teamRef}
+                    name="team_name"
+                    className="input h-[30px] w-full text-[12px]"
+                    value={teamName}
+                    onChange={(e) => setTeamName(e.target.value)}
+                    placeholder="请输入团队名称"
+                    autoComplete="off"
+                  />
+                </Field>
+                <Field label="会员信息">
+                  <input
+                    name="member_card"
+                    className="input h-[30px] w-full text-[12px]"
+                    value={memberCard}
+                    onChange={(e) => setMemberCard(e.target.value)}
+                    placeholder="会员卡号或手机号"
+                    autoComplete="off"
+                  />
+                </Field>
+                <Field label="会员类型">
+                  <input
+                    name="member_type"
+                    readOnly
+                    value={matchedMember ? vipText(matchedMember.vipLevel) : memberCard.trim() ? "普通" : ""}
+                    placeholder="自动匹配"
+                    className="input h-[30px] w-full bg-gray-100 text-[12px] text-gray-600"
+                    title={matchedMember ? `已匹配客史：${matchedMember.name}` : "输入会员卡号 / 手机号自动匹配"}
+                  />
+                </Field>
+              </div>
+
+              <div className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2 xl:grid-cols-4">
+                <Field label="入住日期">
+                  <div className="flex w-full items-center gap-1">
+                    <input
+                      type="date"
+                      name="check_in_date"
+                      className="input h-[30px] flex-1 text-[12px]"
+                      value={checkInDate}
+                      onChange={(e) => changeCheckInDate(e.target.value)}
+                    />
+                    <select
+                      name="check_in_time"
+                      className="input h-[30px] w-[86px] text-[12px]"
+                      value={checkInTime}
+                      onChange={(e) => setCheckInTime(e.target.value)}
+                    >
+                      {timeOptions.map((t) => (
+                        <option key={t} value={t}>
+                          {t}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </Field>
+
+                {localMode === "day" ? (
+                  <>
+                    <Field label="离店日期">
+                      <div className="flex w-full items-center gap-1">
+                        <input
+                          type="date"
+                          name="check_out_date"
+                          className="input h-[30px] flex-1 text-[12px]"
+                          value={checkOutDate}
+                          min={checkInDate || undefined}
+                          onChange={(e) => changeCheckOutDate(e.target.value)}
+                        />
+                        <select
+                          name="check_out_time"
+                          className="input h-[30px] w-[86px] text-[12px]"
+                          value={checkOutTime}
+                          onChange={(e) => setCheckOutTime(e.target.value)}
+                        >
+                          {timeOptions.map((t) => (
+                            <option key={t} value={t}>
+                              {t}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </Field>
+                    <Field label="入住天数">
+                      <div className="flex h-[30px] w-full items-center rounded-md border border-gray-300 bg-white">
+                        <button
+                          type="button"
+                          aria-label="减少入住天数"
+                          onClick={() => changeNights(nights - 1)}
+                          className="h-full w-7 text-[15px] leading-none text-gray-500 hover:bg-gray-50"
+                        >
+                          −
+                        </button>
+                        <input
+                          name="nights"
+                          value={nights}
+                          onChange={(e) => changeNights(Number(e.target.value))}
+                          inputMode="numeric"
+                          aria-label="入住天数"
+                          className="h-full w-full border-x border-gray-200 text-center text-[12px] tabular-nums outline-none focus-visible:ring-2 focus-visible:ring-brand-300"
+                        />
+                        <button
+                          type="button"
+                          aria-label="增加入住天数"
+                          onClick={() => changeNights(nights + 1)}
+                          className="h-full w-7 text-[15px] leading-none text-gray-500 hover:bg-gray-50"
+                        >
+                          +
+                        </button>
+                      </div>
+                    </Field>
+                  </>
+                ) : (
+                  <>
+                    <Field label="时长">
+                      <select
+                        name="hours"
+                        className="input h-[30px] w-full text-[12px]"
+                        value={hours}
+                        onChange={(e) => setHours(Number(e.target.value))}
+                      >
+                        {HOUR_OPTIONS.map((h) => (
+                          <option key={h} value={h}>
+                            {h} 小时
+                          </option>
+                        ))}
+                      </select>
+                    </Field>
+                    <Field label="离店时间">
+                      <span className="text-[12px] tabular-nums text-gray-700">
+                        预计 {addHoursText(checkInTime, hours)} 离店
+                      </span>
+                    </Field>
+                  </>
+                )}
+
+                <Field label="协议客户">
+                  <input
+                    name="company"
+                    className="input h-[30px] w-full text-[12px]"
+                    value={company}
+                    onChange={(e) => setCompany(e.target.value)}
+                    placeholder="协议客户"
+                    list={companies.length > 0 ? "company-options" : undefined}
+                    autoComplete="off"
+                  />
+                </Field>
+                <Field label="销售员">
+                  <select
+                    name="salesman"
+                    className="input h-[30px] w-full text-[12px]"
+                    value={salesman}
+                    onChange={(e) => setSalesman(e.target.value)}
+                  >
+                    <option value="">请选择销售员</option>
+                    {salesmen.map((s) => (
+                      <option key={s.name} value={s.name}>
+                        {s.role ? `${s.name}（${s.role}）` : s.name}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              </div>
+
+              <div className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2 xl:grid-cols-4">
+                <Field label="房价代码">
+                  <select
+                    name="rate_code"
+                    className="input h-[30px] w-full text-[12px]"
+                    value={rateCode}
+                    onChange={(e) => setRateCode(e.target.value)}
+                  >
+                    {RATE_CODES.map((r) => (
+                      <option key={r.value} value={r.value}>
+                        {r.label}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="渠道来源">
+                  <select
+                    name="channel_id"
+                    className="input h-[30px] w-full text-[12px]"
+                    value={channelId}
+                    onChange={(e) => setChannelId(e.target.value)}
+                  >
+                    <option value="">线下客人</option>
+                    {channels.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="渠道订单号">
+                  <input
+                    name="channel_order_no"
+                    className="input h-[30px] w-full text-[12px]"
+                    value={channelOrderNo}
+                    onChange={(e) => setChannelOrderNo(e.target.value)}
+                    placeholder="渠道订单号"
+                    autoComplete="off"
+                  />
+                </Field>
+                <Field label="收款类型">
+                  <select
+                    name="pay_type"
+                    className="input h-[30px] w-full text-[12px]"
+                    value={payType}
+                    onChange={(e) => setPayType(e.target.value)}
+                  >
+                    {PAY_TYPES.map((p) => (
+                      <option key={p} value={p}>
+                        {p}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              </div>
+
+              <div className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2 xl:grid-cols-4">
+                <Field label="包价">
+                  <input
+                    name="package_code"
+                    className="input h-[30px] w-full text-[12px]"
+                    value={packageCode}
+                    onChange={(e) => setPackageCode(e.target.value)}
+                    placeholder="包价"
+                    autoComplete="off"
+                  />
+                </Field>
+                <Field label="开票方">
+                  <select
+                    name="invoice_party"
+                    className="input h-[30px] w-full text-[12px]"
+                    value={invoiceParty}
+                    onChange={(e) => setInvoiceParty(e.target.value)}
+                  >
+                    {INVOICE_PARTIES.map((p) => (
+                      <option key={p} value={p}>
+                        {p}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="押金">
+                  <div className="flex w-full items-center gap-1.5">
+                    <input
+                      name="deposit"
+                      type="number"
+                      min={0}
+                      step={0.01}
+                      className="input h-[30px] flex-1 text-[12px]"
+                      value={deposit}
+                      onChange={(e) => setDeposit(e.target.value)}
+                      placeholder="元 / 间"
+                    />
+                    <span className="shrink-0 text-[11px] text-gray-400">每间</span>
+                  </div>
+                </Field>
+              </div>
+            </div>
+          </div>
+
+          {/* 第二块：快速排房 + 住客 + 备注 */}
+          <div className="card space-y-4 p-4">
+            <div>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setRoomPanelOpen((v) => !v)}
+                  aria-expanded={roomPanelOpen}
+                  className="inline-flex h-[30px] items-center gap-1.5 rounded bg-[#3fa855] px-2.5 text-[13px] font-medium text-white transition-colors hover:bg-[#379a4c]"
+                >
+                  <HomeIcon />
+                  快速排房（卡片选房）
+                  <span className={`text-[9px] transition-transform ${roomPanelOpen ? "rotate-180" : ""}`}>▾</span>
+                </button>
+                {showRoomError && <span className="text-[12px] text-red-500">请先选择房间</span>}
+              </div>
+
+              {roomPanelOpen && (
+                <div className="mt-2 rounded-md border border-gray-200 bg-white">
+                  {roomTypes.length === 0 && (
+                    <div className="px-3 py-4 text-center text-[12px] text-gray-400">
+                      暂无可售房型，请先到
+                      <Link prefetch={false} href="/rooms" className="mx-1 text-brand-600 hover:underline">
+                        房态图
+                      </Link>
+                      清理出空净房
+                    </div>
+                  )}
+                  {roomTypes.map((type) => (
+                    <div
+                      key={type.id}
+                      className="border-t border-gray-100 px-2.5 py-2 first:border-t-0"
+                    >
+                      <div className="mb-1.5 flex flex-wrap items-center gap-2">
+                        <div className="w-[112px] shrink-0">
+                          <div className="text-[12px] font-medium text-gray-800">{type.name}</div>
+                          <div className="text-[11px] text-gray-400">
+                            可订 {type.rooms.length} 间
+                            {type.max_occupancy ? ` · 可住 ${type.max_occupancy} 人` : ""}
+                          </div>
+                        </div>
+                        <div className="ml-auto flex shrink-0 items-center gap-1.5">
+                          <span className="text-[11px] text-gray-400">间数</span>
+                          <div className="flex h-[26px] items-center rounded border border-gray-300">
+                            <button
+                              type="button"
+                              aria-label={`减少${type.name}间数`}
+                              onClick={() => setTypeCount(type, countOf(type.id) - 1)}
+                              className="h-full w-5 text-[13px] leading-none text-gray-500 hover:bg-gray-50"
+                            >
+                              −
+                            </button>
+                            <input
+                              value={countOf(type.id)}
+                              onChange={(e) => setTypeCount(type, Number(e.target.value))}
+                              inputMode="numeric"
+                              aria-label={`${type.name}间数`}
+                              className="h-full w-8 border-x border-gray-200 text-center text-[12px] tabular-nums outline-none focus-visible:ring-2 focus-visible:ring-brand-300"
+                            />
+                            <button
+                              type="button"
+                              aria-label={`增加${type.name}间数`}
+                              onClick={() => setTypeCount(type, countOf(type.id) + 1)}
+                              className="h-full w-5 text-[13px] leading-none text-gray-500 hover:bg-gray-50"
+                            >
+                              +
+                            </button>
+                          </div>
+                          <span className="ml-1 text-[11px] text-gray-500">
+                            房价 {fmtMoney(rateOf(type.base_price))}
+                            {localMode === "day" ? "/晚" : `/${hours}小时`}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+                        {type.rooms.length === 0 ? (
+                          <span className="col-span-full text-[11px] text-gray-300">暂无可售房</span>
+                        ) : (
+                          type.rooms.map((room) => {
+                            const active = selectedSet.has(room.id);
+                            return (
+                              <button
+                                key={room.id}
+                                type="button"
+                                onClick={() => toggleRoom(room.id)}
+                                aria-pressed={active}
+                                className={`flex flex-col items-start gap-0.5 rounded-md border px-2 py-1.5 text-left transition-colors ${
+                                  active
+                                    ? "border-emerald-500 bg-emerald-50"
+                                    : "border-gray-200 bg-white hover:border-emerald-300"
+                                }`}
+                              >
+                                <span className="flex w-full items-center justify-between gap-1">
+                                  <span
+                                    className={`text-[12px] font-semibold tabular-nums ${
+                                      active ? "text-emerald-700" : "text-gray-800"
+                                    }`}
+                                  >
+                                    {room.room_no}
+                                  </span>
+                                  <span
+                                    className={`h-1.5 w-1.5 rounded-full ${STATUS_DOT[room.status] ?? "bg-gray-300"}`}
+                                    title={room.status === "VD" ? "空脏" : "空净"}
+                                  />
+                                </span>
+                                <span className="w-full truncate text-[10px] text-gray-400">
+                                  {type.name}
+                                </span>
+                              </button>
+                            );
+                          })
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {selectedRooms.length > 0 && (
+                <div className="mt-2 flex flex-wrap items-center gap-2 rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[12px] text-emerald-700">
+                  <span>
+                    已排房：
+                    <b className="font-semibold">{selectedRooms.map((r) => r.room_no).join("、")}</b>
+                  </span>
+                  <span className="text-[11px] text-emerald-600/80">
+                    共 {selectedRooms.length} 间 · 房费 {fmtMoney(roomFee)}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedRoomIds([])}
+                    className="ml-auto text-[11px] text-emerald-700 underline hover:text-emerald-800"
+                  >
+                    清空
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <div>
+              <div className="mb-2 flex flex-wrap items-center gap-2">
+                <span className="text-[13px] font-semibold text-gray-800">住客信息</span>
+                <Link prefetch={false} href="/guests" className="text-[11px] text-brand-600 hover:underline">
+                  关于未成年入住「五必须」
+                </Link>
+                <span className="ml-auto text-[11px] text-gray-400">
+                  主住客姓名必填，可添加多名同住人
+                </span>
+              </div>
+
+              {roomError && !submitted && (
+                <p className="mb-2 text-[12px] text-red-500">请先排房，再录入住客信息</p>
+              )}
+
+              <div className="space-y-2.5">
+                {guestDrafts.map((guest, index) => (
+                  <div key={index} className="rounded-md border border-gray-200 bg-gray-50/60 p-3">
+                    <div className="mb-2 flex items-center gap-2">
+                      <span className="text-[12px] font-medium text-gray-700">
+                        {index === 0 ? "主住客" : `住客 ${index + 1}`}
+                      </span>
+                      {index === 0 && <span className="text-[11px] text-red-500">姓名 *</span>}
+                      {index > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => removeGuest(index)}
+                          className="ml-auto text-[11px] text-rose-500 hover:underline"
+                        >
+                          删除
+                        </button>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-1 gap-x-4 gap-y-2 sm:grid-cols-2 xl:grid-cols-3">
+                      <label className="flex flex-col gap-1">
+                        <span className="text-[12px] text-gray-500">
+                          姓名 {index === 0 && <span className="text-red-500">*</span>}
+                        </span>
+                        <input
+                          name={`guest_name_${index}`}
+                          className="input h-[30px] w-full bg-white text-[12px]"
+                          value={guest.name}
+                          onChange={(e) => updateGuest(index, { name: e.target.value })}
+                          placeholder="请输入姓名"
+                          autoComplete="off"
+                        />
+                        {index === 0 && showNameError && (
+                          <span className="text-[11px] text-red-500">请填写主住客姓名</span>
+                        )}
+                      </label>
+                      <label className="flex items-center gap-1.5">
+                        <span className="shrink-0 text-[12px] text-gray-500">手机</span>
+                        <input
+                          name={`guest_mobile_${index}`}
+                          className="input h-[30px] w-full bg-white text-[12px]"
+                          value={guest.mobile}
+                          onChange={(e) => updateGuest(index, { mobile: e.target.value })}
+                          placeholder="手机号"
+                          inputMode="tel"
+                          autoComplete="off"
+                        />
+                      </label>
+                      <label className="flex items-center gap-1.5">
+                        <span className="shrink-0 text-[12px] text-gray-500">证件类型</span>
+                        <select
+                          name={`guest_id_type_${index}`}
+                          className="input h-[30px] w-full bg-white text-[12px]"
+                          value={guest.idType}
+                          onChange={(e) => updateGuest(index, { idType: e.target.value })}
+                        >
+                          {ID_TYPES.map((t) => (
+                            <option key={t} value={t}>
+                              {t}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="flex flex-col gap-1">
+                        <span className="text-[12px] text-gray-500">证件号</span>
+                        <input
+                          ref={index === 0 ? idNoRef : undefined}
+                          name={`guest_id_no_${index}`}
+                          className="input h-[30px] w-full bg-white text-[12px]"
+                          value={guest.idNo}
+                          onChange={(e) => updateGuest(index, { idNo: e.target.value })}
+                          placeholder="证件号码"
+                          autoComplete="off"
+                        />
+                      </label>
+                      <label className="flex items-center gap-1.5">
+                        <span className="shrink-0 text-[12px] text-gray-500">性别</span>
+                        <select
+                          name={`guest_gender_${index}`}
+                          className="input h-[30px] w-full bg-white text-[12px]"
+                          value={guest.gender}
+                          onChange={(e) => updateGuest(index, { gender: e.target.value })}
+                        >
+                          {GENDERS.map((g) => (
+                            <option key={g} value={g}>
+                              {g}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="flex items-center gap-1.5">
+                        <span className="shrink-0 text-[12px] text-gray-500">早餐</span>
+                        <select
+                          name={`guest_breakfast_${index}`}
+                          className="input h-[30px] w-full bg-white text-[12px]"
+                          value={guest.breakfast}
+                          onChange={(e) => updateGuest(index, { breakfast: e.target.value })}
+                        >
+                          {BREAKFASTS.map((b) => (
+                            <option key={b} value={b}>
+                              {b} 份
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <button
+                type="button"
+                onClick={addGuest}
+                className="mt-2 rounded border border-dashed border-gray-300 px-2.5 py-1 text-[12px] text-gray-600 transition-colors hover:border-emerald-400 hover:text-emerald-700"
+              >
+                + 增加住客
+              </button>
+            </div>
+
+            <div>
+              <label htmlFor="remark" className="mb-1 block text-[13px] font-semibold text-gray-800">
+                订单备注
+              </label>
+              <textarea
+                id="remark"
+                name="remark"
+                className="input min-h-[96px] resize-y bg-white text-[12px]"
+                value={remark}
+                onChange={(e) => setRemark(e.target.value)}
+                placeholder="特殊要求、担保方式、同住人信息等"
+              />
+            </div>
+
+            {/* 底部居中「入住」按钮：对齐去呼呼散客步入页 */}
+            <div className="flex justify-center pt-1">
+              <button
+                type="submit"
+                disabled={pending || roomError || nameError}
+                className="h-9 w-[120px] rounded-[2px] bg-[#58bc62] text-[14px] text-white transition-colors hover:bg-[#4fae59] disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {pending ? "办理中…" : "入住"}
+              </button>
+            </div>
+
+            {state.error && (
+              <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-600">
+                {state.error}
+              </div>
+            )}
+            {state.ok && (
+              <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-[12px] text-emerald-700">
+                {state.ok} · 正在跳转在住单…
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* 右侧：入住摘要（sticky） */}
+        <aside className="card self-start p-4 lg:sticky lg:top-4">
+          <div className="mb-3 text-[13px] font-semibold text-gray-800">入住摘要</div>
+
+          <div className="space-y-2 text-[12px]">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-gray-500">已选房号</span>
+              <span className="text-right font-medium text-gray-800">
+                {selectedRooms.length > 0 ? selectedRooms.map((r) => r.room_no).join("、") : "未选房"}
+              </span>
+            </div>
+
+            <div className="space-y-1.5 border-t border-gray-100 pt-2">
+              {selectedRooms.length === 0 && (
+                <div className="py-2 text-center text-[11px] text-gray-400">选择房间后展示房价明细</div>
+              )}
+              {selectedRooms.map((room) => (
+                <div key={room.id} className="flex items-center justify-between gap-2 text-gray-700">
+                  <span className="truncate">
+                    {room.room_no} · {room.room_type_name}
+                  </span>
+                  <span className="shrink-0 tabular-nums text-gray-500">
+                    {fmtMoney(rateOf(room.base_price))} × {modeLabel}
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            <div className="flex items-center justify-between gap-2 border-t border-gray-100 pt-2">
+              <span className="text-gray-500">押金</span>
+              <span className="tabular-nums text-gray-800">{fmtMoney(totalDeposit)}</span>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-gray-500">预计房费</span>
+              <span className="text-[15px] font-semibold tabular-nums text-emerald-700">
+                {fmtMoney(roomFee)}
+              </span>
+            </div>
+          </div>
+
+          {(showRoomError || showNameError) && (
+            <div className="mt-3 space-y-1 text-[11px] text-red-500">
+              {showRoomError && <div>· 请先选择房间</div>}
+              {showNameError && <div>· 请填写主住客姓名</div>}
+            </div>
+          )}
+
+          <button
+            type="submit"
+            disabled={pending || roomError || nameError}
+            className="mt-3 h-[38px] w-full rounded-md bg-[#5cb85c] text-[14px] font-medium text-white transition-colors hover:bg-[#4f9e4f] disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {pending ? "办理中…" : "确认入住"}
+          </button>
+        </aside>
+      </div>
+    </form>
+  );
+}
