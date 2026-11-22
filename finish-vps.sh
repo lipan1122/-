@@ -89,6 +89,20 @@ node scripts/migrate-all.mjs
 log "补全表结构（缺表补表、缺列补列）"
 node scripts/sync-schema.mjs
 
+# 可选：导入演示数据（默认不导，显式设 PMS_LOAD_DEMO=1 才导）
+#
+# 演示数据包含 46 间房 / 588 条预订 / 200 张账单 / 45 个客人 / 会员储值 / AR 应收，
+# 适合给客户演示、给同事试用、培训。正式运营不要导，直接在「设置」里录真实房型。
+#
+#   sudo PMS_LOAD_DEMO=1 bash finish-vps.sh
+#
+if [ "${PMS_LOAD_DEMO:-0}" = "1" ]; then
+  log "导入演示数据（PMS_LOAD_DEMO=1）"
+  node scripts/load-demo.mjs --force
+else
+  log "跳过演示数据（需要的话设 PMS_LOAD_DEMO=1 重跑）"
+fi
+
 log "数据库概况"
 sqlite3 data/pms.db "SELECT '房间 ' || COUNT(*) || ' 间' FROM rooms; SELECT '用户 ' || COUNT(*) || ' 个' FROM users;" 2>/dev/null || true
 

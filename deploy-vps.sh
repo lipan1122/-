@@ -135,6 +135,20 @@ node scripts/migrate-all.mjs
 log "补全表结构（缺表补表、缺列补列）"
 node scripts/sync-schema.mjs
 
+# 可选：导入演示数据（默认不导，显式设 PMS_LOAD_DEMO=1 才导）
+#
+# 演示数据包含 46 间房 / 588 条预订 / 200 张账单 / 45 个客人 / 会员储值 / AR 应收，
+# 适合给客户演示、给同事试用、培训。正式运营不要导，直接在「设置」里录真实房型。
+#
+#   sudo PMS_LOAD_DEMO=1 bash deploy-vps.sh
+#
+if [ "${PMS_LOAD_DEMO:-0}" = "1" ]; then
+  log "导入演示数据（PMS_LOAD_DEMO=1）"
+  node scripts/load-demo.mjs --force
+else
+  log "跳过演示数据（需要的话设 PMS_LOAD_DEMO=1 重跑）"
+fi
+
 # 权限：服务以 $APP_USER 运行，data 目录要可写
 chown -R "$APP_USER":"$APP_USER" "$APP_DIR"
 
