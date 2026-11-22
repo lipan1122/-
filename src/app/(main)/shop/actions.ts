@@ -43,15 +43,29 @@ type ShopSaleRow = {
   voided_at: string | null;
 };
 
+/**
+ * 购物车明细行
+ *
+ * 前端提交 `items = [{ item_id, qty }, ...]`（整改报告 二：必须提交完整明细数组）。
+ * 老调用方（历史表单 / 手工调用 / 旧验收脚本）只带 item_id（+ qty），按单商品兼容。
+ */
+type CartLine = { item_id: number; qty: number };
+
 /** 幂等查重用的最小流水行（重放时按它的字段回显「原单已成交」） */
 type SoldSaleRow = {
   id: number;
+  hotel_id: number;
   item_name: string;
   qty: number;
   amount: number;
   method: string | null;
   room_no: string | null;
+  order_no: string | null;
 };
+
+/** 拆好、校验过、可以直接落库的一行（金额在事务内按数据库里的价格算，绝不信任前端传的价） */
+type CartPlan = { id: number; name: string; price: number; qty: number; amount: number };
+
 
 /** 事务内业务失败：抛出去让 tx() 回滚，外层统一转成页面提示 */
 class ShopTxError extends Error {}
@@ -134,8 +148,25 @@ function settledSaleOf(hotelId: number, requestId: string): SoldSaleRow | undefi
   );
   if (!hit) return undefined;
   return get<SoldSaleRow>(
-    `SELECT id, item_name, qty, amount, method, room_no FROM shop_sales WHERE id = ? AND hotel_id = ?`,
+    `SELECT id, hotel_id, item_name, qty, amount, method, room_no, order_no FROM shop_sales WHERE id = ? AND hotel_id = ?`,
     [hit.id, hotelId]
+  );
+}
+
+/**
+ * 整单汇总（多商品单）
+ *
+ * 多商品购物车按「一行一个商品」写 shop_sales，request_id 只落在首行
+ * （shop_sales(hotel_id, request_id) 是唯一索引，多行都带会被自己挡下来）。
+ * 为了让同一单的所有行仍可整体追溯 / 对账，同时写 order_no = request_id，
+ * 这里按 order_no 汇总行数与金额，用于幂等重放的提示与前台账面核对。
+ */
+function orderTotalsOf(hotelId: number, orderNo: string): { n: number; total: number } | undefined {
+  if (!orderNo) return undefined;
+  return get<{ n: number; total: number }>(
+    `SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total
+       FROM shop_sales WHERE hotel_id = ? AND order_no = ?`,
+    [hotelId, orderNo]
   );
 }
 
@@ -148,9 +179,13 @@ function settledSaleOf(hotelId: number, requestId: string): SoldSaleRow | undefi
  * 用 err= 的话前端会当成失败保留同一枚 request_id，同一单就再也卖不出去了。
  */
 function replayUrl(sale: SoldSaleRow): string {
-  const amount = fmtMoney(Number(sale.amount ?? 0));
+  const order = orderTotalsOf(sale.hotel_id, sale.order_no ?? "");
+  const body =
+    order && order.n > 1
+      ? `本单 ${order.n} 行，合计 ${fmtMoney(Number(order.total ?? 0))}`
+      : `${sale.item_name} ×${Number(sale.qty ?? 0)}，${fmtMoney(Number(sale.amount ?? 0))}`;
   return `/shop?msg=${encodeURIComponent(
-    `该请求已处理（幂等重放），本次未重复销售：${sale.item_name} ×${Number(sale.qty ?? 0)}，${amount}${
+    `该请求已处理（幂等重放），本次未重复销售：${body}${
       sale.room_no ? ` → 房 ${sale.room_no}` : sale.method ? ` · ${sale.method}` : ""
     }`
   )}`;
@@ -199,6 +234,11 @@ function ensureShopSalesTable(): void {
     ["request_id", "ALTER TABLE shop_sales ADD COLUMN request_id TEXT"],
     ["voided_at", "ALTER TABLE shop_sales ADD COLUMN voided_at TEXT"],
     ["void_reason", "ALTER TABLE shop_sales ADD COLUMN void_reason TEXT"],
+    /*
+     * 整单号（多商品单）：request_id 只落首行（唯一索引限制），
+     * order_no 让同一单的所有商品行仍能被整体查询 / 对账 / 汇总。
+     */
+    ["order_no", "ALTER TABLE shop_sales ADD COLUMN order_no TEXT"],
   ] as const) {
     if (cols.has(name)) continue;
     try {
@@ -212,7 +252,82 @@ function ensureShopSalesTable(): void {
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_shop_sales_request
        ON shop_sales(hotel_id, request_id) WHERE request_id IS NOT NULL`
   );
+  getDb().exec(`CREATE INDEX IF NOT EXISTS idx_shop_sales_order ON shop_sales(hotel_id, order_no)`);
   salesSchemaReady = true;
+}
+
+/**
+ * 商超库存流水表 shop_stock_flows
+ *
+ * 为什么不写 goods_flows：goods_flows.goods_id 指向**仓库商品** goods 表
+ * （进货 / 退货 / 报废 / 销售，/goods 页面按 goods_id 关联展示变动后结存）。
+ * 商超商品在 shop_items 里是另一套台账，把 shop_items.id 塞进 goods_flows.goods_id
+ * 会让 /goods 的流水把毫不相干的仓库商品串成一条（两套自增 id 必然撞车），
+ * 等于用「修商超」的名义污染现有仓库账。
+ * 所以商超单独记账，字段与 goods_flows 对齐（type / qty / stock_after / unit_price /
+ * amount / note / operator / created_at），以后要合并报表直接 UNION 即可。
+ */
+let stockFlowReady = false;
+
+function ensureShopStockFlowTable(): void {
+  if (stockFlowReady) return;
+  getDb().exec(`
+    CREATE TABLE IF NOT EXISTS shop_stock_flows (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      hotel_id INTEGER NOT NULL,
+      item_id INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      qty INTEGER NOT NULL,
+      stock_after INTEGER NOT NULL,
+      unit_price REAL NOT NULL DEFAULT 0,
+      amount REAL NOT NULL DEFAULT 0,
+      sale_id INTEGER,
+      request_id TEXT,
+      note TEXT,
+      operator TEXT,
+      created_at TEXT NOT NULL
+    );
+  `);
+  getDb().exec(
+    `CREATE INDEX IF NOT EXISTS idx_shop_stock_flows_item ON shop_stock_flows (hotel_id, item_id, type)`
+  );
+  stockFlowReady = true;
+}
+
+/** 写一条商超库存流水（调用方必须已经在同一个 tx() 里改完 shop_items.stock） */
+function writeShopFlow(flow: {
+  hotelId: number;
+  itemId: number;
+  type: "SELL" | "VOID";
+  qty: number;
+  stockAfter: number;
+  unitPrice: number;
+  amount: number;
+  saleId: number | null;
+  requestId: string | null;
+  note: string;
+  operator: string;
+  createdAt: string;
+}): void {
+  run(
+    `INSERT INTO shop_stock_flows
+       (hotel_id, item_id, type, qty, stock_after, unit_price, amount, sale_id, request_id, note, operator, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      flow.hotelId,
+      flow.itemId,
+      flow.type,
+      flow.qty,
+      flow.stockAfter,
+      flow.unitPrice,
+      flow.amount,
+      flow.saleId,
+      flow.requestId,
+      flow.note,
+      flow.operator,
+      flow.createdAt,
+    ]
+  );
 }
 
 /** 懒建表 + 首次种子：第一次访问时建 shop_items / shop_sales 并写入 10 个商品 */
@@ -231,6 +346,7 @@ function ensureShopSchema(hotelId: number): void {
     );
   `);
   ensureShopSalesTable();
+  ensureShopStockFlowTable();
 
   const existing =
     get<{ n: number }>(`SELECT COUNT(*) AS n FROM shop_items WHERE hotel_id = ?`, [hotelId])?.n ?? 0;
@@ -364,10 +480,29 @@ export async function sellAction(formData: FormData): Promise<void> {
 
       /* 销售流水与库存、账单同事务落地 */
       const saleId = run(
-        `INSERT INTO shop_sales (hotel_id, item_name, qty, amount, method, room_no, created_at, request_id)
-         VALUES (?,?,?,?,?,?,?,?)`,
-        [hotelId, item.name, qty, amount, `挂账 ${roomNo}`, roomNo, now, requestId]
+        `INSERT INTO shop_sales (hotel_id, item_name, qty, amount, method, room_no, created_at, order_no, request_id)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+        [hotelId, item.name, qty, amount, `挂账 ${roomNo}`, roomNo, now, requestId, requestId]
       ).lastInsertRowid;
+
+      /* 库存变动必须有库存流水：单商品挂账走这里，购物车走 sellCartAction，两边口径一致 */
+      writeShopFlow({
+        hotelId,
+        itemId,
+        type: "SELL",
+        qty,
+        stockAfter: Number(
+          get<{ stock: number }>(`SELECT stock FROM shop_items WHERE id = ? AND hotel_id = ?`, [itemId, hotelId])
+            ?.stock ?? 0
+        ),
+        unitPrice: Number(item.price),
+        amount,
+        saleId,
+        requestId,
+        note: `挂账房 ${roomNo} · 商超挂账 单 ${saleId}`,
+        operator: user.realName || user.username,
+        createdAt: now,
+      });
 
       /* 统一走公共重算（P0-4）：部分结账负项的排除规则只写一份，避免各入口算出不同余额 */
       recalcFolioBalance(hotelId, folioId);
@@ -392,7 +527,7 @@ export async function sellAction(formData: FormData): Promise<void> {
 
   revalidateShop();
   redirect(
-    `/shop?ok=${encodeURIComponent(
+    `/shop?msg=${encodeURIComponent(
       `已挂房账：${item.name} ×${qty}，${fmtMoney(amount)} → 房 ${roomNo} ${stay.guest_name ?? "客人"}`
     )}`
   );
@@ -425,13 +560,81 @@ export async function toggleItemStatusAction(formData: FormData): Promise<void> 
   revalidatePath("/shop");
 }
 
+/** 单笔结算最多几种商品（挡住异常超长 payload，避免一次事务里跑上千次查询） */
+const CART_MAX_LINES = 50;
+
+/** 单个商品一次最多卖多少件（与 sellAction 的 1-99 同一口径） */
+const LINE_MAX_QTY = 99;
+
 /**
- * 购物车结算（去呼呼前台售卖：可多件、现金或挂房账）
+ * 解析购物车明细（整改报告 二：前端必须提交完整明细数组）
  *
- * 与旧实现的三处差异（都属于清单点名的要求）：
- *   1. 库存不足 / 商品下架 / 商品不存在 → 整单失败，不再静默跳过还能报「已售出 N 件」；
- *   2. 挂房账时房号查不到在住单或账单 → 整单回滚（旧代码继续扣库存、写流水，账单却没记）；
- *   3. 扣库存用条件更新 + request_id 幂等，库存不会为负、重复提交不会重复销售。
+ * 新格式（优先）：
+ *   items = [{ "item_id": 1, "qty": 1 }, { "item_id": 2, "qty": 1 }]
+ * 旧格式（items 缺失时兼容老调用方）：
+ *   item_id（可逗号分隔多个）+ qty —— 单个 id 用 qty 件；多个 id 时每件 1 件，
+ *   与改造前的口径完全一致，历史调用不会因为本轮改造少卖或多卖。
+ *
+ * 同一个 item_id 出现多次会合并数量：一行一个商品，库存流水与销售流水都是一行一条，
+ * 不合并的话同一商品会被拆成两条流水，对账时分不清是同一件还是两件。
+ *
+ * 任何一行不合法（商品 id 不是正整数 / qty 不是正数）一律判定**整单非法**：
+ * 绝不能悄悄丢掉那一行接着卖，否则又回到「购物车里有东西没结算」的老问题。
+ */
+function parseCartLines(formData: FormData): { lines: CartLine[]; invalid: boolean } {
+  const merged = new Map<number, number>();
+  const add = (rawId: unknown, rawQty: unknown): boolean => {
+    const id = Math.trunc(Number(rawId));
+    const qty = Math.trunc(Number(rawQty));
+    if (!Number.isFinite(id) || id <= 0) return false;
+    if (!Number.isFinite(qty) || qty <= 0) return false;
+    merged.set(id, Math.min(LINE_MAX_QTY, (merged.get(id) ?? 0) + qty));
+    return true;
+  };
+  const toLines = (): CartLine[] => [...merged.entries()].map(([item_id, qty]) => ({ item_id, qty }));
+
+  const rawItems = str(formData.get("items"));
+  if (rawItems) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawItems);
+    } catch {
+      return { lines: [], invalid: true };
+    }
+    if (!Array.isArray(parsed)) return { lines: [], invalid: true };
+    for (const entry of parsed) {
+      const row = entry as { item_id?: unknown; qty?: unknown } | null;
+      if (!add(row?.item_id, row?.qty)) return { lines: [], invalid: true };
+    }
+    return { lines: toLines(), invalid: false };
+  }
+
+  /* 兼容旧调用：item_id（可逗号分隔）+ qty */
+  const legacyIds = str(formData.get("item_id"))
+    .split(",")
+    .map((x) => Math.trunc(Number(x)))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  const rawQty = Math.trunc(Number(str(formData.get("qty"))));
+  const singleQty = Number.isFinite(rawQty) && rawQty > 0 ? Math.min(LINE_MAX_QTY, rawQty) : 1;
+  for (const id of legacyIds) {
+    if (!add(id, legacyIds.length === 1 ? singleQty : 1)) return { lines: [], invalid: true };
+  }
+  return { lines: toLines(), invalid: false };
+}
+
+/**
+ * 购物车结算（去呼呼前台售卖：多商品、现金或挂房账）
+ *
+ * 整改报告 二（多商品购物车）的核心改动：
+ *   1. 前端提交 items = [{ item_id, qty }, ...]，本动作逐行解析（旧 item_id 仍兼容）；
+ *   2. 逐商品校验「存在 + 上架 + 库存够」，任何一行不合格 → 整单取消、整单回滚，
+ *      绝不会出现「扣了甲商品的库存、乙商品没扣」这种半截账；
+ *   3. 同一个 tx() 内按顺序落库：逐商品条件扣库存 → 逐商品写库存流水 → 逐商品写销售流水
+ *      → （挂账时）逐商品写 folio_items → 重算账单；
+ *   4. 金额一律按数据库里的 price × qty 汇总，不采信前端传来的任何金额；
+ *   5. 幂等：request_id 反复提交只有第一单成交（唯一索引 + 两道查重）；
+ *      request_id 只落首行（唯一索引限制），同单所有行的 order_no = request_id 便于整单对账；
+ *   6. 现金只写 shop_sales；挂房账额外每商品一条 folio_items，账单上能按商品逐条核对与撤销。
  */
 export async function sellCartAction(formData: FormData): Promise<void> {
   const user = await requirePermission("cashier.receive");
@@ -440,11 +643,7 @@ export async function sellCartAction(formData: FormData): Promise<void> {
 
   const failUrl = (message: string) => `/shop?err=${encodeURIComponent(message)}`;
 
-  const ids = String(formData.get("item_id") ?? "")
-    .split(",")
-    .map((x) => Number(x))
-    .filter((n) => Number.isFinite(n) && n > 0)
-    .map((n) => Math.trunc(n));
+  const operator = user.realName || user.username;
   const method = str(formData.get("method")) || "现金";
   const roomNo = str(formData.get("room_no"));
   const requestId = resolveRequestId(formData);
@@ -456,21 +655,23 @@ export async function sellCartAction(formData: FormData): Promise<void> {
    * 幂等第一道闸（第七轮 一.2）：同一个 request_id 已经成交过 → 按首次结果返回成功。
    * 双击的第二下、网络重试的那一次都会走到这里，得到的是成功横幅而不是错误，
    * 所以前端不会把它当成失败去反复重试。
+   * 放在明细解析之前：重放请求即使购物车已清空 / 商品已下架，也应该拿到「已处理」。
    */
   const settledBefore = settledSaleOf(hotelId, requestId);
   if (settledBefore) redirect(replayUrl(settledBefore));
 
+  const parsed = parseCartLines(formData);
+  if (parsed.invalid) {
+    redirect(failUrl("购物车明细里有非法商品行（商品或数量不合法），整单已取消。请刷新页面重新加购"));
+  }
+  const lines = parsed.lines;
+  const ids = lines.map((line) => line.item_id);
   if (ids.length === 0) redirect(failUrl("购物车为空，请先选择商品"));
-
-  /*
-   * 单商品时 quantity 生效（POS 传的是购物车总件数）；多商品时按每件 1 件结算，
-   * 与页面「一件一行」的流水展示保持一致。
-   */
-  const rawQty = Number(str(formData.get("qty")));
-  const singleQty = Number.isFinite(rawQty) && rawQty > 0 ? Math.min(99, Math.trunc(rawQty)) : 1;
+  if (ids.length > CART_MAX_LINES) redirect(failUrl(`单笔结算最多 ${CART_MAX_LINES} 种商品，请分单结算`));
 
   const now = nowIso();
-  let outcome: { names: string[]; total: number; count: number };
+  const today = todayStr();
+  let outcome: { names: string[]; total: number; count: number; qty: number; orderNo: string };
 
   try {
     outcome = tx(() => {
@@ -478,52 +679,33 @@ export async function sellCartAction(formData: FormData): Promise<void> {
       const duplicated = settledSaleOf(hotelId, requestId);
       if (duplicated) throw new ShopReplayedError(duplicated);
 
-      const names: string[] = [];
-      let total = 0;
-      let count = 0;
-
-      for (const id of ids) {
+      /* ① 逐商品预校验（只读）：商品存在 / 上架 / 库存够，任何一条不合格整单不写库 */
+      const plans: CartPlan[] = [];
+      for (const line of lines) {
         const item = get<ShopItemRow>(
           `SELECT id, name, price, stock, status FROM shop_items WHERE id = ? AND hotel_id = ?`,
-          [id, hotelId]
+          [line.item_id, hotelId]
         );
-        if (!item) throw new ShopTxError(`商品 #${id} 不存在或已被删除，整单已取消`);
+        if (!item) throw new ShopTxError(`商品 #${line.item_id} 不存在或已被删除，整单已取消`);
         if (item.status !== "ON") throw new ShopTxError(`商品「${item.name}」已下架，整单已取消`);
-        const qty = ids.length === 1 ? singleQty : 1;
-
-        const dec = run(
-          `UPDATE shop_items SET stock = stock - ? WHERE id = ? AND hotel_id = ? AND stock >= ?`,
-          [qty, id, hotelId, qty]
-        );
-        if (dec.changes === 0) {
-          throw new ShopTxError(`商品「${item.name}」库存不足（需要 ${qty} 件，当前 ${item.stock} 件），整单已取消`);
+        if (Number(item.stock) < line.qty) {
+          throw new ShopTxError(
+            `商品「${item.name}」库存不足（需要 ${line.qty} 件，当前 ${item.stock} 件），整单已取消`
+          );
         }
-
-        const amount = round2(Number(item.price) * qty);
-        run(
-          `INSERT INTO shop_sales (hotel_id, item_name, qty, amount, method, room_no, created_at, request_id)
-           VALUES (?,?,?,?,?,?,?,?)`,
-          [
-            hotelId,
-            item.name,
-            qty,
-            amount,
-            roomNo ? `挂账 ${roomNo}` : method,
-            roomNo || null,
-            now,
-            /* 部分唯一索引只约束非空 request_id：同一单只把幂等标识记在首行 */
-            count === 0 ? requestId : null,
-          ]
-        );
-
-        names.push(item.name);
-        total += amount;
-        count += 1;
+        plans.push({
+          id: item.id,
+          name: item.name,
+          price: Number(item.price),
+          qty: line.qty,
+          amount: round2(Number(item.price) * line.qty),
+        });
       }
 
-      /* 挂账：必须真的写进在住客人的账单，否则回滚（旧实现查不到就静默跳过） */
+      /* ② 挂房账前置校验：房号必须真有在住客人，查不到就整单回滚（库存一件都不扣、流水一条不写） */
+      let stay: StayFolioRow | undefined;
       if (roomNo) {
-        const stay = get<StayFolioRow>(
+        stay = get<StayFolioRow>(
           `SELECT s.id AS stay_id, s.guest_name, f.id AS folio_id
              FROM stays s JOIN rooms r ON r.id = s.room_id
              LEFT JOIN folios f ON f.stay_id = s.id
@@ -532,18 +714,81 @@ export async function sellCartAction(formData: FormData): Promise<void> {
           [hotelId, roomNo]
         );
         if (!stay) throw new ShopTxError(`房号 ${roomNo} 当前没有在住客人，整单已取消（库存未扣、流水未记）`);
+      }
 
-        const folioId = ensureStayFolio(hotelId, stay, roomNo, now);
-        run(
-          `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, amount, qty, biz_date, created_at)
-           VALUES (?,?,?,?,?,?,?,?)`,
-          [hotelId, folioId, "OTHER", `商超:${names.join("、")}`, round2(total), count, todayStr(), now]
+      /* ③ 逐商品：条件扣库存（stock >= qty）→ 库存流水 → 销售流水 */
+      const names: string[] = [];
+      const saleIds: number[] = [];
+      let total = 0;
+      let qtyTotal = 0;
+      for (const plan of plans) {
+        const dec = run(
+          `UPDATE shop_items SET stock = stock - ? WHERE id = ? AND hotel_id = ? AND stock >= ?`,
+          [plan.qty, plan.id, hotelId, plan.qty]
         );
+        if (dec.changes === 0) {
+          /* 预校验之外再挡一次：两人同时买最后一件时，条件更新才是真正的并发闸 */
+          throw new ShopTxError(`商品「${plan.name}」库存不足（需要 ${plan.qty} 件），整单已取消`);
+        }
+        const stockAfter = Number(
+          get<{ stock: number }>(`SELECT stock FROM shop_items WHERE id = ? AND hotel_id = ?`, [plan.id, hotelId])
+            ?.stock ?? 0
+        );
+
+        const saleId = run(
+          `INSERT INTO shop_sales (hotel_id, item_name, qty, amount, method, room_no, created_at, order_no, request_id)
+           VALUES (?,?,?,?,?,?,?,?,?)`,
+          [
+            hotelId,
+            plan.name,
+            plan.qty,
+            plan.amount,
+            roomNo ? `挂账 ${roomNo}` : method,
+            roomNo || null,
+            now,
+            /* 整单号：同单每一行都写，便于整单查询 / 对账 / 汇总 */
+            requestId,
+            /* 部分唯一索引只约束非空 request_id：同一单只把幂等标识记在首行 */
+            saleIds.length === 0 ? requestId : null,
+          ]
+        ).lastInsertRowid;
+
+        writeShopFlow({
+          hotelId,
+          itemId: plan.id,
+          type: "SELL",
+          qty: plan.qty,
+          stockAfter,
+          unitPrice: plan.price,
+          amount: plan.amount,
+          saleId,
+          requestId,
+          note: `${roomNo ? `挂账房 ${roomNo}` : method} · 商超销售 单 ${saleId}`,
+          operator,
+          createdAt: now,
+        });
+
+        saleIds.push(saleId);
+        names.push(plan.name);
+        total += plan.amount;
+        qtyTotal += plan.qty;
+      }
+
+      /* ④ 挂房账：每个商品一条 folio_items（账单上可按商品逐条核对、逐条撤销） */
+      if (roomNo && stay) {
+        const folioId = ensureStayFolio(hotelId, stay, roomNo, now);
+        for (const plan of plans) {
+          run(
+            `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at, created_by)
+             VALUES (?,?,?,?,?,?,?,?,?,?)`,
+            [hotelId, folioId, "OTHER", `商超：${plan.name}`, plan.qty, plan.price, plan.amount, today, now, user.id]
+          );
+        }
         /* 不再增量累加（部分结账后累加会把负项算漏），统一重算 */
         recalcFolioBalance(hotelId, folioId);
       }
 
-      return { names, total: round2(total), count };
+      return { names, total: round2(total), count: names.length, qty: qtyTotal, orderNo: requestId };
     });
   } catch (e) {
     if (e instanceof ShopReplayedError) redirect(replayUrl(e.sale));
@@ -556,17 +801,19 @@ export async function sellCartAction(formData: FormData): Promise<void> {
 
   writeOpLog(
     hotelId,
-    user.realName || user.username,
+    operator,
     "商超结算",
-    `${outcome.count} 件 · 合计 ${fmtMoney(outcome.total)} · ${roomNo ? `挂账房 ${roomNo}` : method} · 商品 ${outcome.names.join(
-      "、"
-    )} · request_id ${requestId}`
+    `${outcome.count} 种 ${outcome.qty} 件 · 合计 ${fmtMoney(outcome.total)} · ${
+      roomNo ? `挂账房 ${roomNo}` : method
+    } · 商品 ${outcome.names.join("、")} · 整单号 ${outcome.orderNo}`
   );
 
-  revalidatePath("/shop");
+  revalidateShop();
   redirect(
     `/shop?msg=${encodeURIComponent(
-      `已售出 ${outcome.count} 件，合计 ¥${outcome.total.toFixed(2)}（${roomNo ? `挂账 ${roomNo}` : method}）`
+      `已售出 ${outcome.qty} 件（${outcome.count} 种商品），合计 ¥${outcome.total.toFixed(2)}（${
+        roomNo ? `挂账 ${roomNo}` : method
+      }）`
     )}`
   );
 }
@@ -617,11 +864,35 @@ export async function voidSaleAction(formData: FormData): Promise<void> {
         [hotelId, sale.item_name]
       );
       if (!item) return { stockRestored: false, folioReversed: true };
+      const restoredQty = Math.abs(Math.trunc(Number(sale.qty ?? 1)));
       run(`UPDATE shop_items SET stock = stock + ? WHERE id = ? AND hotel_id = ?`, [
-        Math.abs(Math.trunc(Number(sale.qty ?? 1))),
+        restoredQty,
         item.id,
         hotelId,
       ]);
+
+      /*
+       * 撤销也要有库存流水（type = VOID，qty 记回库的绝对值）：
+       * 只回加库存不记流水，shop_stock_flows 的结存就会与 shop_items.stock 对不上，
+       * 盘点时查不出这 N 件是怎么回来的。
+       */
+      writeShopFlow({
+        hotelId,
+        itemId: item.id,
+        type: "VOID",
+        qty: restoredQty,
+        stockAfter: Number(
+          get<{ stock: number }>(`SELECT stock FROM shop_items WHERE id = ? AND hotel_id = ?`, [item.id, hotelId])
+            ?.stock ?? 0
+        ),
+        unitPrice: round2(Number(sale.amount ?? 0) / Math.max(1, restoredQty)),
+        amount: Math.abs(round2(Number(sale.amount ?? 0))),
+        saleId: id,
+        requestId: null,
+        note: `撤销销售单 #${id}：${reason}`,
+        operator: user.realName || user.username,
+        createdAt: now,
+      });
 
       /* 挂房账的销售：在客人账单上补一笔负项冲减（否则账单还欠着这笔钱） */
       let folioReversed = true;

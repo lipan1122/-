@@ -11,7 +11,7 @@
  *
  * ── 本文件提供的东西 ──
  *   invoices 表（迁移见 scripts/migrate-all.mjs 第 10 段）
- *   issueInvoice        开票：校验账单归属 / 已结账 / 不超应收，落台账
+ *   issueInvoice        开票：校验账单归属 / 已结账或已挂账 / 不超应收，落台账
  *   redFlushInvoice     红冲：生成负数票 + 原票状态置 RED，开票额度自动还回
  *   listInvoices        台账查询（按账单 / 营业日 / 区间 / 状态）
  *   invoiceStats        开票金额 / 红冲金额 / 净开票额
@@ -130,6 +130,8 @@ const STATUS_LABEL: Record<string, string> = {
 const FOLIO_STATUS_LABEL: Record<string, string> = {
   OPEN: "未结账",
   SETTLED: "已结账",
+  /* 第九轮缺陷修复：挂公司账也是「客账已结清」，只是钱由协议单位付 */
+  CHARGED: "已挂公司账",
   VOID: "已作废",
 };
 
@@ -284,9 +286,24 @@ function folioNetInvoiced(hotelId: number, folioId: number): number {
  *
  * 校验顺序（错误文案直接面向收银台，所以写得能照着改）：
  *   1. 抬头必填、金额 > 0 且不超过上限；
- *   2. 传了 folioId 时：账单必须属于当前酒店 → 必须已结账（SETTLED）→
+ *   2. 传了 folioId 时：账单必须属于当前酒店 → 必须已结清客账（SETTLED 或 CHARGED）→
  *      「该账单已开票净额 + 本次」不能超过账单 total_amount（同一账单可分次开）；
  *   3. invoice_no 为空时自动生成 INV-yyyymmdd-xxx，同酒店唯一。
+ *
+ * ── 为什么 CHARGED（挂公司账）允许开票（第九轮修复）──
+ * chargeToCompanyAction 把账单 balance 归 0、status 置 CHARGED：客账已结清，
+ * 钱转成协议单位的应收账款（ar_ledgers），但账务主体仍是这张 folio。
+ * 财务给协议单位开票时，抬头是公司、依据就是这张账单 —— 不放行等于「挂给公司的账
+ * 开不出公司抬头发票」，发票台账与账单永远对不上。
+ *
+ * 金额上限仍取 folios.total_amount、不是 folios.balance：挂账把 balance 归 0 了，
+ * 用 balance 会把可开额度算成 0；total_amount 是这张账单的应收总额，与是否收到钱无关。
+ * 红冲的唯一约束（idx_invoices_red_of）只认 invoices 表的 red_of，不涉及账单状态，
+ * 因此放开 CHARGED 不改变「一张原票只能红冲一次」。
+ *
+ * 仍不放行 OPEN（未结清）/ VOID（已作废）：前者客人还没付钱就先开票，
+ * 账单可能继续消费或被拆分，开票额度会随 balance 变动而失真；后者账单已作废。
+ * 这两档是刻意保留的业务风控，不是遗漏。
  *
  * 不抛异常：所有业务校验都以 `{ error }` 返回，方便 server action 直接转成表单提示。
  */
@@ -310,7 +327,7 @@ export function issueInvoice(input: InvoiceIssueInput): InvoiceResult {
   const bizDate = normalizeBizDate(input.bizDate, hotelId);
   if (!bizDate) return { error: "开票营业日格式不正确，应为 YYYY-MM-DD" };
 
-  /* ---------- 关联账单校验：已结账 + 不超应收 ---------- */
+  /* ---------- 关联账单校验：客账已结清（已结账 / 已挂账）+ 不超应收 ---------- */
   let folio: FolioBrief | null = null;
   const rawFolioId = input.folioId;
   if (rawFolioId !== undefined && rawFolioId !== null) {
@@ -320,10 +337,19 @@ export function issueInvoice(input: InvoiceIssueInput): InvoiceResult {
     folio = loadFolio(hotelId, folioId) ?? null;
     if (!folio) return { error: "关联账单不存在或不属于当前酒店" };
 
-    if (folio.status !== "SETTLED") {
+    /*
+     * 允许 SETTLED（客人已付）与 CHARGED（已挂协议单位，见上方口径说明）；
+     * OPEN / VOID 一律拒绝，错误文案按状态给出准确原因。
+     */
+    if (folio.status !== "SETTLED" && folio.status !== "CHARGED") {
       const label = FOLIO_STATUS_LABEL[folio.status] ?? folio.status;
+      if (folio.status === "OPEN") {
+        return {
+          error: `账单 ${folio.folio_no} 当前为「${label}」，未结账不能开发票（请先结账或挂公司账）`,
+        };
+      }
       return {
-        error: `账单 ${folio.folio_no} 当前为「${label}」，未结账不能开发票（请先结账）`,
+        error: `账单 ${folio.folio_no} 当前为「${label}」，不能开发票`,
       };
     }
 

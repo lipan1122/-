@@ -11,6 +11,9 @@ import { conflictMessage, findRoomConflicts } from "@/lib/room-availability";
 import { addDays, fmtMoney, nightsBetween, nowIso, todayStr } from "@/lib/utils";
 import { recalcFolioBalance } from "@/lib/folio";
 import { findGuestByIdentity } from "@/lib/guest-match";
+/* 第八轮业务冒烟 C6：会员充值唯一记账入口（member_wallet_ledger，member_id 维度）。
+ * 禁止再往 guest_name 维度的旧表 member_wallet 写单笔充值行，否则与收银台储值卡两套账。 */
+import { rechargeWallet } from "@/lib/member-wallet";
 
 /** 统一返回：{ error } 失败提示，{ ok } 成功提示（与 cashier/actions.ts 保持一致） */
 type ActionState = { error?: string; ok?: string };
@@ -1443,15 +1446,46 @@ export async function sendSmsAction(formData: FormData): Promise<ActionState> {
 }
 
 /**
- * 会员充值：懒建表 member_wallet 后写入一条 RECHARGE 记录
- * 入参：guest_name、amount、method
+ * 会员充值（房态 / 远期房态面板 / 房间卡片入口）
+ *
+ * ── 缺陷（第八轮业务冒烟 C6）──
+ * 旧实现自己懒建 `member_wallet`，然后 INSERT 一行（guest_name 维度）。
+ * 而收银台「会员储值卡」支付读的是 `member_wallet_ledger`（member_id 维度，
+ * 见 src/lib/member-wallet.ts 文件头「唯一记账明细」）。
+ * 两套账的后果：在「房态 → 会员充值」充 1000，收银台读到的储值余额仍是 0 ——
+ * 钱充进去了却花不出去。
+ *
+ * ── 修复 ──
+ * 一律调用 lib/member-wallet.rechargeWallet()（全项目唯一记账入口）：
+ *   · member_wallet_ledger 记 RECHARGE 正数流水，余额缓存由 SUM(流水) 回写；
+ *   · request_id 作幂等键（表单可带；未带时按普通充值处理，与收银台页面一致）；
+ *   · 本函数只保留前台口径的「单笔 5 万上限 + 原因必填」，比 service 的 999999 更严。
+ *
+ * ── 入参（三个既有表单的调用方式保持不变）──
+ *   guest_name / name    会员姓名（远期房态面板；房间卡片右栏表单）
+ *   stay_id              入住单（房间卡片行内表单只传它 → 取 stays.guest_id）
+ *   member_id / guest_id 显式会员主键（优先；供后续表单/接口升级）
+ *   amount / method / reason / request_id
+ *
+ * ── 旧表 member_wallet 的存量 ──
+ * 本函数不再 CREATE TABLE、不再 INSERT、不再读取旧表（表保留，避免丢历史数据）。
+ * 历史行（member_id IS NULL 的 guest_name 维度单笔充值）由
+ * `scripts/migrate-all.mjs` 第 8c 段一次性搬进 ledger：
+ *   · request_id = 'migrate:mw:<旧行 id>'，幂等（重复执行不会重复入账）；
+ *   · 按 (hotel_id, 姓名) 反查 guests，同名取最早一条；
+ *   · 找不到客史的行保留在原表、只提示人工核对（不删、不猜）。
+ * 缺陷真正的根因是「迁移过又被旧入口写回旧表」，所以本次重点是停掉旧写入路径；
+ * 存量按上面的迁移脚本处理，先迁移再上代码不会把钱算两遍。
  */
 export async function memberRechargeAction(formData: FormData): Promise<ActionState> {
   // 权限（P0-5：会员充值 = 收钱进储值（最严重的越权点：客房账号能凭空加钱）。）
   const user = await requirePermission("cashier.receive");
 
-  const guestName = firstStr(formData, ["guest_name", "name"]);
-  if (!guestName) return { error: "请填写会员姓名" };
+  let guestName = firstStr(formData, ["guest_name", "name"]);
+  const rawMemberId = Math.trunc(numOf(formData, "member_id") || numOf(formData, "guest_id"));
+  const rawStayId = Math.trunc(numOf(formData, "stay_id"));
+  if (!guestName && rawMemberId <= 0 && rawStayId <= 0) return { error: "请填写会员姓名" };
+
   const amount = round2(numOf(formData, "amount"));
   if (!(amount > 0)) return { error: "充值金额必须大于 0" };
   /*
@@ -1470,37 +1504,92 @@ export async function memberRechargeAction(formData: FormData): Promise<ActionSt
   }
   const method = str(formData, "method") || "现金";
 
-  getDb().exec(`
-    CREATE TABLE IF NOT EXISTS member_wallet (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      hotel_id INTEGER NOT NULL,
-      guest_name TEXT NOT NULL,
-      amount REAL DEFAULT 0,
-      type TEXT NOT NULL DEFAULT 'RECHARGE',
-      note TEXT,
-      created_at TEXT
+  /* ---------- 会员定位：显式 ID → 入住单客史 → 姓名唯一匹配 ----------
+   * 三种入口必须都收敛到 guests.id：ledger.member_id 是 NOT NULL，
+   * 收银台也是按 guests.id 汇总余额的。旧实现把姓名直接写进旧表，
+   * 连「房间卡片行内充值」（表单只有 stay_id）都会因为没姓名而被拒。 */
+  const loadGuest = (guestId: number) =>
+    get<{ id: number; name: string; mobile: string | null }>(
+      `SELECT id, name, mobile FROM guests WHERE id = ? AND hotel_id = ?`,
+      [guestId, user.hotelId]
     );
-  `);
 
-  tx(() => {
-    run(`INSERT INTO member_wallet (hotel_id, guest_name, amount, type, note, created_at) VALUES (?,?,?,?,?,?)`, [
-      user.hotelId,
-      guestName,
-      amount,
-      "RECHARGE",
-      `充值方式：${method} · 原因：${rechargeReason}`,
-      nowIso(),
-    ]);
+  let memberId = 0;
+  let memberLabel = guestName;
+
+  if (rawMemberId > 0) {
+    const hit = loadGuest(rawMemberId);
+    if (!hit) return { error: `会员（ID ${rawMemberId}）不存在，或不属于当前酒店` };
+    memberId = hit.id;
+    memberLabel = hit.name;
+  } else if (rawStayId > 0) {
+    const stay = get<{ guest_id: number | null; guest_name: string | null }>(
+      `SELECT guest_id, guest_name FROM stays WHERE id = ? AND hotel_id = ?`,
+      [rawStayId, user.hotelId]
+    );
+    if (!stay) return { error: "入住单不存在或不属于当前酒店，无法确定充值会员" };
+    const hit = stay.guest_id ? loadGuest(stay.guest_id) : undefined;
+    if (hit) {
+      memberId = hit.id;
+      memberLabel = hit.name;
+    } else if (stay.guest_name) {
+      guestName = stay.guest_name;
+    } else {
+      return { error: "该入住单没有关联客史，请先补登客人资料再充值" };
+    }
+  }
+
+  if (memberId <= 0) {
+    if (!guestName) return { error: "该入住单没有关联客史，请先补登客人资料再充值" };
+    /*
+     * 姓名匹配必须唯一：同名客人充给谁无法判断，不能像旧表那样按姓名合并成一笔。
+     * 多条同名的处理是「拒绝 + 指路」，不是猜最早一条 —— 充错人的钱很难追回。
+     */
+    const hits = all<{ id: number; name: string; mobile: string | null }>(
+      `SELECT id, name, mobile FROM guests WHERE hotel_id = ? AND name = ? ORDER BY id`,
+      [user.hotelId, guestName]
+    );
+    if (hits.length === 0) {
+      return {
+        error: `未找到名为「${guestName}」的客史，无法充值：请先在入住/会员管理里建档，或到收银台「会员储值」页按会员办理`,
+      };
+    }
+    if (hits.length > 1) {
+      const candidates = hits
+        .slice(0, 3)
+        .map((h) => `${h.name}${h.mobile ? `（尾号 ${h.mobile.slice(-4)}）` : ""}`)
+        .join("、");
+      return {
+        error: `本店有 ${hits.length} 位同名会员「${guestName}」，无法确定充值对象（${candidates}…）：请到收银台「会员储值」页按手机号选择会员`,
+      };
+    }
+    memberId = hits[0].id;
+    memberLabel = hits[0].name;
+  }
+
+  /* ---------- 记账：唯一入口 + 同一事务写操作日志 ---------- */
+  const requestId = str(formData, "request_id") || undefined;
+  const result = tx(() => {
+    /* rechargeWallet 内部用 SAVEPOINT，可在外层 tx 里安全调用（见 member-wallet.ts「事务」段） */
+    const written = rechargeWallet(user.hotelId, memberId, amount, {
+      operator: user.realName,
+      remark: `充值方式：${method} · 原因：${rechargeReason}（房态会员充值）`,
+      refType: "rooms.memberRecharge",
+      requestId,
+    });
+    if ("error" in written) return written;
     writeOpLog(
       user.hotelId,
       user.realName,
       "会员充值",
-      `会员 ${guestName} · 方式 ${method} · 金额 ${fmtMoney(amount)} · 原因：${rechargeReason}`
+      `会员 ${memberLabel}（ID ${memberId}）· 方式 ${method} · 金额 ${fmtMoney(amount)} · 原因：${rechargeReason} · 储值余额 ${fmtMoney(written.balance)}`
     );
+    return written;
   });
+  if ("error" in result) return { error: result.error };
 
   revalidateRooms();
-  return { ok: `已为 ${guestName} 充值 ${fmtMoney(amount)}（${method}）` };
+  return { ok: `已为 ${memberLabel} 充值 ${fmtMoney(amount)}（${method}），储值余额 ${fmtMoney(result.balance)}` };
 }
 
 /**

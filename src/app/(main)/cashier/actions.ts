@@ -7,7 +7,7 @@ import { bizToday } from "@/lib/biz-date";
 import { requirePermission, requireUser } from "@/lib/session";
 import { changeRoomStatus } from "@/lib/room-status";
 import { fmtMoney, nowIso, todayStr } from "@/lib/utils";
-import { NON_REVENUE_ITEM, recalcFolioBalance } from "@/lib/folio";
+import { NON_REVENUE_ITEM, depositHeld, recalcFolioBalance } from "@/lib/folio";
 import { getCompanyOutstanding, postArCharge } from "@/lib/ar";
 import { issueInvoice } from "@/lib/invoice";
 /* 第 4 轮 P1-9：收银台支持会员储值卡支付（扣余额） */
@@ -460,8 +460,8 @@ export async function refundPaymentAction(formData: FormData): Promise<ActionSta
   if (amount <= 0) return { error: "退款金额必须大于 0" };
   if (!reason) return { error: "请填写退款原因" };
 
-  const pay = get<{ id: number; hotel_id: number; folio_id: number | null; stay_id: number | null; method: string; amount: number; refund_of: number | null }>(
-    `SELECT id, hotel_id, folio_id, stay_id, method, amount, refund_of FROM payments
+  const pay = get<{ id: number; hotel_id: number; folio_id: number | null; stay_id: number | null; method: string; amount: number; refund_of: number | null; remark: string | null }>(
+    `SELECT id, hotel_id, folio_id, stay_id, method, amount, refund_of, remark FROM payments
       WHERE id = ? AND hotel_id = ?`,
     [paymentId, user.hotelId]
   );
@@ -518,8 +518,73 @@ export async function refundPaymentAction(formData: FormData): Promise<ActionSta
     return { error: "账单已结账，请先撤销结账再退款" };
   }
 
+  let appliedDepositOffset = 0;
   try {
-    tx(() => {
+    appliedDepositOffset = tx(() => {
+      /*
+       * 押金冲销（第八轮业务冒烟 D3b）
+       *
+       * 旧实现这里只有 paid_amount -= amount + recalcFolioBalance，
+       * 注释承诺的「同步冲销押金口径」并没有落 SQL：
+       * 手动退了押金，folio_items 的 DEPOSIT 明细与 stays.deposit 还是原值。
+       * 后果不是「钱少退/多退」而是**押金负债口径错**：
+       *   · 「在住押金」报表 / 在住列表按 stays.deposit 汇总，会一直虚高；
+       *   · 前台按押金明细判断「还能退多少」，会重复退一次；
+       *   · 退房时 checkoutAction 还按剩余押金明细继续冲减，账实始终对不上。
+       *
+       * 判定「这笔退款动到了押金」的两个来源（满足其一）：
+       *   ① 原收款本身就是押金收款：remark 含「押金」/「预收」
+       *      —— 入住建押金写「入住押金」，addDepositAction 写「预收款（…）」/「预收款」；
+       *      checkoutAction 找押金原收款也用 `remark LIKE '%押金%'` 这套业务标记。
+       *   ② 退款金额超过「非押金已收」：非押金已收 = 已收 − 押金明细，即客人实付的消费款；
+       *      退的钱超过这一块，超出部分只可能出自押金。
+       *
+       * 冲销额 = min(判定金额, 押金明细余额, stays.deposit)：
+       *   两条上限各自兜底，任一维度都不会被减成负数。
+       *
+       * 注意这里**不再**减 folios.paid_amount：下面的退款流水已经让 paid 减过一次，
+       * 押金冲销只改「押金负债」，不重复扣收款（否则余额会多算一次退款）。
+       */
+      const moneyBeforeRefund = recalcFolioBalance(user.hotelId, refundFolioId);
+      const depositHeldBefore = depositHeld(user.hotelId, refundFolioId);
+      const payRemark = String(pay.remark ?? "");
+      const isDepositPayment = /押金|预收/.test(payRemark);
+      const nonDepositPaid = round2(moneyBeforeRefund.paid - depositHeldBefore);
+      const depositPortion = isDepositPayment
+        ? amount
+        : round2(Math.max(0, amount - Math.max(0, nonDepositPaid)));
+
+      /*
+       * 押金冲销要落到入住单：收款行的 stay_id 可能为空（旧数据 / 挂账收款），
+       * 用账单上的 stay_id 兜底 —— 否则会出现「明细冲销了、stays.deposit 没减」，
+       * 在住列表与「在住押金」报表仍虚高。
+       */
+      const depositStayId =
+        pay.stay_id ??
+        get<{ stay_id: number | null }>(`SELECT stay_id FROM folios WHERE id = ? AND hotel_id = ?`, [
+          refundFolioId,
+          user.hotelId,
+        ])?.stay_id ??
+        null;
+      let stayDeposit = 0;
+      if (depositStayId) {
+        stayDeposit = round2(
+          Number(
+            get<{ d: number | null }>(
+              `SELECT COALESCE(deposit, 0) AS d FROM stays WHERE id = ? AND hotel_id = ?`,
+              [depositStayId, user.hotelId]
+            )?.d ?? 0
+          )
+        );
+      }
+      const depositOffset = round2(
+        Math.min(
+          depositPortion,
+          Math.max(0, depositHeldBefore),
+          depositStayId ? Math.max(0, stayDeposit) : Math.max(0, depositHeldBefore)
+        )
+      );
+
       run(
         `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, refund_of, operator)
          VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
@@ -537,14 +602,59 @@ export async function refundPaymentAction(formData: FormData): Promise<ActionSta
           user.realName ?? user.username,
         ]
       );
+
+      if (depositOffset > 0.001) {
+        /*
+         * 逐行冲销押金明细（取代「只冲最新一行」的旧写法）
+         *
+         * 旧写法用子查询锁一行，但**没限制「冲销额 ≤ 该行余额」**：
+         * 若最新一笔押金只有 300、而应冲 600，那一行会被冲成 -300（负押金）。
+         * 真库目前每张账单只有 1 条押金明细所以不暴露，多次收押金后就会踩到。
+         *
+         * 现在与 checkoutAction 同款：
+         *   · 优先冲最新的那笔
+         *   · 单笔 ≤ 该行余额
+         *   · 总额 ≤ stays.deposit（明细不足时不会把 stays.deposit 减成负数）
+         *   · stays.deposit 按「实际冲销额」减，不按应冲额
+         */
+        let left = depositOffset;
+        const depLines = all<{ id: number; amount: number }>(
+          `SELECT id, amount FROM folio_items
+            WHERE folio_id = ? AND hotel_id = ? AND item_type = 'DEPOSIT' AND amount > 0.005
+            ORDER BY id DESC`,
+          [refundFolioId, user.hotelId]
+        );
+        let applied = 0;
+        for (const line of depLines) {
+          if (left <= 0.005) break;
+          const take = Math.min(left, Number(line.amount));
+          run(
+            `UPDATE folio_items SET amount = amount - ?
+              WHERE id = ? AND folio_id = ? AND hotel_id = ? AND item_type = 'DEPOSIT'`,
+            [take, line.id, refundFolioId, user.hotelId]
+          );
+          left = Math.round((left - take) * 100) / 100;
+          applied = Math.round((applied + take) * 100) / 100;
+        }
+        if (depositStayId && applied > 0) {
+          run(`UPDATE stays SET deposit = MAX(0, COALESCE(deposit, 0) - ?) WHERE id = ? AND hotel_id = ?`, [
+            applied,
+            depositStayId,
+            user.hotelId,
+          ]);
+        }
+        writeLog(
+          user.hotelId,
+          user.realName,
+          "退款冲销押金",
+          `账单 #${refundFolioId} · 退款 ${fmtMoney(amount)}（原收款 #${pay.id}，${payRemark || pay.method}）· 冲销押金 ${fmtMoney(depositOffset)}`
+        );
+      }
+
       /*
        * 退款后重算（第 4 轮 P0-1 + P0-3）
        *
        * 不再在 SQL 里手算 balance；只扣 paid_amount，再统一重算。
-       *
-       * 另外补两件旧实现漏掉的事（P0-3）：退款必须同步冲销押金口径，
-       * 否则「退了钱但押金明细和 stays.deposit 还是原值」，账实不符。
-       * 这两行只对 DEPOSIT 明细生效（没有押金时 UPDATE 影响 0 行，无副作用）。
        */
       run(`UPDATE folios SET paid_amount = COALESCE(paid_amount,0) - ? WHERE id = ? AND hotel_id = ?`, [
         amount,
@@ -552,13 +662,16 @@ export async function refundPaymentAction(formData: FormData): Promise<ActionSta
         user.hotelId,
       ]);
       recalcFolioBalance(user.hotelId, refundFolioId);
+      return depositOffset;
     });
   } catch (e) {
     return { error: e instanceof Error ? e.message : "退款失败" };
   }
 
   revalidateCashier();
-  return { ok: `已退款 ${fmtMoney(amount)}（原因：${reason}）` };
+  return appliedDepositOffset > 0.001
+    ? { ok: `已退款 ${fmtMoney(amount)}（原因：${reason}），其中同步冲销押金 ${fmtMoney(appliedDepositOffset)}` }
+    : { ok: `已退款 ${fmtMoney(amount)}（原因：${reason}）` };
 }
 
 /**
@@ -1271,18 +1384,52 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
           user.realName ?? user.username,
         ]
       );
-      /* ② 冲销押金明细 */
-      run(
-        `UPDATE folio_items SET amount = amount - ?
-          WHERE folio_id = ? AND hotel_id = ? AND item_type = 'DEPOSIT'`,
-        [refundCash, folioId, user.hotelId]
+      /*
+       * ② 冲销押金明细：按行逐笔冲，单条 UPDATE 只改一行
+       *
+       * 同一张账单可以多次收押金（addDepositAction 每次插一条 DEPOSIT 明细）。
+       * 写成 `UPDATE ... WHERE item_type = 'DEPOSIT'` 的批量语句会把**每条**都减一遍：
+       * 账单挂了 3 条押金（各 600），退房应退 600，批量 UPDATE 之后
+       * 押金明细总额从 1800 变成 1200 —— 少掉的 600 是「被多冲了 2 次」。
+       * refundPaymentAction（本文件 610 行起）第九轮已修成同样的写法，这里对齐。
+       *
+       * 两条硬边界：
+       *   · 单笔冲销额不超过该行余额（否则会把某条冲成负押金）；
+       *   · 冲销总额不超过 stays.deposit（否则「在住押金」会变负，报表虚高）。
+       * 优先冲最新收的那笔（ORDER BY id DESC），符合前台「后收先退」的习惯。
+       */
+      const stayDepositRow = get<{ d: number | null }>(
+        `SELECT COALESCE(deposit, 0) AS d FROM stays WHERE id = ? AND hotel_id = ?`,
+        [stayId, user.hotelId]
       );
-      /* ③ 减入住单押金 */
-      run(`UPDATE stays SET deposit = COALESCE(deposit, 0) - ? WHERE id = ? AND hotel_id = ?`, [
-        refundCash,
-        stayId,
-        user.hotelId,
-      ]);
+      let depositLeft = round2(Math.min(refundCash, Math.max(0, Number(stayDepositRow?.d ?? 0))));
+      const depositLines = all<{ id: number; amount: number | null }>(
+        `SELECT id, amount FROM folio_items
+          WHERE folio_id = ? AND hotel_id = ? AND item_type = 'DEPOSIT' AND COALESCE(amount, 0) > 0.005
+          ORDER BY id DESC`,
+        [folioId, user.hotelId]
+      );
+      let depositOffset = 0;
+      for (const line of depositLines) {
+        if (depositLeft <= 0.005) break;
+        const take = round2(Math.min(depositLeft, Number(line.amount ?? 0)));
+        if (take <= 0.005) continue;
+        run(
+          `UPDATE folio_items SET amount = COALESCE(amount, 0) - ?
+            WHERE id = ? AND folio_id = ? AND hotel_id = ? AND item_type = 'DEPOSIT'`,
+          [take, line.id, folioId, user.hotelId]
+        );
+        depositOffset = round2(depositOffset + take);
+        depositLeft = round2(depositLeft - take);
+      }
+      /* ③ 减入住单押金（按实际冲销额；明细不足时不能把 stays.deposit 减成负数） */
+      if (depositOffset > 0.005) {
+        run(`UPDATE stays SET deposit = COALESCE(deposit, 0) - ? WHERE id = ? AND hotel_id = ?`, [
+          depositOffset,
+          stayId,
+          user.hotelId,
+        ]);
+      }
       /* ④ 减已收并重算 */
       run(`UPDATE folios SET paid_amount = COALESCE(paid_amount,0) - ? WHERE id = ? AND hotel_id = ?`, [
         refundCash,
@@ -1294,7 +1441,8 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
         user.hotelId,
         user.realName,
         "退房退还押金",
-        `入住单 ${stay.stay_no} · 账单 ${folio.folio_no} · 退还 ${fmtMoney(refundCash)}（${depositPay?.method ?? "现金"}）`
+        `入住单 ${stay.stay_no} · 账单 ${folio.folio_no} · 退还 ${fmtMoney(refundCash)}（${depositPay?.method ?? "现金"}）` +
+          ` · 冲销押金明细 ${fmtMoney(depositOffset)}（${depositLines.length} 条押金，逐笔冲销）`
       );
     }
 

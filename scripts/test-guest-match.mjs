@@ -43,8 +43,24 @@ const files = [
 ];
 for (const [f, label] of files) {
   const s = readFileSync(join(...f.split("/")), "utf8");
-  const nameLookup = /FROM guests WHERE hotel_id = \? AND name = \?/.test(s);
-  check(`${label}不再按姓名定位客史（${f.split("/").pop()}）`, !nameLookup);
+
+  /*
+   * 精确区分「按姓名**定位**」和「用姓名做**唯一性校验**」
+   *
+   * guest-match 的设计是：定位客史只能用「证件号 → 手机号」，姓名不参与定位。
+   * 但有些场景拿不到 id/证件号/手机号（比如历史数据 `stays.guest_id` 为空，
+   * 只有 guest_name），这时用姓名是**唯一可行的回退**，但必须满足：
+   *   · 不直接用 `LIMIT 1` 取第一条（那才会充错/改错人）
+   *   · 查全部候选，0 条拒绝、多条拒绝（同名歧义）、恰好 1 条才用
+   *
+   * 所以断言改成：**不允许「按姓名 LIMIT 1 直接定位」**，
+   * 允许「查全部 + 判断歧义」的保守回退。
+   */
+  const blindNameLookup =
+    /FROM guests WHERE hotel_id = \? AND name = \?[^`]*?LIMIT 1/.test(s) ||
+    /FROM guests WHERE hotel_id = \? AND name = \?`\s*,\s*\[[^\]]*\]\s*\)/.test(s);
+
+  check(`${label}不再按姓名盲取客史（${f.split("/").pop()}）`, !blindNameLookup);
 }
 
 /* ---------- 2. 数据：唯一约束 ---------- */

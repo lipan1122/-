@@ -4,7 +4,7 @@ import { requireUser } from "@/lib/session";
 import { fmtMoney, todayStr } from "@/lib/utils";
 import ConfirmForm from "@/components/ConfirmForm";
 import { ShopPOS } from "@/components/ShopPOS";
-import { ensureShopPageSchema, sellCartAction, voidSaleAction } from "./actions";
+import { ensureShopPageSchema, voidSaleAction } from "./actions";
 
 export const dynamic = "force-dynamic";
 
@@ -61,16 +61,6 @@ export default async function ShopPage({ searchParams }: { searchParams: Promise
   );
 
   const totalSales = todaySales.reduce((a, s) => a + (s.voided_at ? 0 : Number(s.amount ?? 0)), 0);
-
-  async function submitOrder(payload: { itemId: number; qty: number; roomNo: string; method: string }) {
-    "use server";
-    const fd = new FormData();
-    fd.set("item_id", String(payload.itemId));
-    fd.set("qty", String(payload.qty));
-    fd.set("room_no", payload.roomNo);
-    fd.set("method", payload.method);
-    await sellCartAction(fd);
-  }
 
   return (
     <div className="flex">
@@ -199,7 +189,6 @@ export default async function ShopPage({ searchParams }: { searchParams: Promise
           <ShopPOS
             items={items.map((i) => ({ id: i.id, name: i.name, price: Number(i.price), stock: it0(i.stock), category: i.category }))}
             rooms={rooms.map((r) => ({ roomNo: r.room_no, guestName: r.guest_name }))}
-            onSubmit={submitOrder}
             msg={sp.msg}
             err={sp.err}
           />

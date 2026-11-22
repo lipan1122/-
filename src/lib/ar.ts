@@ -19,9 +19,26 @@
  *   ar_accounts / ar_transactions 是「账户维度总账」：一个 AR 账户一个余额，
  *   由 src/app/(main)/ar/actions.ts 懒建并灌种子，报表与核销都按它算。
  *   ar_ledgers 是「协议单位维度的笔级明细」，主键 company_id。
- *   两者是总账 vs 明细的关系，company 与 ar_account 之间没有现成外键，
- *   强行合并会改变既有 5 个种子账户 / 55 条流水的口径，风险大于收益，
- *   因此新建台账表，并在 /ar 页面并排展示。
+ *
+ * ── 第九轮修复（F12）：两套台账原来各写各的，挂账在 AR 报表里查不到 ──
+ *   chargeToCompanyAction 只调 postArCharge → 只写 ar_ledgers；
+ *   AR 报表（reports/page.tsx 的 arAccountAgg）只读 ar_accounts + ar_transactions。
+ *   于是「挂给协议单位的应收」在 AR 报表里命中 0 条 —— 财务看不到这笔钱。
+ *
+ *   修法：**双写**。以 ar_ledgers 为笔级权威（信用额度、账龄、逐笔核销都靠它），
+ *   同时把同一笔金额写进账户维度总账：
+ *     · 每个协议单位对应一个 AR 账户（company_id 精确绑定 / 名称唯一匹配 / 懒建镜像账户）；
+ *     · 挂账 → ar_transactions 一条 POST + ar_accounts.balance 增加同额；
+ *     · 核销 → ar_transactions 一条 PAY（负数）+ balance 减少同额。
+ *   两处金额在同一个 SAVEPOINT 里写，任一步失败整体回滚，
+ *   因此 ar_accounts.balance 始终等于该账户 SUM(ar_transactions.amount)，
+ *   且「挂账/核销」那部分与 ar_ledgers 的 amount/settled_amount 一一对应，
+ *   不存在两套互相打架的账。报表读账户总账即可看到挂账产生的应收。
+ *
+ *   为什么不让报表改读 ar_ledgers：ar_ledgers 没有账户/授信/流水概念，
+ *   账龄、还款、转账、授信占用都建立在 ar_accounts 上；只改报表等于把
+ *   /ar 页面（账户）与报表（协议单位）拆成两个宇宙，财务仍要对两本账。
+ *   双写让两边在同一个账户下汇合，才是根因修复。
  *
  * ── 事务 ──
  * 与 member-wallet.ts 一致用 SAVEPOINT：本文件会在收银台已有的 tx() 内被调用，
@@ -85,6 +102,8 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const AGING_BUCKETS = ["0–30 天", "31–60 天", "61–90 天", "90 天以上"] as const;
 
 let schemaReady = false;
+/** 账户总账表（ar_accounts / ar_transactions）是否已兜底建过（第九轮 F12 双写用） */
+let arAccountSchemaReady = false;
 let savepointSeq = 0;
 
 function round2(n: number): number {
@@ -140,6 +159,275 @@ function atomically<T>(fn: () => T): T {
     }
     throw e;
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * 账户维度总账双写（第九轮 F12）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 账户总账表兜底（幂等）
+ *
+ * ar_accounts / ar_transactions 正常由 scripts/schema-full.sql 建、
+ * 老库由 scripts/migrate-all.mjs 补列、/ar 页面由 ensureArSchema 懒建。
+ * 但 postArCharge 可能在「收银台第一次挂账、还没人打开过 /ar」时被调用，
+ * 这时表可能不存在 —— 挂账不能因为别人没先建表而失败，这里兜底建。
+ *
+ * company_id 是本次修复新增的绑定列：
+ *   · 新库直接建成带列的表；
+ *   · 老库 CREATE TABLE IF NOT EXISTS 不会补列，用 ALTER 补（幂等，并发重复补吞掉
+ *     duplicate column name）。
+ */
+export function ensureArAccountSchema(): void {
+  if (arAccountSchemaReady) return;
+  const db = getDb();
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ar_accounts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      hotel_id INTEGER NOT NULL,
+      code TEXT NOT NULL,
+      name TEXT NOT NULL,
+      type TEXT NOT NULL,
+      credit_limit REAL DEFAULT 0,
+      balance REAL DEFAULT 0,
+      status TEXT DEFAULT 'ON',
+      contact TEXT,
+      phone TEXT,
+      company_id INTEGER,
+      created_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ar_transactions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      hotel_id INTEGER NOT NULL,
+      ar_account_id INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      amount REAL NOT NULL,
+      balance_after REAL NOT NULL,
+      note TEXT,
+      operator TEXT,
+      biz_date TEXT NOT NULL,
+      request_id TEXT,
+      created_at TEXT NOT NULL
+    )
+  `);
+  const columnsOf = (table: string): string[] =>
+    db
+      .prepare(`PRAGMA table_info(${table})`)
+      .all()
+      .map((c) => String((c as { name?: unknown }).name ?? ""));
+  const addColumn = (table: string, ddl: string) => {
+    try {
+      db.exec(ddl);
+    } catch (e) {
+      /* 多实例并发补列时后到的会拿到 duplicate column name：列已经有了，不是故障 */
+      if (!/duplicate column name/i.test(e instanceof Error ? e.message : String(e))) throw e;
+    }
+  };
+  if (!columnsOf("ar_accounts").includes("company_id")) {
+    addColumn("ar_accounts", `ALTER TABLE ar_accounts ADD COLUMN company_id INTEGER`);
+  }
+  if (!columnsOf("ar_transactions").includes("request_id")) {
+    addColumn("ar_transactions", `ALTER TABLE ar_transactions ADD COLUMN request_id TEXT`);
+  }
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_ar_tx_request
+       ON ar_transactions (hotel_id, request_id) WHERE request_id IS NOT NULL`
+  );
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_ar_accounts_company
+       ON ar_accounts (hotel_id, company_id) WHERE company_id IS NOT NULL`
+  );
+  arAccountSchemaReady = true;
+}
+
+/** 读账户当前余额（双写前取快照，与 ar/actions.ts 的 setBalance 同口径） */
+function accountBalance(hotelId: number, accountId: number): number {
+  const row = get<{ balance: number | null }>(
+    `SELECT COALESCE(balance, 0) AS balance FROM ar_accounts WHERE id = ? AND hotel_id = ?`,
+    [accountId, hotelId]
+  );
+  return round2(Number(row?.balance ?? 0));
+}
+
+/** 账户维度记一笔流水并同步余额（正数增加应收、负数减少应收） */
+function addAccountTx(opts: {
+  hotelId: number;
+  accountId: number;
+  type: "POST" | "PAY";
+  amount: number;
+  bizDate: string;
+  operator: string;
+  note: string;
+  requestId?: string;
+}): void {
+  const { hotelId, accountId, type, amount, bizDate, operator, note, requestId } = opts;
+  const after = round2(accountBalance(hotelId, accountId) + amount);
+  run(
+    `INSERT INTO ar_transactions
+       (hotel_id, ar_account_id, type, amount, balance_after, note, operator, biz_date, request_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      hotelId,
+      accountId,
+      type,
+      round2(amount),
+      after,
+      note || null,
+      operator,
+      bizDate,
+      requestId || null,
+      nowIso(),
+    ]
+  );
+  run(`UPDATE ar_accounts SET balance = ? WHERE id = ? AND hotel_id = ?`, [after, accountId, hotelId]);
+}
+
+/**
+ * 该协议单位对应的 AR 账户
+ *
+ * 解析顺序（每一步都写回 company_id 固化，之后不再靠猜）：
+ *   1. company_id 精确绑定 —— 主路径，挂账/核销都用它；
+ *   2. 名称唯一匹配未绑定账户：种子账户用的是简称（「杭州云启科技」）而
+ *      companies 是全称（「杭州云启科技有限公司」），互含即算命中，
+ *      但**必须唯一命中**才认，避免把「西湖旅行社」和「春秋旅行社」之类配错；
+ *   3. 都没有 → 懒建镜像账户（code = ARC + 三位 companyId）。
+ *
+ * 懒建时把该单位**历史 ar_ledgers 的未结余额**作为一条期初 POST 流水结转进账户，
+ * 这样升级前已有挂账的老库不会在报表里凭空少掉一笔应收；
+ * 绑定到既有账户（种子账户有自己的期初流水）时不再补期初，避免重复记账。
+ *
+ * @param excludeLedgerId 本次刚写/刚累加的那条台账 id（结转期初时必须排除，
+ *                        否则「历史 500 + 本次 200」会被结转成 700 再加本次 200 = 900）
+ */
+function resolveArAccount(
+  hotelId: number,
+  companyId: number,
+  companyName: string,
+  excludeLedgerId?: number
+): number {
+  const bound = get<{ id: number }>(
+    `SELECT id FROM ar_accounts WHERE hotel_id = ? AND company_id = ? ORDER BY id LIMIT 1`,
+    [hotelId, companyId]
+  );
+  if (bound) return Number(bound.id);
+
+  const name = companyName.trim();
+  if (name) {
+    const unbound = all<{ id: number; name: string | null }>(
+      `SELECT id, name FROM ar_accounts WHERE hotel_id = ? AND company_id IS NULL ORDER BY id`,
+      [hotelId]
+    );
+    const hits = unbound.filter((a) => {
+      const an = String(a.name ?? "").trim();
+      if (!an) return false;
+      return an === name || name.includes(an) || an.includes(name);
+    });
+    if (hits.length === 1) {
+      run(
+        `UPDATE ar_accounts SET company_id = ? WHERE id = ? AND hotel_id = ? AND company_id IS NULL`,
+        [companyId, hits[0].id, hotelId]
+      );
+      return Number(hits[0].id);
+    }
+  }
+
+  /* 懒建前先看同 code 是否已被人工建过（老版本/手工录入），有就复用并绑定 */
+  const code = `ARC${String(companyId).padStart(3, "0")}`;
+  const byCode = get<{ id: number }>(
+    `SELECT id FROM ar_accounts WHERE hotel_id = ? AND code = ? ORDER BY id LIMIT 1`,
+    [hotelId, code]
+  );
+  if (byCode) {
+    run(
+      `UPDATE ar_accounts SET company_id = COALESCE(company_id, ?) WHERE id = ? AND hotel_id = ?`,
+      [companyId, byCode.id, hotelId]
+    );
+    return Number(byCode.id);
+  }
+
+  const created = run(
+    `INSERT INTO ar_accounts
+       (hotel_id, code, name, type, credit_limit, balance, status, company_id, created_at)
+     VALUES (?, ?, ?, '协议单位', 0, 0, 'ON', ?, ?)`,
+    [hotelId, code, name || `协议单位#${companyId}`, companyId, nowIso()]
+  );
+  const accountId = created.lastInsertRowid;
+
+  /* 历史台账结转：升级前只写了 ar_ledgers 的未结余额，不进账户就会在报表里消失 */
+  const exclude = Number.isFinite(Number(excludeLedgerId)) && Number(excludeLedgerId) > 0 ? Math.trunc(Number(excludeLedgerId)) : 0;
+  const carry = get<{ total: number | null; first_date: string | null }>(
+    `SELECT COALESCE(SUM(amount - COALESCE(settled_amount, 0)), 0) AS total,
+            MIN(biz_date) AS first_date
+       FROM ar_ledgers
+      WHERE hotel_id = ? AND company_id = ? AND status IN ('OPEN', 'PARTIAL')
+        AND (? = 0 OR id <> ?)`,
+    [hotelId, companyId, exclude, exclude]
+  );
+  const carryAmount = round2(Number(carry?.total ?? 0));
+  if (carryAmount > EPS) {
+    addAccountTx({
+      hotelId,
+      accountId,
+      type: "POST",
+      amount: carryAmount,
+      bizDate: normalizeBizDate(carry?.first_date ?? undefined),
+      operator: "系统结转",
+      note: `期初余额结转：历史挂账台账（协议单位 #${companyId}）`,
+    });
+  }
+  return Number(accountId);
+}
+
+/** 挂账双写：协议单位台账 → 账户维度一笔 POST */
+function syncChargeToAccount(opts: {
+  hotelId: number;
+  companyId: number;
+  companyName: string;
+  amount: number;
+  bizDate: string;
+  operator: string;
+  note: string;
+  /** 本次挂账对应的台账 id：懒建账户结转历史余额时排除它 */
+  ledgerId?: number;
+}): void {
+  ensureArAccountSchema();
+  const accountId = resolveArAccount(opts.hotelId, opts.companyId, opts.companyName, opts.ledgerId);
+  addAccountTx({
+    hotelId: opts.hotelId,
+    accountId,
+    type: "POST",
+    amount: opts.amount,
+    bizDate: opts.bizDate,
+    operator: opts.operator,
+    note: opts.note,
+  });
+}
+
+/** 核销双写：协议单位台账的 settled_amount 增加 → 账户维度一笔 PAY（负数） */
+function syncSettleToAccount(opts: {
+  hotelId: number;
+  companyId: number;
+  amount: number;
+  bizDate: string;
+  operator: string;
+  note: string;
+  requestId: string;
+}): void {
+  ensureArAccountSchema();
+  const companyName = companyNameOf(opts.hotelId, opts.companyId) ?? `协议单位#${opts.companyId}`;
+  const accountId = resolveArAccount(opts.hotelId, opts.companyId, companyName);
+  addAccountTx({
+    hotelId: opts.hotelId,
+    accountId,
+    type: "PAY",
+    amount: round2(-opts.amount),
+    bizDate: opts.bizDate,
+    operator: opts.operator,
+    note: opts.note,
+    requestId: opts.requestId,
+  });
 }
 
 /** 营业日归一：非法输入回落到今天 */
@@ -248,6 +536,20 @@ export function postArCharge(hotelId: number, input: ArChargeInput): ArPostResul
           WHERE id = ? AND hotel_id = ?`,
         [amount, `；追加挂账 ${amount}`, existed.id, hotelId]
       );
+      /*
+       * 双写（第九轮 F12）：追加的金额同样要进账户总账，否则报表里的区间建账
+       * 只算第一次挂账，与台账的未结余额越差越远。
+       */
+      syncChargeToAccount({
+        hotelId,
+        companyId,
+        companyName,
+        amount,
+        bizDate,
+        operator: input.operator ?? "系统",
+        note: `挂账（追加）：账单 ${folioNo ?? "-"} · 协议单位 ${companyName}`,
+        ledgerId: existed.id,
+      });
       return { ok: true as const, id: existed.id };
     }
 
@@ -269,6 +571,17 @@ export function postArCharge(hotelId: number, input: ArChargeInput): ArPostResul
         nowIso(),
       ]
     );
+    /* 双写（第九轮 F12）：同一事务内写账户流水 + 余额，报表读账户总账就能看到这笔应收 */
+    syncChargeToAccount({
+      hotelId,
+      companyId,
+      companyName,
+      amount,
+      bizDate,
+      operator: input.operator ?? "系统",
+      note: `挂账：账单 ${folioNo ?? "-"} · 协议单位 ${companyName}`,
+      ledgerId: inserted.lastInsertRowid,
+    });
     return { ok: true as const, id: inserted.lastInsertRowid };
   });
 }
@@ -330,8 +643,15 @@ export function settleAr(
   const amt = round2(Number(amount));
   if (!Number.isFinite(amt) || amt <= 0) return { error: "核销金额必须大于 0" };
 
-  const row = get<{ id: number; amount: number; settled_amount: number | null; status: string; folio_no: string | null }>(
-    `SELECT id, amount, settled_amount, status, folio_no
+  const row = get<{
+    id: number;
+    company_id: number;
+    amount: number;
+    settled_amount: number | null;
+    status: string;
+    folio_no: string | null;
+  }>(
+    `SELECT id, company_id, amount, settled_amount, status, folio_no
        FROM ar_ledgers WHERE id = ? AND hotel_id = ?`,
     [id, hotelId]
   );
@@ -360,6 +680,20 @@ export function settleAr(
         WHERE id = ? AND hotel_id = ?`,
       [settled, status, id, hotelId]
     );
+    /*
+     * 双写（第九轮 F12）：核销在账户维度是一笔 PAY（负数），余额同步减少。
+     * request_id 用「台账 id + 核销后累计值」：同一笔核销被重放时撞唯一索引，
+     * 整个 SAVEPOINT 回滚，账户余额不会被扣第二次。
+     */
+    syncSettleToAccount({
+      hotelId,
+      companyId: Number(row.company_id),
+      amount: amt,
+      bizDate: normalizeBizDate(opts.bizDate),
+      operator,
+      note: `AR 核销：台账 #${id}${row.folio_no ? `（账单 ${row.folio_no}）` : ""}${tail}`,
+      requestId: `arsettle-${id}-${settled}`,
+    });
     writeArOpLog(
       hotelId,
       operator,

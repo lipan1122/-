@@ -1,6 +1,15 @@
 import type { ReactNode } from "react";
 import Link from "next/link";
+import { ensureArAccountSchema } from "@/lib/ar";
 import { all, get } from "@/lib/db";
+import {
+  nightSeries,
+  occupancyMetrics,
+  occupancyOfDay,
+  stayNightSlices,
+  type OccupancyMetrics,
+  type StayNightSlice,
+} from "@/lib/metrics";
 import { requirePermission } from "@/lib/session";
 import { addDays, fmtMoney, round2, todayStr } from "@/lib/utils";
 
@@ -463,7 +472,6 @@ const CATEGORY_SQL = `
     COALESCE(SUM(CASE WHEN item_type = 'ROOM' THEN amount ELSE 0 END), 0) AS room,
     COALESCE(SUM(CASE WHEN item_type = 'FOOD' THEN amount ELSE 0 END), 0) AS food,
     COALESCE(SUM(CASE WHEN item_type = 'OTHER' THEN amount ELSE 0 END), 0) AS other_total,
-    COALESCE(SUM(CASE WHEN item_type = 'ROOM' THEN qty ELSE 0 END), 0) AS nights,
     ${OTHER_CATEGORIES.map(
       (c, i) =>
         `COALESCE(SUM(CASE WHEN item_type = 'OTHER' AND ${c.match} THEN amount ELSE 0 END), 0) AS c${i}`
@@ -486,7 +494,15 @@ type CategoryAgg = {
   income: number;
 };
 
-function categoryAgg(hotelId: number, from: string, to: string): CategoryAgg {
+/**
+ * 收入分类汇总。
+ *
+ * `nights` 不再从 folio_items.qty 算（那是明细行数，夜里补记房费之前是 0 ——
+ * 报表间夜会恒等于 0，与房态/工作台/夜审的 21 间在住打架）。
+ * 间夜一律由调用方从 metrics.ts 传进来：区间总量用 occupancyMetrics().roomNights，
+ * 逐日 / 房型 / 渠道用 stayNightSlices() 聚合，全部同一口径。
+ */
+function categoryAgg(hotelId: number, from: string, to: string, nights: number): CategoryAgg {
   const raw = get<Record<string, number>>(CATEGORY_SQL, [hotelId, from, to]) ?? {};
   /* 聚合结果一律 round2（P2-9）：这些值会被上层再次相加/相除，
      浮点尾巴（9999.999999999998）会传导到毛利率、占比和平衡校验里 */
@@ -503,10 +519,28 @@ function categoryAgg(hotelId: number, from: string, to: string): CategoryAgg {
     room,
     food,
     otherTotal,
-    nights: num(raw.nights),
+    nights,
     rows,
     income: round2(room + food + otherTotal),
   };
+}
+
+/**
+ * 把入住单的区间占用明细按某个维度聚合成「维度键 → 间夜」。
+ *
+ * 房型 / 渠道一律用 **id** 当键（不是名字）：`channels` 表里可能真有一条叫
+ * 「散客」的渠道，而「未匹配渠道」也显示成「散客」，按名字聚合会把间夜加两遍。
+ * 客人维度没有 id 可用，按姓名（就是账务明细的关联方式）。
+ *
+ * 纯内存聚合：SQL 只在 metrics.ts 的 stayNightSlices 里有一份，报表不再各写一套。
+ */
+function nightsBy<T>(slices: StayNightSlice[], pick: (s: StayNightSlice) => T): Map<T, number> {
+  const out = new Map<T, number>();
+  for (const s of slices) {
+    const key = pick(s);
+    out.set(key, (out.get(key) ?? 0) + s.nights);
+  }
+  return out;
 }
 
 function paymentAgg(hotelId: number, from: string, to: string): { amount: number; cnt: number } {
@@ -578,6 +612,8 @@ function roomStateMismatch(hotelId: number): { total: number; noStay: number; no
 }
 
 type RoomTypeRow = {
+  /** 房型 id：间夜按 id 对齐（名称只用于显示） */
+  roomTypeId: number | null;
   name: string | null;
   nights: number;
   room: number;
@@ -586,10 +622,24 @@ type RoomTypeRow = {
   total: number;
 };
 
-function roomTypeAgg(hotelId: number, from: string, to: string): RoomTypeRow[] {
-  return all<RoomTypeRow>(
-    `SELECT COALESCE(rt.name, '未分房型') AS name,
-            COALESCE(SUM(CASE WHEN fi.item_type = 'ROOM' THEN fi.qty ELSE 0 END), 0) AS nights,
+/**
+ * 按房型汇总收入 + 间夜。
+ *
+ * 间夜不再数 ROOM 明细行（fi.qty 恒为 1，且房费没补记时是 0），
+ * 而是取 stayNightSlices() 按房型聚合的结果。两者维度名做同样的归一化：
+ * 房型为 NULL（未排房 / 房间已删）一律归入「未分房型」，与 SQL 的
+ * COALESCE(rt.name, '未分房型') 一致。
+ */
+function roomTypeAgg(
+  hotelId: number,
+  from: string,
+  to: string,
+  nightsByTypeId: Map<number | null, number>
+): RoomTypeRow[] {
+  const rows = all<RoomTypeRow>(
+    `SELECT rt.id AS roomTypeId,
+            COALESCE(rt.name, '未分房型') AS name,
+            0 AS nights,
             COALESCE(SUM(CASE WHEN fi.item_type = 'ROOM' THEN fi.amount ELSE 0 END), 0) AS room,
             COALESCE(SUM(CASE WHEN fi.item_type = 'FOOD' THEN fi.amount ELSE 0 END), 0) AS food,
             COALESCE(SUM(CASE WHEN fi.item_type = 'OTHER' THEN fi.amount ELSE 0 END), 0) AS other,
@@ -605,14 +655,43 @@ function roomTypeAgg(hotelId: number, from: string, to: string): RoomTypeRow[] {
      ORDER BY room DESC, nights DESC`,
     [hotelId, from, to]
   );
+  const seen = new Set<number | null>();
+  for (const r of rows) {
+    seen.add(r.roomTypeId);
+    r.nights = nightsByTypeId.get(r.roomTypeId) ?? 0;
+  }
+  /*
+   * 有住宿但本期没有房费明细的房型（今天/昨天的房费要等夜审过账）也要出现，
+   * 否则表格「间夜」列加总会小于合计行 —— 报表自己先自相矛盾。
+   */
+  for (const [id, nights] of nightsByTypeId) {
+    if (nights <= 0 || seen.has(id)) continue;
+    rows.push({
+      roomTypeId: id,
+      name: id == null ? "未分房型" : `房型#${id}`,
+      nights,
+      room: 0,
+      food: 0,
+      other: 0,
+      total: 0,
+    });
+  }
+  return rows.sort((a, b) => num(b.room) - num(a.room) || num(b.nights) - num(a.nights));
 }
 
-type ChannelRoomRow = { name: string | null; nights: number; room: number };
+type ChannelRoomRow = { channelId: number | null; name: string | null; nights: number; room: number };
 
-function channelAgg(hotelId: number, from: string, to: string): ChannelRoomRow[] {
-  return all<ChannelRoomRow>(
-    `SELECT COALESCE(c.name, '散客') AS name,
-            COALESCE(SUM(CASE WHEN fi.item_type = 'ROOM' THEN fi.qty ELSE 0 END), 0) AS nights,
+/** 按客源渠道汇总房费 + 间夜（间夜按渠道 id 对齐，渠道 NULL 归入「散客」） */
+function channelAgg(
+  hotelId: number,
+  from: string,
+  to: string,
+  nightsByChannelId: Map<number | null, number>
+): ChannelRoomRow[] {
+  const rows = all<ChannelRoomRow>(
+    `SELECT c.id AS channelId,
+            COALESCE(c.name, '散客') AS name,
+            0 AS nights,
             COALESCE(SUM(CASE WHEN fi.item_type = 'ROOM' THEN fi.amount ELSE 0 END), 0) AS room
      FROM folio_items fi
      JOIN folios f ON f.id = fi.folio_id
@@ -623,6 +702,16 @@ function channelAgg(hotelId: number, from: string, to: string): ChannelRoomRow[]
      ORDER BY room DESC`,
     [hotelId, from, to]
   );
+  const seen = new Set<number | null>();
+  for (const r of rows) {
+    seen.add(r.channelId);
+    r.nights = nightsByChannelId.get(r.channelId) ?? 0;
+  }
+  for (const [id, nights] of nightsByChannelId) {
+    if (nights <= 0 || seen.has(id)) continue;
+    rows.push({ channelId: id, name: id == null ? "散客" : `渠道#${id}`, nights, room: 0 });
+  }
+  return rows.sort((a, b) => num(b.room) - num(a.room) || num(b.nights) - num(a.nights));
 }
 
 type DailyRow = {
@@ -633,19 +722,26 @@ type DailyRow = {
   nights: number;
 };
 
-function dailyAgg(hotelId: number, from: string, to: string): DailyRow[] {
-  return all<DailyRow>(
+/**
+ * 逐日收入 + 间夜。
+ *
+ * 行集合仍由「本期有没有收入明细」决定（金额驱动），
+ * 间夜一律取 nightSeries() 的逐日值 —— 不再数房费明细行。
+ * 没有房费但有住宿的日子，间夜字段仍然有值（页面对 hasData 的判断已放宽）。
+ */
+function dailyAgg(hotelId: number, from: string, to: string, nightMap: Map<string, number>): DailyRow[] {
+  const rows = all<Omit<DailyRow, "nights">>(
     `SELECT biz_date,
             COALESCE(SUM(CASE WHEN item_type = 'ROOM' THEN amount ELSE 0 END), 0) AS room,
             COALESCE(SUM(CASE WHEN item_type = 'FOOD' THEN amount ELSE 0 END), 0) AS food,
-            COALESCE(SUM(CASE WHEN item_type = 'OTHER' THEN amount ELSE 0 END), 0) AS other,
-            COALESCE(SUM(CASE WHEN item_type = 'ROOM' THEN qty ELSE 0 END), 0) AS nights
+            COALESCE(SUM(CASE WHEN item_type = 'OTHER' THEN amount ELSE 0 END), 0) AS other
      FROM folio_items
      WHERE hotel_id = ? AND biz_date BETWEEN ? AND ? AND item_type IN ('ROOM','FOOD','OTHER')
      GROUP BY biz_date
      ORDER BY biz_date`,
     [hotelId, from, to]
   );
+  return rows.map((r) => ({ ...r, nights: nightMap.get(r.biz_date) ?? 0 }));
 }
 
 type CapacityRow = { name: string | null; rooms: number };
@@ -876,6 +972,8 @@ function payDetailRows(hotelId: number, from: string, to: string): PayDetailRow[
 }
 
 type SalesChannelRow = {
+  /** 渠道 id：间夜按 id 对齐（名称只用于显示，「散客」可能有两行） */
+  channelId: number | null;
   name: string;
   nights: number;
   room: number;
@@ -883,10 +981,17 @@ type SalesChannelRow = {
   rate: number;
 };
 
-function salesChannelAgg(hotelId: number, from: string, to: string): SalesChannelRow[] {
-  return all<SalesChannelRow>(
-    `SELECT COALESCE(c.name, '散客') AS name,
-            COALESCE(SUM(CASE WHEN fi.item_type = 'ROOM' THEN fi.qty ELSE 0 END), 0) AS nights,
+/** 销售概况：按客源渠道汇总营收 + 间夜（间夜口径同 channelAgg） */
+function salesChannelAgg(
+  hotelId: number,
+  from: string,
+  to: string,
+  nightsByChannelId: Map<number | null, number>
+): SalesChannelRow[] {
+  const rows = all<Omit<SalesChannelRow, "nights">>(
+    `SELECT c.id AS channelId,
+            COALESCE(c.name, '散客') AS name,
+            0 AS nights,
             COALESCE(SUM(CASE WHEN fi.item_type = 'ROOM' THEN fi.amount ELSE 0 END), 0) AS room,
             COALESCE(SUM(fi.amount), 0) AS total,
             COALESCE(MAX(c.commission), 0) AS rate
@@ -900,16 +1005,35 @@ function salesChannelAgg(hotelId: number, from: string, to: string): SalesChanne
      ORDER BY total DESC`,
     [hotelId, from, to]
   );
+  const out: SalesChannelRow[] = rows.map((r) => ({
+    ...r,
+    nights: nightsByChannelId.get(r.channelId) ?? 0,
+  }));
+  const seen = new Set<number | null>(out.map((r) => r.channelId));
+  for (const [id, nights] of nightsByChannelId) {
+    if (nights <= 0 || seen.has(id)) continue;
+    out.push({ channelId: id, name: id == null ? "散客" : `渠道#${id}`, nights, room: 0, total: 0, rate: 0 });
+  }
+  return out.sort((a, b) => num(b.total) - num(a.total) || num(b.nights) - num(a.nights));
 }
 
 type MemberLevelRow = { level: number; members: number; amount: number; nights: number };
 
-function memberLevelAgg(hotelId: number, from: string, to: string): MemberLevelRow[] {
-  return all<MemberLevelRow>(
+/**
+ * 会员等级汇总。金额取账务明细，间夜取 metrics.ts 的住宿明细
+ * （按客人姓名归到 guests.vip_level，与金额的关联方式保持一致）。
+ */
+function memberLevelAgg(
+  hotelId: number,
+  from: string,
+  to: string,
+  nightsByGuest: Map<string, number>
+): MemberLevelRow[] {
+  const rows = all<Omit<MemberLevelRow, "nights">>(
     `SELECT g.vip_level AS level,
             COUNT(DISTINCT g.id) AS members,
             COALESCE(SUM(fi.amount), 0) AS amount,
-            COALESCE(SUM(CASE WHEN fi.item_type = 'ROOM' THEN fi.qty ELSE 0 END), 0) AS nights
+            0 AS nights
      FROM guests g
      LEFT JOIN stays s ON s.guest_name = g.name AND s.hotel_id = g.hotel_id
      LEFT JOIN folios f ON f.stay_id = s.id
@@ -921,6 +1045,14 @@ function memberLevelAgg(hotelId: number, from: string, to: string): MemberLevelR
      ORDER BY g.vip_level`,
     [from, to, hotelId]
   );
+  const levelOf = guestLevelMap(hotelId);
+  const nightsByLevel = new Map<number, number>();
+  for (const [name, n] of nightsByGuest) {
+    const lv = levelOf.get(name);
+    if (lv === undefined) continue;
+    nightsByLevel.set(lv, (nightsByLevel.get(lv) ?? 0) + n);
+  }
+  return rows.map((r) => ({ ...r, nights: nightsByLevel.get(num(r.level)) ?? 0 }));
 }
 
 type MemberRankRow = {
@@ -931,12 +1063,17 @@ type MemberRankRow = {
   amount: number;
 };
 
-function memberRankRows(hotelId: number, from: string, to: string): MemberRankRow[] {
-  return all<MemberRankRow>(
+function memberRankRows(
+  hotelId: number,
+  from: string,
+  to: string,
+  nightsByGuest: Map<string, number>
+): MemberRankRow[] {
+  const rows = all<Omit<MemberRankRow, "nights">>(
     `SELECT g.name,
             g.vip_level AS level,
             COUNT(DISTINCT s.id) AS stays,
-            COALESCE(SUM(CASE WHEN fi.item_type = 'ROOM' THEN fi.qty ELSE 0 END), 0) AS nights,
+            0 AS nights,
             COALESCE(SUM(fi.amount), 0) AS amount
      FROM guests g
      JOIN stays s ON s.guest_name = g.name AND s.hotel_id = g.hotel_id
@@ -950,6 +1087,19 @@ function memberRankRows(hotelId: number, from: string, to: string): MemberRankRo
      LIMIT 30`,
     [from, to, hotelId]
   );
+  return rows.map((r) => ({ ...r, nights: nightsByGuest.get(r.name) ?? 0 }));
+}
+
+/** 客人姓名 → 会员等级（只读，用于把间夜归到会员等级；间夜本身来自 metrics.ts） */
+function guestLevelMap(hotelId: number): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const g of all<{ name: string | null; vip_level: number | null }>(
+    `SELECT name, vip_level FROM guests WHERE hotel_id = ?`,
+    [hotelId]
+  )) {
+    if (g.name != null) out.set(g.name, num(g.vip_level));
+  }
+  return out;
 }
 
 type BizTypeRow = { item_type: string; cnt: number; qty: number; amount: number };
@@ -1681,6 +1831,21 @@ type ArAccountRow = {
 };
 
 function arAccountAgg(hotelId: number, from: string, to: string): ArAccountRow[] {
+  /*
+   * 第九轮修复（F12）：挂账原来只写 ar_ledgers，报表只读 ar_accounts + ar_transactions，
+   * 于是「挂给协议单位的应收」在 AR 报表里查不到。
+   *
+   * 现在两处都在：chargeToCompanyAction → lib/ar.postArCharge 双写账户总账
+   * （ar_transactions 一条 POST + ar_accounts.balance 同额增加），
+   * 所以挂账会作为账户行出现在第一段（区间建账 / 应收余额都能对上）。
+   *
+   * 第二段是**升级兜底**：老库里已存在的挂账只写了 ar_ledgers，
+   * 那些协议单位还没有绑定 AR 账户（company_id IS NULL），
+   * 给它们各出一行（id 取负数避免与账户主键冲突），
+   * 金额取台账未结余额，避免「明明挂着账、报表一家都看不到」。
+   * 一旦该单位之后再挂账/核销，lib/ar 会把它绑定到账户，兜底行自动消失，
+   * 不会与账户行重复计数。
+   */
   return all<ArAccountRow>(
     `SELECT a.id, a.code, a.name, a.type, a.status,
             COALESCE(a.credit_limit, 0) AS credit_limit,
@@ -1690,13 +1855,34 @@ function arAccountAgg(hotelId: number, from: string, to: string): ArAccountRow[]
             COALESCE(SUM(CASE WHEN t.type = 'PAY' THEN -t.amount ELSE 0 END), 0) AS paid_amount,
             COALESCE(SUM(CASE WHEN t.type = 'WRITE_OFF' THEN -t.amount ELSE 0 END), 0) AS write_off,
             COALESCE(MAX(t.biz_date), '') AS last_date
-     FROM ar_accounts a
-     LEFT JOIN ar_transactions t
-       ON t.ar_account_id = a.id AND t.hotel_id = a.hotel_id AND t.biz_date BETWEEN ? AND ?
-     WHERE a.hotel_id = ?
-     GROUP BY a.id
-     ORDER BY balance DESC`,
-    [from, to, hotelId]
+       FROM ar_accounts a
+       LEFT JOIN ar_transactions t
+         ON t.ar_account_id = a.id AND t.hotel_id = a.hotel_id AND t.biz_date BETWEEN ? AND ?
+      WHERE a.hotel_id = ?
+      GROUP BY a.id
+     UNION ALL
+     SELECT -l.company_id AS id,
+            'ARC' || l.company_id AS code,
+            COALESCE(c.name, '协议单位#' || l.company_id) AS name,
+            '协议单位' AS type,
+            'ON' AS status,
+            COALESCE(c.credit_limit, 0) AS credit_limit,
+            COALESCE(SUM(l.amount - COALESCE(l.settled_amount, 0)), 0) AS balance,
+            COUNT(*) AS cnt,
+            COALESCE(SUM(CASE WHEN l.biz_date BETWEEN ? AND ? THEN l.amount ELSE 0 END), 0) AS post_amount,
+            COALESCE(SUM(CASE WHEN l.biz_date BETWEEN ? AND ? THEN COALESCE(l.settled_amount, 0) ELSE 0 END), 0) AS paid_amount,
+            0 AS write_off,
+            COALESCE(MAX(l.biz_date), '') AS last_date
+       FROM ar_ledgers l
+       LEFT JOIN companies c ON c.id = l.company_id AND c.hotel_id = l.hotel_id
+      WHERE l.hotel_id = ?
+        AND NOT EXISTS (
+              SELECT 1 FROM ar_accounts x
+               WHERE x.hotel_id = l.hotel_id AND x.company_id = l.company_id
+            )
+      GROUP BY l.company_id, c.name, c.credit_limit
+      ORDER BY balance DESC`,
+    [from, to, hotelId, from, to, from, to, hotelId]
   );
 }
 
@@ -2523,6 +2709,14 @@ type ReportCtx = {
   sellableRooms: number;
   totalRooms: number;
   hotelName: string;
+  /**
+   * 当前区间 / 对比区间的经营指标（metrics.ts 统一口径）。
+   *
+   * 间夜只在页面级算一次，各报表通过 ctx 取 —— 68 张报表不再各自数一遍
+   * folio_items.qty（那会得到第三套间夜口径：房费没补记时恒为 0）。
+   */
+  occupancy: OccupancyMetrics;
+  cmpOccupancy: OccupancyMetrics;
   href: (patch: Partial<FilterState>) => string;
 };
 
@@ -2539,8 +2733,8 @@ function rangeText(ctx: ReportCtx): string {
 /* -------------------- 1. 酒店经营总表 -------------------- */
 function ReportHotelSummary({ ctx }: ReportProps) {
   const { hotelId, from, to, href } = ctx;
-  const cur = categoryAgg(hotelId, from, to);
-  const prev = categoryAgg(hotelId, ctx.cmpFrom, ctx.cmpTo);
+  const cur = categoryAgg(hotelId, from, to, ctx.occupancy.roomNights);
+  const prev = categoryAgg(hotelId, ctx.cmpFrom, ctx.cmpTo, ctx.cmpOccupancy.roomNights);
   const pay = paymentAgg(hotelId, from, to);
   const payPrev = paymentAgg(hotelId, ctx.cmpFrom, ctx.cmpTo);
   const ar = receivableAgg(hotelId);
@@ -2665,11 +2859,13 @@ function ReportHotelSummary({ ctx }: ReportProps) {
 /* -------------------- 2. 客房收益报表 -------------------- */
 function ReportRoomRevenue({ ctx }: ReportProps) {
   const { hotelId, from, to, days } = ctx;
-  const cur = categoryAgg(hotelId, from, to);
-  const prev = categoryAgg(hotelId, ctx.cmpFrom, ctx.cmpTo);
+  const cur = categoryAgg(hotelId, from, to, ctx.occupancy.roomNights);
+  const prev = categoryAgg(hotelId, ctx.cmpFrom, ctx.cmpTo, ctx.cmpOccupancy.roomNights);
   const capacity = roomTypeCapacity(hotelId);
-  const rows = roomTypeAgg(hotelId, from, to);
-  const channels = channelAgg(hotelId, from, to);
+  /* 间夜按房型 / 渠道拆：一次取明细，本地聚合，不再让每个 SQL 各数一遍 qty */
+  const slices = stayNightSlices(hotelId, from, to);
+  const rows = roomTypeAgg(hotelId, from, to, nightsBy(slices, (s) => s.roomTypeId));
+  const channels = channelAgg(hotelId, from, to, nightsBy(slices, (s) => s.channelId));
   const capMap = new Map<string, number>();
   for (const c of capacity) capMap.set(c.name ?? "未分房型", num(c.rooms));
   const capRooms = capacity.reduce((s, c) => s + num(c.rooms), 0);
@@ -2692,7 +2888,7 @@ function ReportRoomRevenue({ ctx }: ReportProps) {
         />
         <KpiCard
           label="间夜数"
-          hint="统计区间内已过房费的间夜数"
+          hint="统计区间内的出租间夜（在住晚数，排除钟点房；与房态/工作台/夜审同口径）"
           prevLabel={CMP_SHORT[ctx.cmp]}
           prevValue={`${prev.nights}`}
           delta={countDelta(cur.nights, prev.nights, "")}
@@ -2797,7 +2993,7 @@ function ReportRoomRevenue({ ctx }: ReportProps) {
 
       <div className="grid grid-cols-2 gap-2.5 xl:grid-cols-4">
         <StatCard label="可售房晚" value={fmtInt(capNights)} hint="可售房 × 统计天数" />
-        <StatCard label="已售房晚" value={fmtInt(cur.nights)} />
+        <StatCard label="已售房晚" value={fmtInt(cur.nights)} hint="出租间夜（在住晚数，排除钟点房；与房态/工作台/夜审同口径）" />
         <StatCard label="平均房价" value={fmtMoney(adr)} />
         <StatCard label="RevPAR" value={fmtMoney(revpar)} hint="房费 ÷ 可售房晚" />
       </div>
@@ -3287,7 +3483,7 @@ function ReportReceiptSummary({ ctx }: ReportProps) {
 /* -------------------- 8. 财务概况 -------------------- */
 function ReportFinanceOverview({ ctx }: ReportProps) {
   const { hotelId, from, to, days, sellableRooms } = ctx;
-  const cur = categoryAgg(hotelId, from, to);
+  const cur = categoryAgg(hotelId, from, to, ctx.occupancy.roomNights);
   const pay = paymentAgg(hotelId, from, to);
   const cost = 0;
   const gross = cur.income - cost;
@@ -3367,6 +3563,8 @@ function ReportFinanceOverview({ ctx }: ReportProps) {
       <NoteCard>
         口径说明：收入按营业日（biz_date）归集房费 / 餐饮 / 其他，不含押金与调整；成本本期未归集，按 0 计，
         因此毛利等于收入。出租率 = 间夜 ÷（可售房 × 统计天数），可售房已排除维修房与锁房。
+        间夜取住宿占用口径（stays 的在住 / 已退房晚数，排除钟点房），不是房费明细行数 ——
+        房费由夜审按营业日补记，补记之前房费明细为空但房间确实住着人。
       </NoteCard>
     </>
   );
@@ -3375,7 +3573,8 @@ function ReportFinanceOverview({ ctx }: ReportProps) {
 /* -------------------- 9. 销售概况 -------------------- */
 function ReportSalesOverview({ ctx }: ReportProps) {
   const { hotelId, from, to } = ctx;
-  const rows = salesChannelAgg(hotelId, from, to);
+  const slices = stayNightSlices(hotelId, from, to);
+  const rows = salesChannelAgg(hotelId, from, to, nightsBy(slices, (s) => s.channelId));
   const totalRevenue = rows.reduce((s, r) => s + num(r.total), 0);
   const totalNights = rows.reduce((s, r) => s + num(r.nights), 0);
   const totalRoom = rows.reduce((s, r) => s + num(r.room), 0);
@@ -3386,7 +3585,7 @@ function ReportSalesOverview({ ctx }: ReportProps) {
     <>
       <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard label="渠道营收" value={fmtMoney(totalRevenue)} hint="含房费、餐饮与其他收入" />
-        <StatCard label="售价间夜" value={fmtInt(totalNights)} />
+        <StatCard label="售价间夜" value={fmtInt(totalNights)} hint="按渠道归属的出租间夜（住宿占用口径，排除钟点房）" />
         <StatCard label="渠道佣金" value={fmtMoney(totalCommission)} hint="房费 × 渠道佣金率" />
         <StatCard label="综合佣金率" value={fmtPct(commissionRate)} />
       </div>
@@ -3448,8 +3647,11 @@ function ReportSalesOverview({ ctx }: ReportProps) {
 /* -------------------- 10. 会员概况 -------------------- */
 function ReportMemberOverview({ ctx }: ReportProps) {
   const { hotelId, from, to } = ctx;
-  const levels = memberLevelAgg(hotelId, from, to);
-  const rank = memberRankRows(hotelId, from, to);
+  /* 会员间夜按「客人姓名」归到住宿明细（同一批次数据，不另写一套房费明细 SQL） */
+  const slices = stayNightSlices(hotelId, from, to);
+  const nightsByGuest = nightsBy(slices, (s) => s.guestName ?? "");
+  const levels = memberLevelAgg(hotelId, from, to, nightsByGuest);
+  const rank = memberRankRows(hotelId, from, to, nightsByGuest);
   const memberLevels = levels.filter((l) => num(l.level) > 0);
   const normal = levels.find((l) => num(l.level) === 0);
 
@@ -3707,14 +3909,22 @@ function ReportBizTotal({ ctx }: ReportProps) {
 /* -------------------- 13. 综合营业日报 -------------------- */
 function ReportBizDaily({ ctx }: ReportProps) {
   const { hotelId, from, to, days, sellableRooms } = ctx;
-  const cur = categoryAgg(hotelId, from, to);
-  const rows = dailyAgg(hotelId, from, to);
+  const cur = categoryAgg(hotelId, from, to, ctx.occupancy.roomNights);
+  /*
+   * 逐日间夜单独取一次（nightSeries 是 metrics.ts 的住宿口径）：
+   * 房费是夜审按营业日补记的，今天/昨天还没有 ROOM 明细时，
+   * 旧口径（SUM(qty)）这一天的间夜就是 0，而房间明明住着人。
+   */
+  const nightMap = nightSeries(hotelId, from, to);
+  const rows = dailyAgg(hotelId, from, to, nightMap);
   const map = new Map<string, DailyRow>();
   for (const r of rows) map.set(r.biz_date, r);
   const dates = dayList(from, to);
   const adr = cur.nights > 0 ? cur.room / cur.nights : 0;
   const occupancy = sellableRooms > 0 ? cur.nights / (sellableRooms * days) : 0;
-  const hasData = rows.length > 0;
+  const hasNights = [...nightMap.values()].some((v) => v > 0);
+  /* 今天/昨天可能「有住宿、无房费」：这种日子也要出表，否则合计行的间夜与表格对不上 */
+  const hasData = rows.length > 0 || hasNights;
 
   return (
     <>
@@ -3747,7 +3957,7 @@ function ReportBizDaily({ ctx }: ReportProps) {
                 const room = num(r?.room);
                 const food = num(r?.food);
                 const other = num(r?.other);
-                const nights = num(r?.nights);
+                const nights = num(nightMap.get(d));
                 const total = room + food + other;
                 return (
                   <tr key={d} className="hover:bg-gray-50">
@@ -3787,7 +3997,8 @@ function ReportBizDaily({ ctx }: ReportProps) {
 
       <NoteCard>
         口径说明：逐日按营业日展开，即使某天无营业数据也显示 0 值行，便于观察空档；合计行取区间汇总值，
-        出租率按「间夜 ÷ 可售房数」逐日计算。
+        出租率按「间夜 ÷ 可售房数」逐日计算。间夜取住宿占用口径（在住 + 已退房晚数，排除钟点房），
+        所以「今天房费还没过账」的日子也会显示间夜，房费列则为 0。
       </NoteCard>
     </>
   );
@@ -3797,7 +4008,7 @@ function ReportBizDaily({ ctx }: ReportProps) {
 function ReportRoomTypeDaily({ ctx }: ReportProps) {
   const { hotelId, from, to } = ctx;
   const rows = roomTypeMatrix(hotelId, from, to);
-  const cur = categoryAgg(hotelId, from, to);
+  const cur = categoryAgg(hotelId, from, to, ctx.occupancy.roomNights);
   const capacity = roomTypeCapacity(hotelId);
   const dateSet = new Set<string>();
   const typeSet = new Set<string>();
@@ -3891,7 +4102,7 @@ function ReportRoomTypeDaily({ ctx }: ReportProps) {
 function ReportRoomDaily({ ctx }: ReportProps) {
   const { hotelId, from, to } = ctx;
   const rows = roomNoMatrix(hotelId, from, to);
-  const cur = categoryAgg(hotelId, from, to);
+  const cur = categoryAgg(hotelId, from, to, ctx.occupancy.roomNights);
 
   const dateSet = new Set<string>();
   const roomSet = new Set<string>();
@@ -3982,7 +4193,7 @@ function ReportRoomDaily({ ctx }: ReportProps) {
 function ReportFloorDaily({ ctx }: ReportProps) {
   const { hotelId, from, to, sellableRooms } = ctx;
   const rows = floorMatrix(hotelId, from, to);
-  const cur = categoryAgg(hotelId, from, to);
+  const cur = categoryAgg(hotelId, from, to, ctx.occupancy.roomNights);
   const floors = floorList(hotelId);
   const dateSet = new Set<string>();
   const floorSet = new Set<string>();
@@ -4080,14 +4291,16 @@ function ReportFloorDaily({ ctx }: ReportProps) {
 /* -------------------- 16. 房费日报表 -------------------- */
 function ReportRoomFeeDaily({ ctx }: ReportProps) {
   const { hotelId, from, to, days, sellableRooms } = ctx;
-  const cur = categoryAgg(hotelId, from, to);
-  const rows = dailyAgg(hotelId, from, to);
+  const cur = categoryAgg(hotelId, from, to, ctx.occupancy.roomNights);
+  const nightMap = nightSeries(hotelId, from, to);
+  const rows = dailyAgg(hotelId, from, to, nightMap);
   const map = new Map<string, DailyRow>();
   for (const r of rows) map.set(r.biz_date, r);
   const dates = dayList(from, to);
   const adr = cur.nights > 0 ? cur.room / cur.nights : 0;
   const occupancy = sellableRooms > 0 ? cur.nights / (sellableRooms * days) : 0;
-  const hasData = rows.length > 0;
+  const hasNights = [...nightMap.values()].some((v) => v > 0);
+  const hasData = rows.length > 0 || hasNights;
 
   return (
     <>
@@ -4116,7 +4329,7 @@ function ReportRoomFeeDaily({ ctx }: ReportProps) {
               dates.map((d) => {
                 const r = map.get(d);
                 const room = num(r?.room);
-                const nights = num(r?.nights);
+                const nights = num(nightMap.get(d));
                 return (
                   <tr key={d} className="hover:bg-gray-50">
                     <td className="td tabular-nums text-gray-700">
@@ -4155,7 +4368,8 @@ function ReportRoomFeeDaily({ ctx }: ReportProps) {
 
       <NoteCard>
         口径说明：房费按夜审过账的营业日（folio_items.biz_date）统计，ADR = 房费 ÷ 间夜，
-        出租率 = 间夜 ÷ 可售房数；区间无房费数据时仅显示空状态与合计行。
+        出租率 = 间夜 ÷ 可售房数；间夜取住宿占用口径（在住晚数，排除钟点房），
+        与房态 / 工作台 / 夜审一致 —— 房费尚未过账的日子间夜仍然显示，房费列才是 0。
       </NoteCard>
     </>
   );
@@ -4164,7 +4378,7 @@ function ReportRoomFeeDaily({ ctx }: ReportProps) {
 /* -------------------- 17. 试算平衡表 -------------------- */
 function ReportTrialBalance({ ctx }: ReportProps) {
   const { hotelId, from, to } = ctx;
-  const cur = categoryAgg(hotelId, from, to);
+  const cur = categoryAgg(hotelId, from, to, ctx.occupancy.roomNights);
   const pay = paymentAgg(hotelId, from, to);
   const methods = payMethodAgg(hotelId, from, to);
   const before = get<{ charges: number; paid: number }>(
@@ -5889,6 +6103,12 @@ function ReportArHappen({ ctx }: ReportProps) {
 /* -------------------- 33. AR账报表 -------------------- */
 function ReportArAccount({ ctx }: ReportProps) {
   const { hotelId, from, to } = ctx;
+  /*
+   * 兜底建表 / 补 company_id 列（幂等，模块级缓存只跑一次）：
+   * arAccountAgg 的第二段（历史挂账兜底）要用 a.company_id 判断绑定关系，
+   * 老库 / 全新库都可能还没有这一列 —— 报表是只读页面，不能因为列未补就 500。
+   */
+  ensureArAccountSchema();
   const rows = arAccountAgg(hotelId, from, to);
   const balance = rows.reduce((s, r) => s + num(r.balance), 0);
   const post = rows.reduce((s, r) => s + num(r.post_amount), 0);
@@ -5967,6 +6187,9 @@ function ReportArAccount({ ctx }: ReportProps) {
       <NoteCard>
         口径说明：主体为 ar_accounts（协议单位 / 挂账客户）；区间建账、已收、销账来自 ar_transactions 按 biz_date 汇总，
         应收余额取账户当前余额（a.balance），授信占用 = 余额 ÷ 授信额度。
+        收银台「挂公司账」会在同一事务里双写账户流水（POST +800 这类），因此挂账产生的应收在本表可见；
+        编号以 ARC 开头的是系统为协议单位自动建立的账户。最后几行可能来自「历史挂账兜底」：
+        升级前只写了 ar_ledgers、尚未绑定 AR 账户的协议单位，按台账未结余额单独列出（金额与 /ar 页面台账一致）。
       </NoteCard>
     </>
   );
@@ -8157,19 +8380,19 @@ export default async function ReportsPage({
   const cmpRange = comparisonRange(from, to, cmp);
   const days = Math.max(1, dayList(from, to).length);
 
+  /*
+   * 区间经营指标：一次算好，通过 ctx 传给各报表（含对比区间）。
+   * 房量 / 可售房也取这里的结果，保证「页头房量」与 metrics 口径同源。
+   */
+  const occupancy = occupancyMetrics(hotelId, from, to);
+  const cmpOccupancy = occupancyMetrics(hotelId, cmpRange.from, cmpRange.to);
+  const todayOccupancy = occupancyOfDay(hotelId, todayDate);
+
   /* ---------- 房量与今日摘要（页面级公共数据） ---------- */
-  const roomStats =
-    get<{ total: number; sellable: number }>(
-      `SELECT COUNT(*) AS total,
-              COALESCE(SUM(CASE WHEN status IN ('OOO','LOCK') THEN 0 ELSE 1 END), 0) AS sellable
-       FROM rooms WHERE hotel_id = ?`,
-      [hotelId]
-    ) ?? { total: 0, sellable: 0 };
+  const totalRooms = occupancy.totalRooms;
+  const sellableRooms = occupancy.sellableRooms;
 
-  const totalRooms = num(roomStats.total);
-  const sellableRooms = num(roomStats.sellable);
-
-  const todayAgg = categoryAgg(hotelId, todayDate, todayDate);
+  const todayAgg = categoryAgg(hotelId, todayDate, todayDate, todayOccupancy.roomNights);
   const unpostedToday =
     get<{ amount: number; cnt: number }>(
       `SELECT COALESCE(SUM(s.rate), 0) AS amount, COUNT(*) AS cnt
@@ -8198,6 +8421,8 @@ export default async function ReportsPage({
     sellableRooms,
     totalRooms,
     hotelName: user.hotelName,
+    occupancy,
+    cmpOccupancy,
     href,
   };
 

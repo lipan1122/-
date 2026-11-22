@@ -93,15 +93,11 @@ export function ShopPOS({
 }: {
   items: PosItem[];
   rooms: PosRoom[];
-  /**
-   * 兼容参数：第七轮 一.2 之后**不再生效**，组件内部直接调用 sellCartAction
-   *
-   * 幂等要求 request_id 与业务字段在同一次请求里送到服务端，而 onSubmit 的入参是
-   * 纯业务对象（page.tsx 的 submitOrder 只把 4 个字段塞进 FormData），
-   * 通过它无法把 request_id 带过去。保留这个 prop 只是为了让
-   * src/app/(main)/shop/page.tsx 不用改（本轮整改的文件白名单里没有它）。
+  /*
+   * 不再接受 onSubmit：第七轮 一.2 之后组件内部直接调用 sellCartAction，
+   * 旧的回调 prop（page.tsx 的 submitOrder）永远收不到调用，是死代码，
+   * 本轮整改一并删掉（整改报告 三.死代码）。
    */
-  onSubmit?: (payload: { itemId: number; qty: number; roomNo: string; method: string }) => Promise<void>;
   msg?: string;
   err?: string;
 }) {
@@ -172,10 +168,6 @@ export function ShopPOS({
       setTip({ kind: "err", text: "购物车为空，请先点商品" });
       return;
     }
-    if (!roomNo) {
-      setTip({ kind: "err", text: "挂房账请先选房号；现金收款可直接点收款" });
-      return;
-    }
 
     busyRef.current = true;
     /* 本次结算固定用这一枚：双击的第二下、网络重试、再点一次收款都复用它 */
@@ -184,9 +176,31 @@ export function ShopPOS({
     const qty = totalQty;
     const amount = total;
 
+    /**
+     * 提交**完整明细数组**（整改报告 二）
+     *
+     * 改造前只提交「第一件商品的 id」+「整个购物车的总件数」：
+     * 服务端按「item_id × qty」结算，于是「矿泉水 1 件 + 牙刷 1 件」被记成
+     * 「矿泉水 2 件」—— 牙刷的库存没扣、金额记在矿泉水头上、流水只记矿泉水，
+     * 牙刷等于白拿。这是真实的库存与资金损失，不是显示问题。
+     *
+     * 现在每行一个商品：服务端逐商品校验状态与库存、逐商品扣减、逐商品写库存流水与销售流水，
+     * 并按明细汇总金额；任一商品不合格整单回滚（不会出现「扣了一半」）。
+     */
+    const lines = cart.map((c) => ({ item_id: c.id, qty: c.qty }));
     const fd = new FormData();
-    fd.set("item_id", String(cart[0].id));
-    fd.set("qty", String(qty));
+    fd.set("items", JSON.stringify(lines));
+    /*
+     * 单商品时同时带上旧的 item_id / qty 字段。
+     *   · 服务端保留了「items 缺失 → 按 item_id 单商品处理」的兼容分支（清单要求向后兼容），
+     *     单商品两种编码的结果完全一致（同一个 id、同一个数量），双写不改变金额与库存；
+     *   · 老调用方 / 既有验收脚本按旧字段断言表单内容，双写让新旧两条路径始终都通。
+     * 多商品时只提交 items：item_id 只带第一件商品是本次要根治的 bug，绝不能保留。
+     */
+    if (lines.length === 1) {
+      fd.set("item_id", String(lines[0].item_id));
+      fd.set("qty", String(lines[0].qty));
+    }
     fd.set("room_no", roomNo);
     fd.set("method", method);
     fd.set("request_id", rid);
@@ -315,13 +329,16 @@ export function ShopPOS({
           </div>
           <div className="mt-2 space-y-1.5">
             <select value={roomNo} onChange={(e) => setRoomNo(e.target.value)} className="input h-7 w-full text-[12px]">
-              <option value="">挂房账（选房号）</option>
+              <option value="">现金收款（不挂房账）</option>
               {rooms.map((r) => (
                 <option key={r.roomNo} value={r.roomNo}>
                   {r.roomNo} {r.guestName ?? ""}
                 </option>
               ))}
             </select>
+            <div className="text-[11px] leading-tight text-[#999]">
+              留空 = 现金收款；选房号 = 记到在住客人账单（挂房账）
+            </div>
             <div className="flex items-center gap-1.5">
               <select value={method} onChange={(e) => setMethod(e.target.value)} className="input h-7 flex-1 text-[12px]">
                 {["现金", "微信", "支付宝", "银行卡"].map((m) => (
