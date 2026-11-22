@@ -204,6 +204,28 @@ export default async function DashboardPage({
         ))}
       </div>
 
+      {/*
+        演示数据入口（admin 可见）
+        原来只在「设置 → 演示数据」（要点进设置、再点左侧第 22 项菜单），埋得太深找不到。
+        这里放到工作台最上面一行，一眼就能看到。
+      */}
+      {user.role === "admin" && (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-dashed border-amber-300 bg-amber-50 px-3 py-2">
+          <div className="min-w-0">
+            <span className="text-[12.5px] font-semibold text-amber-900">🧪 演示数据</span>
+            <span className="ml-2 text-[11.5px] text-amber-700">
+              一键导入 46 间房 / 588 条预订 / 200 张账单，或清空业务数据重来
+            </span>
+          </div>
+          <Link
+            href="/settings?tab=demo"
+            className="shrink-0 rounded bg-amber-600 px-3 py-1 text-[12px] text-white hover:bg-amber-700"
+          >
+            去导入 / 清空
+          </Link>
+        </div>
+      )}
+
       {/* 今日预警（报告 P2-10）：有问题才显示 */}
       {alerts.length > 0 && (
         <div className="card overflow-hidden">

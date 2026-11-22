@@ -6,7 +6,13 @@ import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 
 /* ------------------------------------------------------------ 第一行导航 */
 
-type NavItem = { href: string; label: string; badge?: "channel" };
+type NavItem = {
+  href: string;
+  label: string;
+  badge?: "channel";
+  /** 只有 admin 看得到（比如演示数据入口，不该给前台看到） */
+  adminOnly?: boolean;
+};
 
 const MAIN_NAV: NavItem[] = [
   { href: "/rooms", label: "房态" },
@@ -21,6 +27,14 @@ const MAIN_NAV: NavItem[] = [
   { href: "/today-todo", label: "今日待办" },
   { href: "/handover", label: "交班汇总" },
   { href: "/invoices", label: "发票台账" },
+  /*
+   * 演示数据入口
+   *
+   * 原来只在「设置 → 演示数据」（要点进设置、再点左侧第 22 项菜单），
+   * 埋得太深找不到。这里放到顶部主菜单，admin 一眼可见。
+   * 前台/收银/客房不需要这个功能，所以 adminOnly。
+   */
+  { href: "/settings?tab=demo", label: "演示数据", adminOnly: true },
 ];
 
 /* ------------------------------------------------------------ 更多下拉 */
@@ -440,7 +454,7 @@ export default function AppShell({
 
         {/* 2 ─ 导航（项间 gap 更紧，当前项白底深绿字） */}
         <nav className="flex h-10 items-center gap-0.5 px-2 pb-1">
-          {MAIN_NAV.map((item) => {
+          {MAIN_NAV.filter((item) => !item.adminOnly || user.role === "admin").map((item) => {
             const active = isNavActive(item.href, pathname);
             return (
               <Link
