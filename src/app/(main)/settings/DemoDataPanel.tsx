@@ -14,7 +14,7 @@
  */
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { countBusinessDataAction, loadDemoDataAction } from "./demo-actions";
+import { countBusinessDataAction, fillUniformDemoAction, loadDemoDataAction } from "./demo-actions";
 import { clearBusinessDataAction } from "./clear-data-actions";
 
 type Counts = { rooms: number; bookings: number; stays: number; folios: number };
@@ -40,6 +40,29 @@ export default function DemoDataPanel() {
         setMsg({ kind: "err", text: e instanceof Error ? e.message : "查询失败" });
       } finally {
         setChecking(false);
+      }
+    });
+  };
+
+  /*
+   * 只补均匀数据（不覆盖主数据）
+   *
+   * 场景：已经导入过演示数据、或者已经录了自己的一部分数据，
+   * 只想让近期每一天都有内容可看 —— 不想被整套覆盖。
+   */
+  const fillUniform = () => {
+    setMsg(null);
+    startTransition(async () => {
+      try {
+        const r = await fillUniformDemoAction();
+        if ("error" in r) {
+          setMsg({ kind: "err", text: r.error ?? "补数据失败" });
+        } else {
+          setMsg({ kind: "ok", text: r.ok ?? "补数据完成" });
+          router.refresh();
+        }
+      } catch (e) {
+        setMsg({ kind: "err", text: e instanceof Error ? e.message : "补数据失败" });
       }
     });
   };
@@ -125,6 +148,31 @@ export default function DemoDataPanel() {
             )}
           </div>
         )}
+
+        {/**
+         * 补齐均匀数据（不覆盖主数据）—— 放在最外层，不用先点「检查现有数据」
+         *
+         * 演示 SQL 是某一次快照，日期分布不均（近 30 天 7 天没账单、5 天没流水），
+         * 这个按钮只补「今天往前 60 天每天一批」，不动已有主数据。
+         * 它和「导入演示数据」是两件独立的事，所以不该被 counts 状态挡住。
+         */}
+        <div className="flex flex-wrap items-center gap-2 rounded border border-amber-200 bg-white px-3 py-2">
+          <div className="min-w-0 flex-1">
+            <div className="text-[12px] font-semibold text-amber-900">补齐每一天的数据（不覆盖）</div>
+            <div className="mt-0.5 text-[11px] leading-relaxed text-amber-700">
+              从今天往前 60 天，每天补 3 笔已退房（今天补在住 + 今日预抵），
+              让报表和房态任意一天点进去都有数。已有数据不受影响。
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={fillUniform}
+            disabled={pending}
+            className="shrink-0 rounded bg-amber-600 px-3 py-1.5 text-[12px] text-white hover:bg-amber-700 disabled:opacity-50"
+          >
+            {pending ? "处理中…" : "补齐每一天"}
+          </button>
+        </div>
 
         {counts && (
           <div className="flex flex-wrap items-center gap-2">

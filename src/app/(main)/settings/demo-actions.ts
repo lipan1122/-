@@ -33,7 +33,8 @@ import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { revalidatePath } from "next/cache";
 import { get, run } from "@/lib/db";
-import { requireAdmin } from "@/lib/session";
+import { requireAdmin, requirePermission, requireUser } from "@/lib/session";
+import { seedUniformDemo } from "@/lib/seed-uniform";
 
 export type DemoLoadResult =
   | { ok: string }
@@ -192,11 +193,65 @@ export async function loadDemoDataAction(): Promise<DemoLoadResult> {
     guests: Number(get<{ c: number }>(`SELECT COUNT(*) AS c FROM guests`)?.c ?? 0),
   };
 
+  /*
+   * 导入完再补「按天均匀」的近期数据
+   *
+   * 为什么要在导入后**额外**补：
+   *   演示 SQL 是某一次从真实库导出的快照，它内部的日期分布很不均匀
+   *   （近 30 天里 7 天没有任何账单、5 天没有流水，而 11-14 一天 19 张账单）。
+   *   演示时点进「统计报表」某一天经常看到空白，房态页今天也没有在住/预抵。
+   *
+   * `seedUniformDemo` 会从**今天**往前每天补一批（今天补在住+预抵，历史补已退房），
+   * 让任何一天点进去都有数据。它本身幂等（已有 DEMO 单的日期跳过），
+   * 所以重复导入不会越补越多。
+   *
+   * 失败不阻断导入：主体数据已经进库了，补数据是增强，失败只提示不报错。
+   */
+  let seedNote = "";
+  try {
+    const seeded = seedUniformDemo(user.hotelId ?? 1, 60, false);
+    if (seeded.error) {
+      seedNote = `\n  均匀补数据跳过：${seeded.error}`;
+    } else {
+      seedNote =
+        `\n  均匀补数据：新增 ${seeded.stays} 张入住单 / ${seeded.folios} 张账单 / ${seeded.payments} 笔流水` +
+        `（覆盖近 61 天，跳过已有 ${seeded.skippedDays} 天）` +
+        (seeded.unbalanced ? `\n  ⚠ 自洽校验 ${seeded.unbalanced} 张账单不平，请报障` : "");
+    }
+  } catch (e) {
+    seedNote = `\n  均匀补数据失败（不影响主数据）：${e instanceof Error ? e.message : String(e)}`;
+  }
+
   return {
     ok:
       `演示数据已导入（操作人 ${user.realName ?? user.username}）：\n` +
       `  ${after.rooms} 间房 / ${after.bookings} 条预订 / ${after.stays} 张入住单 / ${after.guests} 个客人\n` +
       `  导入前：${before.rooms} 间房 / ${before.bookings} 条预订（已被覆盖）\n` +
-      `  执行 ${executed} 条语句，4 个演示账号密码已重置为 admin123 / 123456`,
+      `  执行 ${executed} 条语句，4 个演示账号密码已重置为 admin123 / 123456` +
+      seedNote,
   };
+}
+
+/**
+ * 只补「均匀数据」，不覆盖主数据
+ *
+ * 用途：用户之前已经导入过演示数据（或者在自己录真实数据），
+ * 只想让近期每一天都有内容可看，不想被覆盖 —— 设置页单独一个按钮。
+ */
+export async function fillUniformDemoAction(): Promise<{ ok?: string; error?: string }> {
+  const user = await requireUser();
+  requirePermission("settings.manage");
+
+  try {
+    const res = seedUniformDemo(user.hotelId ?? 1, 60, false);
+    if (res.error) return { error: res.error };
+    revalidatePath("/dashboard");
+    revalidatePath("/rooms");
+    revalidatePath("/rooms/forecast");
+    revalidatePath("/reports");
+    revalidatePath("/cashier");
+    return { ok: res.ok ?? "补数据完成" };
+  } catch (e) {
+    return { error: `补数据失败：${e instanceof Error ? e.message : String(e)}` };
+  }
 }
