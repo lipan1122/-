@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import Link from "next/link";
+import { redirect } from "next/navigation";
 import { ensureArAccountSchema } from "@/lib/ar";
 import { all, get } from "@/lib/db";
 import {
@@ -10,7 +11,7 @@ import {
   type OccupancyMetrics,
   type StayNightSlice,
 } from "@/lib/metrics";
-import { requirePermission } from "@/lib/session";
+import { checkPermission, requireUser } from "@/lib/session";
 import { addDays, fmtMoney, round2, todayStr } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
@@ -1553,7 +1554,59 @@ function opDetailRows(hotelId: number, from: string, to: string): OpDetailRow[] 
  * 五之二、新增 20 张报表的数据源
  * ------------------------------------------------------------------ */
 
-/* ---------- 1. 押金报表 ---------- */
+/* ---------- 1. 押金报表 ----------
+ *
+ * ── 第十轮 P1：押金从「明细 item_type」改成「收款流水 kind」 ──
+ *
+ * 旧实现取 folio_items.item_type = 'DEPOSIT'，三个端都不可靠：
+ *   · 退房退押时 cashier/actions.ts 会把 DEPOSIT 明细按退款额冲减
+ *     （`UPDATE folio_items SET amount = amount - refundCash`），
+ *     所以「明细合计」是当前余额而不是期间收取额，直接当收取额用会漏账；
+ *   · 历史「押金补录」只写 payments 不写 folio_items，按明细取数整笔看不见；
+ *   · 业务已冲销、明细没清的残留 DEPOSIT 会虚增押金笔数与金额。
+ *
+ * 现在改用 payments.kind = 'DEPOSIT' 的收款流水（报表与 refundPaymentAction 同一口径）：
+ *   · 新数据（第九轮起）由 folio.ts / cashier / rooms 统一写入 kind，备注写成「订金」也不影响；
+ *   · 升级前的历史行 kind 为 NULL（迁移刻意不静默归类），按备注「押金 / 预收」兜底，
+ *     与 src/lib/folio.ts 的 isDepositPayment / LEGACY_DEPOSIT_REMARK 同一口径。
+ */
+
+/**
+ * 押金收款流水的识别口径（kind 优先 + 历史行备注兜底）
+ *
+ * 别名约定：dp = payments 里的押金收款行。
+ * ⚠️ 必须与 src/lib/folio.ts 的 isDepositPayment 同义：
+ *    kind 有值 → 只有 'DEPOSIT' 算押金；kind IS NULL → 备注含「押金」/「预收」才算。
+ */
+const DEPOSIT_COLLECT_MATCH_SQL = `(
+          dp.kind = 'DEPOSIT'
+          OR (dp.kind IS NULL AND (dp.remark LIKE '%押金%' OR dp.remark LIKE '%预收%'))
+        )`;
+
+/**
+ * 押金退款流水的识别口径（与收款同一套 kind 优先规则 + 原收款兜底）
+ *
+ * 别名约定：p = 退款流水，op = p.refund_of 指向的原始收款。
+ * 判定顺序：
+ *   ① p.kind = 'DEPOSIT_REFUND' → 押金退款（第九轮起 refundKindOf 统一写入）；
+ *   ② p.kind = 'DEPOSIT'        → 负号却标成押金收款的脏数据也计入，避免漏看；
+ *   ③ p.kind IS NULL（历史行）  → 本笔或原收款命中「押金 / 预收」，或原收款 kind = 'DEPOSIT'。
+ *      原收款的 kind 优先于它的备注：备注写「订金」但 kind = 'ROOM_PAYMENT' 的不会被误判成押金。
+ */
+const DEPOSIT_REFUND_MATCH_SQL = `(
+          p.kind = 'DEPOSIT_REFUND'
+          OR p.kind = 'DEPOSIT'
+          OR (
+            p.kind IS NULL
+            AND (
+              p.remark LIKE '%押金%'
+              OR p.remark LIKE '%预收%'
+              OR op.kind = 'DEPOSIT'
+              OR (op.kind IS NULL AND (op.remark LIKE '%押金%' OR op.remark LIKE '%预收%'))
+            )
+          )
+        )`;
+
 type DepositRow = {
   id: number;
   biz_date: string;
@@ -1564,30 +1617,42 @@ type DepositRow = {
   method: string;
   created_at: string | null;
   folio_no: string;
-  folio_status: string;
-  stay_status: string;
+  pay_no: string;
+  /**
+   * 区间内真实负数收款里 refund_of 指向本笔的合计（0 = 区间内没退过）。
+   * 只看区间内落账的退款流水 —— 状态列因此是「区间末状态」，与「已退押金」卡片同一期间口径。
+   */
+  refunded: number;
 };
 
 function depositRows(hotelId: number, from: string, to: string): DepositRow[] {
   return all<DepositRow>(
-    `SELECT fi.id,
-            fi.biz_date,
+    `SELECT dp.id,
+            COALESCE(dp.biz_date, '') AS biz_date,
             COALESCE(f.guest_name, '') AS guest_name,
             COALESCE(f.room_no, '') AS room_no,
-            COALESCE(fi.amount, 0) AS amount,
-            COALESCE(fi.description, '') AS description,
-            COALESCE((SELECT GROUP_CONCAT(DISTINCT p.method) FROM payments p
-                      WHERE p.folio_id = fi.folio_id AND p.biz_date = fi.biz_date), '') AS method,
-            strftime('%Y-%m-%d %H:%M', fi.created_at, '+8 hours') AS created_at,
+            COALESCE(dp.amount, 0) AS amount,
+            COALESCE(dp.remark, '') AS description,
+            COALESCE(dp.method, '') AS method,
+            substr(datetime(dp.created_at, 'localtime'), 1, 16) AS created_at,
             COALESCE(f.folio_no, '') AS folio_no,
-            COALESCE(f.status, '') AS folio_status,
-            COALESCE(s.status, '') AS stay_status
-     FROM folio_items fi
-     LEFT JOIN folios f ON f.id = fi.folio_id
-     LEFT JOIN stays s ON s.id = f.stay_id
-     WHERE fi.hotel_id = ? AND fi.item_type = 'DEPOSIT' AND fi.biz_date BETWEEN ? AND ?
-     ORDER BY fi.biz_date DESC, fi.id DESC`,
-    [hotelId, from, to]
+            COALESCE(dp.pay_no, '') AS pay_no,
+            COALESCE((
+              SELECT SUM(-p.amount)
+                FROM payments p
+                LEFT JOIN payments op ON op.id = p.refund_of AND op.hotel_id = p.hotel_id
+               WHERE p.hotel_id = dp.hotel_id
+                 AND p.amount < 0
+                 AND p.refund_of = dp.id
+                 AND p.biz_date BETWEEN ? AND ?
+                 AND ${DEPOSIT_REFUND_MATCH_SQL}
+            ), 0) AS refunded
+       FROM payments dp
+       LEFT JOIN folios f ON f.id = dp.folio_id
+      WHERE dp.hotel_id = ? AND dp.amount > 0 AND dp.biz_date BETWEEN ? AND ?
+        AND ${DEPOSIT_COLLECT_MATCH_SQL}
+      ORDER BY dp.biz_date DESC, dp.id DESC`,
+    [from, to, hotelId, from, to]
   );
 }
 
@@ -1600,14 +1665,10 @@ function depositRows(hotelId: number, from: string, to: string): DepositRow[] {
  *   · 用净剩余减去在压押金，只会得到「跨期滚动后的差额」，不是真的退过多少钱。
  * 实测就出现「已退 ¥0.00」但实际退过款的情况。
  *
- * 现在直接读真实退款流水。押金退款的识别有两处写入点：
- *   · 退房自动退押金（cashier/actions.ts）：负数流水 + remark「退房退还押金」，
- *     refund_of 指向原押金收款；
- *   · 收银台手动退款（refundPaymentAction）：负数流水 + remark「退款：原因」，
- *     refund_of 指向原收款（原收款可能是押金，也可能不是）。
- * 判定：本笔备注含「押金」，**或** refund_of 指向的那笔原收款备注含「押金」。
- * 押金收款的备注由 rooms/actions.ts 写「预收款（押金）」、收银台写
- * remark || "预收款"，所以「含押金」是两侧都成立的锚点。
+ * 现在直接读真实退款流水。押金退款识别见 DEPOSIT_REFUND_MATCH_SQL
+ * （kind 优先；只有升级前的历史行才看备注，且原收款 kind 同样优先于备注）。
+ * 识别规则同时被押金明细的「状态」列复用 —— 明细状态与「已退押金」卡片
+ * 读的是同一批退款流水，不再各算一套。
  *
  * 时间列用 `datetime(x,'localtime')` 而不是 `x, '+8 hours'`：
  * 老数据 created_at 是 UTC（nowIso），新数据可能是带 +08:00 的本地串
@@ -1645,9 +1706,9 @@ function depositRefundRows(hotelId: number, from: string, to: string): DepositRe
             COALESCE(op.remark, '') AS origin_remark
      FROM payments p
      LEFT JOIN folios f ON f.id = p.folio_id
-     LEFT JOIN payments op ON op.id = p.refund_of
+     LEFT JOIN payments op ON op.id = p.refund_of AND op.hotel_id = p.hotel_id
      WHERE p.hotel_id = ? AND p.amount < 0 AND p.biz_date BETWEEN ? AND ?
-       AND (p.remark LIKE '%押金%' OR COALESCE(op.remark, '') LIKE '%押金%')
+       AND ${DEPOSIT_REFUND_MATCH_SQL}
      ORDER BY p.biz_date DESC, p.id DESC`,
     [hotelId, from, to]
   );
@@ -5487,10 +5548,50 @@ function ReportDeposit({ ctx }: ReportProps) {
   const refunds = depositRefundRows(hotelId, from, to);
 
   const total = sumMoney(rows.map((r) => r.amount));
-  const isHeld = (r: DepositRow) => r.stay_status === "INHOUSE" && r.folio_status !== "SETTLED";
-  const held = sumMoney(rows.filter(isHeld).map((r) => r.amount));
-  /* 已退押金 = 区间内真实负数收款（押金退款）绝对值合计 */
+  /*
+   * 状态与金额同一口径（第十轮验收 P1：报表内部自相矛盾修复）
+   *
+   * 旧实现 `isHeld = 订单在住 && 账单未结` —— 状态由「订单是否在住」推算，
+   * 与金额的「真实退款流水」不是一回事。实测出现：
+   *   明細 8 行显示「已退」，顶部「已退押金」却是 ¥0.00、「押金退款流水 0 笔」；
+   *   F2119（郑凯 8606）押金 ¥600 全额挂在 folio_items、没有任何负数收款，状态却是「已退」。
+   *
+   * 现在三处读同一批数据（同一期间口径）：
+   *   · 明细状态 = 区间内有没有押金退款流水指向这笔收款（depositRows.refunded，区间末状态）；
+   *   · 已退押金 = 区间内真实押金退款流水合计（与下方「押金退款流水」表同源）；
+   *   · 在压押金 = 押金总额 − 已退押金 →「押金总额 = 在压 + 已退」恒成立。
+   * 为什么状态只看区间内的退款：卡片与退款表都按营业日区间取数，状态若看「截至今天」，
+   * 就会出现「区间内明明没退过一笔，明细却标已退」的第二种自相矛盾（已用真实库三种区间验证过）。
+   * 跨期说明：区间内退掉的是区间外收取的旧押金时，「在压」可能小于明细逐笔余额之和
+   * （甚至为负），这是期间口径的正常结果，已写进口径说明。
+   */
   const released = sumMoney(refunds.map((r) => Math.abs(num(r.amount))));
+  const held = round2(total - released);
+  /*
+   * 每笔押金的状态 —— 三种取值，全部由「有没有押金退款流水指向这笔收款」推导：
+   *   ① 没有退款流水（refunded = 0）      → 在压
+   *   ② 退满（refunded ≥ 收取额）          → 已退
+   *   ③ 退了一部分（0 < refunded < 收取额）→ 部分退
+   * 为什么要三种：退房时可能只退差额（押金 800、消费 774、退 26），
+   * 如果一律标「已退」，会让人以为 800 全退了 —— 顶部「已退押金」只加了 26，又对不上。
+   * 三种状态 + 徽标提示里的具体已退金额，才能和「已退押金」卡片逐笔对账。
+   * 关键：既不看订单是否在住，也不看账单是否结清 —— 状态只由退款流水决定。
+   */
+  const refundStateOf = (r: DepositRow): "held" | "refunded" | "partial" => {
+    const refunded = num(r.refunded);
+    if (refunded <= 0.005) return "held";
+    return refunded + 0.005 >= num(r.amount) ? "refunded" : "partial";
+  };
+  const refundStateLabel = (r: DepositRow) => {
+    const s = refundStateOf(r);
+    return s === "held" ? "在压" : s === "refunded" ? "已退" : "部分退";
+  };
+  const refundStateClass = (r: DepositRow) => {
+    const s = refundStateOf(r);
+    if (s === "held") return "border-amber-200 bg-amber-50 text-amber-700";
+    if (s === "refunded") return "border-gray-200 bg-gray-50 text-gray-500";
+    return "border-sky-200 bg-sky-50 text-sky-700";
+  };
 
   const byMethod = new Map<string, { cnt: number; amount: number }>();
   for (const r of rows) {
@@ -5507,18 +5608,26 @@ function ReportDeposit({ ctx }: ReportProps) {
   return (
     <>
       <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="押金笔数" value={fmtInt(rows.length)} hint="区间内 DEPOSIT 明细条数" />
+        <StatCard
+          label="押金笔数"
+          value={fmtInt(rows.length)}
+          hint="区间内押金收款流水条数（payments.kind = DEPOSIT）"
+        />
         <StatCard
           label="押金总额"
           value={fmtMoney(total)}
-          hint="区间内押金明细当前余额（退房退押时会冲减明细）"
+          hint="区间内押金收取合计（kind 优先，旧数据按备注兜底）"
         />
         <StatCard
           label="已退押金"
           value={fmtMoney(released)}
-          hint={`区间内真实退款流水 ${refunds.length} 笔（负数收款，非倒推值）`}
+          hint={`区间内真实押金退款流水 ${refunds.length} 笔（同一口径，非倒推值）`}
         />
-        <StatCard label="在压押金" value={fmtMoney(held)} hint="在住且账单未结的押金" />
+        <StatCard
+          label="在压押金"
+          value={fmtMoney(held)}
+          hint="区间净在压 = 押金总额 − 已退押金；退的是区间外旧押金时可能为负"
+        />
       </div>
 
       <SectionCard title="押金明细" right={`${rangeText(ctx)} · 共 ${rows.length} 笔`}>
@@ -5550,13 +5659,14 @@ function ReportDeposit({ ctx }: ReportProps) {
                   <td className="td tabular-nums text-gray-500">{dash(r.created_at)}</td>
                   <td className="td">
                     <span
-                      className={`rounded border px-1.5 py-0.5 text-[11px] ${
-                        isHeld(r)
-                          ? "border-amber-200 bg-amber-50 text-amber-700"
-                          : "border-gray-200 bg-gray-50 text-gray-500"
-                      }`}
+                      title={
+                        refundStateOf(r) === "held"
+                          ? "区间内没有指向这笔收款的押金退款流水（与「已退押金」同一口径）"
+                          : `已有押金退款流水指向这笔收款，累计已退 ${fmtMoney(num(r.refunded))}`
+                      }
+                      className={`rounded border px-1.5 py-0.5 text-[11px] ${refundStateClass(r)}`}
                     >
-                      {isHeld(r) ? "在压" : "已退"}
+                      {refundStateLabel(r)}
                     </span>
                   </td>
                   <td className="td tabular-nums text-gray-500">{dash(r.folio_no)}</td>
@@ -5666,11 +5776,21 @@ function ReportDeposit({ ctx }: ReportProps) {
       </SectionCard>
 
       <NoteCard>
-        口径说明：押金取 folio_items.item_type = DEPOSIT，按营业日（biz_date）落在区间内统计；
-        收款方式取同账单同营业日的 payments.method；对应订单仍在住且账单未结清记为「在压」，其余记为「已退」。
-        「已退押金」不再用「押金总额 − 在压」倒推，而是直接汇总区间内的**真实退款流水**：
-        退房自动退押（备注「退房退还押金」）与收银台手动退款（refund_of 指向原押金收款）都会写入负数收款，
-        退款明细见「押金退款流水」表；退房退押会同时冲减押金明细，所以「押金总额」是明细当前余额而非期间收取额。
+        口径说明：押金口径以 payments.kind = &apos;DEPOSIT&apos; 的收款流水为准（收款流水才是押金的权威账），
+        按营业日（biz_date）落在区间内统计；升级前 kind 为空的历史行按备注「押金 / 预收」兜底，
+        与 refundPaymentAction / lib/folio.ts 同一口径。
+        只写了收款流水、没写 folio_items 的历史押金补录同样计入（本库的历史补录即属此类），
+        所以「押金笔数 / 押金总额」可能大于按明细取数时的结果 —— 那是补录被如实计入，不是凭空多出；
+        folio_items.item_type = &apos;DEPOSIT&apos; 只作明细参考，不再作为本表取数来源。
+        收款方式直接取该笔流水的 method。
+        「已退押金」直接汇总区间内真实的押金退款流水（kind = &apos;DEPOSIT_REFUND&apos;，明细见下方退款表），
+        「在压押金」= 押金总额 − 已退押金；明细每一行的「状态」看**区间内有没有押金退款流水指向这笔收款**
+        （没有 = 在压；退满 = 已退；只退了一部分 = 部分退，鼠标悬停可看该笔累计已退金额），
+        不再用「订单是否在住 / 账单是否结清」推算 —— 状态与金额因此同源，
+        「押金总额 = 在压 + 已退」恒成立，不会再出现「明細显示已退、顶部已退 ¥0.00」这种两套口径。
+        状态是**区间末状态**（与卡片、退款表同一期间口径）：区间之后才退的押金，在本期看仍是「在压」。
+        跨期提醒：区间内退掉的是区间外收取的旧押金时，「在压」可能小于明细逐笔余额之和（甚至为负），
+        对应退款仍会出现在下方退款表里（看「原收款单号」可知它不属于本表明细），这是期间口径的必然结果。
       </NoteCard>
     </>
   );
@@ -9234,22 +9354,23 @@ export default async function ReportsPage({
   searchParams: Promise<ReportsSearchParams>;
 }) {
   /*
-   * 权限边界（整改清单 P1-32）
+   * 权限边界（整改清单 P1-32 + 第十轮验收 P2）
    *
    * 原来这里是 `requireUser()` —— 只校验「登录了」，没有任何权限点。
-   * 后果：管理员在设置页把收银员的 report.view_finance 取消掉、保存提示
-   * 「接口判断已即时生效」，收银员打开 /reports 依然能看到全部财务报表，
-   * README 声称的「权限在数据库里、改完立即生效」这条不成立。
+   * 后来改成 `requirePermission("report.view_finance")`（抛错）——
+   * 安全上够用，但生产构建下 Next 会把错误消息脱敏成只剩 digest，
+   * error.tsx 认不出 FORBIDDEN，用户看到「操作失败 / React error #441」，
+   * 而不是「没有该操作权限」。
    *
-   * 现在用 report.view_finance：报表页主体就是营收/账务数据，
-   * 与「财务报表」权限点一一对应。路由层（middleware 的 canAccess）仍会先按
-   * role_modules 拦一次，两处叠加才是「页面 + 数据」双重边界。
-   *
-   * 注意：admin 在 hasPermission 里短路放行，管理员不受影响；
-   * 现有 4 个内置角色里只有 admin / cashier 拥有该权限点，与 ROLE_MODULES 里
-   * 「只有 admin 与 cashier 能进 /reports」的现状完全一致，不会误伤。
+   * 现在改成结构化判断 + redirect 到提示页：不依赖被脱敏的错误文案。
+   * 路由层（middleware 的 canAccess）仍会先按 role_modules 拦一次，
+   * 两处叠加才是「页面 + 数据」双重边界；admin 在 hasPermission 里短路放行。
    */
-  const user = await requirePermission("report.view_finance");
+  const user = await requireUser();
+  const reportView = checkPermission(user, "report.view_finance");
+  if (!reportView.ok) {
+    redirect(`/no-permission?p=${encodeURIComponent(reportView.permission)}`);
+  }
   const hotelId = user.hotelId;
   const sp = await searchParams;
 

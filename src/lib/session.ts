@@ -510,6 +510,56 @@ export function hasPermission(role: string, permission: string, hotelId?: number
   return Array.isArray(fallback) ? fallback.includes(role) : false;
 }
 
+/** checkPermission 的返回：不通过时 permission 原样带回，方便跳转时带上权限点 */
+export type PermissionCheck = {
+  ok: boolean;
+  permission: string;
+};
+
+/**
+ * 结构化权限判断（**不抛错**）
+ *
+ * 用法（页面 / 高频动作里替代 requirePermission）：
+ *   const perm = checkPermission(user, "report.view_finance");
+ *   if (!perm.ok) redirect(`/no-permission?p=${encodeURIComponent(perm.permission)}`);
+ *
+ * 为什么需要它（第十轮验收 P2，真浏览器复现）：
+ *   生产构建下 Server Action 抛出的错误会被 Next 脱敏成只剩 digest
+ *   （响应体形如 `1:E{"digest":"1475647473"}`，没有 message），
+ *   error.tsx 的 parsePermissionError 靠匹配 `FORBIDDEN` 文本，永远命中不到，
+ *   用户看到的是「操作失败」而不是「没有该操作权限」。
+ *   改成「先判断、不通过就 redirect」后，呈现不再依赖任何错误文案。
+ *
+ * 与 requirePermission 的分工：
+ *   · requirePermission：抛错，给接口 / 100+ 个还没迁移的 action 兜底（安全边界不变）；
+ *   · checkPermission：只想「拿到结果自己决定怎么呈现」的调用方用（页面、高危按钮）。
+ *   两者共用同一个 hasPermission 口径，不存在两套权限逻辑。
+ */
+export function checkPermission(
+  user: Pick<SessionUser, "role" | "hotelId">,
+  permission: string
+): PermissionCheck {
+  return { ok: hasPermission(user.role, permission, user.hotelId), permission };
+}
+
+/**
+ * 「只要求登录、不做模块授权」的提示页白名单
+ *
+ * 语义（往数组里加路径前必读）：
+ *   · 这里匹配到的路径，canAccess 直接返回 true —— 只保证 session 有效（已登录），
+ *     **不做 role_modules 模块授权判断**；
+ *   · 因为不做模块授权，这些页面绝不能承载任何业务数据 / 写操作，只能放文案与链接；
+ *   · 以后要往这里加路径，先确认它同样「无数据、无副作用」。
+ *
+ * 为什么 /no-permission 必须放行（第十轮验收 P2）：
+ *   权限被拒时会跳到 /no-permission（见 requirePermissionOrRedirect / reports 页），
+ *   而 (main)/layout.tsx 对非 admin 还会按 role_modules 再拦一次 ——
+ *   /no-permission 不在任何角色的模块清单里，不放行的话被拒用户会被第二次重定向回
+ *   /dashboard?err=…，永远看不到「没有该操作权限」这句话，等于没做。
+ *   该页只读 session（角色 / 权限点中文名），不碰任何业务数据，放行无越权风险。
+ */
+const AUTHENTICATED_ONLY_PATHS = ["/no-permission"];
+
 /**
  * 判断角色能否访问某个路径（页面守卫用）
  *
@@ -521,6 +571,7 @@ export function hasPermission(role: string, permission: string, hotelId?: number
  */
 export function canAccess(role: string, pathname: string, hotelId?: number): boolean {
   if (role === "admin") return true;
+  if (AUTHENTICATED_ONLY_PATHS.some((p) => pathname === p || pathname.startsWith(p + "/"))) return true;
   const snapshot = rbacOf(normalizeHotelId(hotelId));
   const dbModules = snapshot.modules.get(role);
   const modules: string[] | "*" | undefined = dbModules ?? ROLE_MODULES[role];
@@ -570,6 +621,29 @@ export async function requirePermission(permission: string): Promise<SessionUser
   const u = await requireUser();
   if (!hasPermission(u.role, permission, u.hotelId)) {
     throw new Error(`FORBIDDEN: 缺少权限 ${permission}`);
+  }
+  return u;
+}
+
+/**
+ * 动作级权限断言（redirect 版）：无权限直接跳 /no-permission，不抛错
+ *
+ * 为什么需要它（第十轮验收 P2）：
+ *   见 checkPermission 的注释 —— 生产构建会把 Server Action 的错误消息脱敏成 digest，
+ *   error.tsx 拿不到 `FORBIDDEN: 缺少权限 xxx` 这段文字，只能显示「操作失败」。
+ *   redirect 是 Next 的受控返回，不经过错误脱敏，页面上一定能看到「没有该操作权限」。
+ *
+ * 覆盖范围（如实说明）：只覆盖主动改用本函数的 action（当前是收银台 10 个动作）。
+ *   其余 100+ 处仍是 requirePermission（抛错），生产构建下继续显示「操作失败」，
+ *   这是本方案的已知限制：逐页迁移，不改变任何服务端拒绝逻辑。
+ *
+ * 安全边界不变：判断仍然是 hasPermission（admin 短路 + 库为准 + 常量兜底），
+ * 只是把「失败后的出口」从抛错换成跳提示页，不会让无权限的人真的执行到写库代码。
+ */
+export async function requirePermissionOrRedirect(permission: string): Promise<SessionUser> {
+  const u = await requireUser();
+  if (!hasPermission(u.role, permission, u.hotelId)) {
+    redirect(`/no-permission?p=${encodeURIComponent(permission)}`);
   }
   return u;
 }

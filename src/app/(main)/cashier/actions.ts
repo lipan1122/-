@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { all, get, run, tx } from "@/lib/db";
 import { bizToday } from "@/lib/biz-date";
-import { requirePermission, requireUser } from "@/lib/session";
+import { requirePermissionOrRedirect, requireUser } from "@/lib/session";
 import { changeRoomStatus } from "@/lib/room-status";
 import { fmtMoney, nowIso, todayStr } from "@/lib/utils";
 import {
@@ -75,6 +75,60 @@ function writeLog(hotelId: number, operator: string, action: string, detail: str
   ]);
 }
 
+/* ------------------------------------------------------------------ *
+ * 收银台幂等键（第十轮 P1：4 个写动作补 request_id）
+ *
+ * ── 缺陷 ──
+ * 收银台只有 addPaymentAction 读 request_id：checkoutAction（退房补收 / 退押金流水）、
+ * refundPaymentAction（退款流水）、addDepositAction（押金明细 + 收款流水）、
+ * addChargeAction（入账明细）全部没有这个参数。
+ * 而 payments / folio_items 上早就建好了
+ * `UNIQUE(hotel_id, request_id) WHERE request_id IS NOT NULL` 的部分唯一索引 ——
+ * 因为这 4 个动作从来不写该列，唯一索引一直是空转的死约束：
+ *   · 双击「确认收取预收款」→ 押金收两笔、stays.deposit 翻倍；
+ *   · 双击「退款」→ 钱退两次、余额多冲一次；
+ *   · 双击「确认退房」→ 补收流水两笔（第二笔一般被「已结账」拦住，但补收已入账）；
+ *   · 双击「确认入账」→ 同一笔消费记两遍。
+ *
+ * ── 修复（与 rooms/actions.ts 第九轮那套完全同款，字段名统一 request_id）──
+ *   ① 客户端 src/components/CashierPanel.tsx 为**每个操作各持一枚** request_id，
+ *      隐藏字段提交；换账单 / 换客人时整组换新，成功后才换新；
+ *   ② 服务端每个写动作先按 (hotel_id, request_id) 查重，命中即按「幂等重放」
+ *      返回成功（不再重复入账，也不重复写 op_logs —— 重放在进事务前就返回了）；
+ *   ③ 并发下两次都通过查重时，后到的撞唯一索引 → catch 里同样按重放返回，
+ *      整个事务已回滚，不会多出一笔。
+ * ------------------------------------------------------------------ */
+
+/** 只认 `request_id` 这个字段名（与 rooms/actions.ts、ShopPOS 一致） */
+function readRequestId(formData: FormData): string | null {
+  const id = str(formData, "request_id");
+  return id ? id : null;
+}
+
+/** 唯一约束冲突判定：查重之后仍被抢写时走幂等分支，其它错误继续抛 */
+function isUniqueViolation(e: unknown): boolean {
+  return /UNIQUE constraint failed|SQLITE_CONSTRAINT/i.test(String(e instanceof Error ? e.message : e));
+}
+
+/** 收款流水的幂等查重（押金 / 退款 / 退房补收共用） */
+function receivedPayment(hotelId: number, requestId: string | null) {
+  if (!requestId) return undefined;
+  return get<{ id: number; folio_id: number | null; amount: number }>(
+    `SELECT id, folio_id, amount FROM payments WHERE hotel_id = ? AND request_id = ? LIMIT 1`,
+    [hotelId, requestId]
+  );
+}
+
+/** 明细类（入账 / 加收房费）的幂等查重 */
+function postedFolioItem(hotelId: number, requestId: string | null) {
+  if (!requestId) return undefined;
+  return get<{ id: number; folio_id: number | null; item_type: string; amount: number }>(
+    `SELECT id, folio_id, item_type, amount FROM folio_items
+      WHERE hotel_id = ? AND request_id = ? LIMIT 1`,
+    [hotelId, requestId]
+  );
+}
+
 function revalidateCashier() {
   revalidatePath("/cashier");
   revalidatePath("/dashboard");
@@ -130,7 +184,7 @@ function loadFolioContext(folioId: number, hotelId: number) {
  */
 export async function splitFolioAction(formData: FormData): Promise<ActionState> {
   // 权限边界（上线前加固）：拆账单只对 admin / 收银开放，原来只校验登录
-  const user = await requirePermission("cashier.split");
+  const user = await requirePermissionOrRedirect("cashier.split");
   /* 拆账会复制收款流水的 kind（第九轮 P1-2），老库先兜底补列 */
   ensurePaymentKindSchema();
   const folioId = numOf(formData, "folio_id");
@@ -288,7 +342,7 @@ export async function addChargeAction(formData: FormData): Promise<ActionState> 
    * 而 folio.post_charge 同时被 /inhouse 的「补过房费」用到，
    * 那个入口收银员根本进不去 —— 共用一个权限点会互相牵制。
    */
-  const user = await requirePermission("cashier.receive");
+  const user = await requirePermissionOrRedirect("cashier.receive");
   const folioId = numOf(formData, "folio_id");
   const rawType = str(formData, "item_type") || "OTHER";
   const itemType = rawType === "ROOM" || rawType === "FOOD" || rawType === "OTHER" ? rawType : "OTHER";
@@ -296,10 +350,22 @@ export async function addChargeAction(formData: FormData): Promise<ActionState> 
   const qty = numOf(formData, "qty", 1);
   const price = numOf(formData, "price");
   const bizDate = str(formData, "biz_date") || bizToday(user.hotelId);
+  /* 第十轮 P1：入账幂等键（明细落 folio_items.request_id，唯一索引兜底） */
+  const requestId = readRequestId(formData);
 
   if (!folioId) return { error: "账务单不存在" };
   if (qty <= 0) return { error: "数量必须大于 0" };
   if (price < 0) return { error: "单价不能为负数" };
+
+  /*
+   * 幂等重放要放在「账单状态」校验之前：
+   * 双击提交时第一笔已入账成功、随后收银台又退了房，第二次提交若先校验状态，
+   * 前台看到的会是「该账单已结账」这句报错，而不是「已入账（重复提交已忽略）」。
+   */
+  const replayed = postedFolioItem(user.hotelId, requestId);
+  if (replayed) {
+    return { ok: `该笔入账已记账 ${fmtMoney(Number(replayed.amount))}（重复提交已忽略）` };
+  }
 
   const folio = get<{ id: number; status: string }>(
     `SELECT id, status FROM folios WHERE id = ? AND hotel_id = ?`,
@@ -312,14 +378,20 @@ export async function addChargeAction(formData: FormData): Promise<ActionState> 
   const desc =
     description || (itemType === "ROOM" ? `房费 ${bizDate}` : itemType === "FOOD" ? "餐饮消费" : "其他消费");
 
-  tx(() => {
-    run(
-      `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at, created_by)
-       VALUES (?,?,?,?,?,?,?,?,?,?)`,
-      [user.hotelId, folioId, itemType, desc, qty, price, amount, bizDate, nowIso(), user.id]
-    );
-    recalcFolioBalance(user.hotelId, folioId);
-  });
+  try {
+    tx(() => {
+      run(
+        `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at, created_by, request_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        [user.hotelId, folioId, itemType, desc, qty, price, amount, bizDate, nowIso(), user.id, requestId]
+      );
+      recalcFolioBalance(user.hotelId, folioId);
+    });
+  } catch (e) {
+    /* 并发双击：两次都通过查重，后到的撞 folio_items 唯一索引；事务已整体回滚 */
+    if (isUniqueViolation(e)) return { ok: "该笔入账已记账（并发重复提交已忽略）" };
+    throw e;
+  }
   revalidateCashier();
   return { ok: `已入账 ${fmtMoney(amount)}` };
 }
@@ -333,7 +405,7 @@ export async function addChargeAction(formData: FormData): Promise<ActionState> 
  *   - 金额后端复算，不信任前端
  */
 export async function addPaymentAction(formData: FormData): Promise<ActionState> {
-  const user = await requirePermission("cashier.receive");
+  const user = await requirePermissionOrRedirect("cashier.receive");
   /* 第九轮 P1-2：收款要写结构化性质 kind，老库先兜底补列 */
   ensurePaymentKindSchema();
   const folioId = numOf(formData, "folio_id");
@@ -490,16 +562,29 @@ export async function addPaymentAction(formData: FormData): Promise<ActionState>
  *   - 写负数 payments 流水，余额回补
  */
 export async function refundPaymentAction(formData: FormData): Promise<ActionState> {
-  const user = await requirePermission("cashier.refund");
+  const user = await requirePermissionOrRedirect("cashier.refund");
   /* 第九轮 P1-2：退款流水要写结构化性质 kind，老库先兜底补列 */
   ensurePaymentKindSchema();
   const paymentId = numOf(formData, "payment_id");
   const amount = round2(numOf(formData, "amount"));
   const reason = str(formData, "reason");
+  /* 第十轮 P1：退款幂等键（负数流水写 payments.request_id） */
+  const requestId = readRequestId(formData);
 
   if (!paymentId) return { error: "请选择要退款的收款记录" };
   if (amount <= 0) return { error: "退款金额必须大于 0" };
   if (!reason) return { error: "请填写退款原因" };
+
+  /*
+   * 幂等重放：同一 request_id 已经退过款 → 直接返回成功。
+   * 放在最前面（早于退款上限 / 账单状态校验）：
+   * 双击时第二笔若先撞上「最多还能退 0.00」或「账单已结账」，前台看到的是报错，
+   * 而实际第一笔已经退成功 —— 收银员会以为没退成，再退一次（真正的重复退款风险）。
+   */
+  const replayedRefund = receivedPayment(user.hotelId, requestId);
+  if (replayedRefund) {
+    return { ok: `该笔退款已入账 ${fmtMoney(Math.abs(Number(replayedRefund.amount)))}（重复提交已忽略）` };
+  }
 
   const pay = get<{ id: number; hotel_id: number; folio_id: number | null; stay_id: number | null; method: string; amount: number; refund_of: number | null; remark: string | null; kind: string | null }>(
     `SELECT id, hotel_id, folio_id, stay_id, method, amount, refund_of, remark, kind FROM payments
@@ -632,8 +717,8 @@ export async function refundPaymentAction(formData: FormData): Promise<ActionSta
       );
 
       run(
-        `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, refund_of, operator, kind)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, refund_of, request_id, operator, kind)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [
           user.hotelId,
           refundFolioId,
@@ -653,6 +738,8 @@ export async function refundPaymentAction(formData: FormData): Promise<ActionSta
           depositSource ? `押金退款：${reason}` : `退款：${reason}`,
           nowIso(),
           pay.id,
+          /* 第十轮 P1：退款幂等键（唯一索引 idx_payments_request 兜底并发双击） */
+          requestId,
           user.realName ?? user.username,
           /*
            * 第九轮 P1-2：退款性质由**原收款**决定（押金退款 / 房费退款），
@@ -724,6 +811,11 @@ export async function refundPaymentAction(formData: FormData): Promise<ActionSta
       return depositOffset;
     });
   } catch (e) {
+    /*
+     * 并发双击兜底：两个请求都通过了幂等查重，后到的撞 payments.request_id
+     * 唯一索引（事务已整体回滚），按幂等重放返回成功而不是把 UNIQUE 报错甩给前台。
+     */
+    if (isUniqueViolation(e)) return { ok: "该笔退款已入账（并发重复提交已忽略）" };
     return { error: e instanceof Error ? e.message : "退款失败" };
   }
 
@@ -747,9 +839,21 @@ export async function addDepositAction(formData: FormData): Promise<ActionState>
   const method = str(formData, "method") || "现金";
   const remark = str(formData, "remark");
   const bizDate = str(formData, "biz_date") || bizToday(user.hotelId);
+  /* 第十轮 P1：押金幂等键（payments 与 folio_items 两处都写，两张表各有唯一索引） */
+  const requestId = readRequestId(formData);
 
   if (!folioId) return { error: "账务单不存在" };
   if (amount <= 0) return { error: "预收款金额必须大于 0" };
+
+  /*
+   * 幂等重放：同一 request_id 的押金已经收过（收款流水是「钱到账」的唯一事实来源）。
+   * 必须在账单状态校验之前 —— 双击时第一笔已收成功、随后退房，第二笔若先撞
+   * 「该账单已结账」就会把重复提交显示成业务报错，收银员会以为没收到再收一次。
+   */
+  const replayed = receivedPayment(user.hotelId, requestId);
+  if (replayed) {
+    return { ok: `该笔预收款已入账 ${fmtMoney(Number(replayed.amount))}（重复提交已忽略）` };
+  }
 
   const folio = loadFolioContext(folioId, user.hotelId);
   if (!folio) return { error: "账务单不存在" };
@@ -757,54 +861,61 @@ export async function addDepositAction(formData: FormData): Promise<ActionState>
 
   const desc = remark ? `预收款（${remark}）` : "预收款（押金）";
 
-  tx(() => {
-    run(
-      `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at, created_by)
-       VALUES (?,?,?,?,?,?,?,?,?,?)`,
-      [user.hotelId, folioId, "DEPOSIT", desc, 1, amount, amount, bizDate, nowIso(), user.id]
-    );
-    run(
-      `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, operator, kind)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-      [
-        user.hotelId,
+  try {
+    tx(() => {
+      run(
+        `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at, created_by, request_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        [user.hotelId, folioId, "DEPOSIT", desc, 1, amount, amount, bizDate, nowIso(), user.id, requestId]
+      );
+      run(
+        `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, request_id, operator, kind)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          user.hotelId,
+          folioId,
+          stayId || folio.stay_id,
+          nextPayNo(),
+          method,
+          amount,
+          bizDate,
+          remark || "预收款",
+          nowIso(),
+          requestId,
+          user.realName ?? user.username,
+          /*
+           * 第九轮 P1-2：kind 是押金的唯一结构标记。
+           * 备注是自由文本（客人/前台可能写「订金」「保证金」「刷卡预授权」），
+           * 一律不再参与押金识别；退房与手动退款都按这个字段找原押金收款。
+           */
+          "DEPOSIT",
+        ]
+      );
+      run(`UPDATE folios SET paid_amount = paid_amount + ? WHERE id = ? AND hotel_id = ?`, [
+        amount,
         folioId,
-        stayId || folio.stay_id,
-        nextPayNo(),
-        method,
-        amount,
-        bizDate,
-        remark || "预收款",
-        nowIso(),
-        user.realName ?? user.username,
-        /*
-         * 第九轮 P1-2：kind 是押金的唯一结构标记。
-         * 备注是自由文本（客人/前台可能写「订金」「保证金」「刷卡预授权」），
-         * 一律不再参与押金识别；退房与手动退款都按这个字段找原押金收款。
-         */
-        "DEPOSIT",
-      ]
-    );
-    run(`UPDATE folios SET paid_amount = paid_amount + ? WHERE id = ? AND hotel_id = ?`, [
-      amount,
-      folioId,
-      user.hotelId,
-    ]);
-    if (stayId || folio.stay_id) {
-      run(`UPDATE stays SET deposit = COALESCE(deposit, 0) + ? WHERE id = ? AND hotel_id = ?`, [
-        amount,
-        stayId || folio.stay_id,
         user.hotelId,
       ]);
-    }
-    recalcFolioBalance(user.hotelId, folioId);
-    writeLog(
-      user.hotelId,
-      user.realName,
-      "预收款",
-      `入住单 ${folio.stay_no} · 账单 ${folio.folio_no} · 房间 ${folio.room_no} · 方式 ${method} · 金额 ${fmtMoney(amount)}`
-    );
-  });
+      if (stayId || folio.stay_id) {
+        run(`UPDATE stays SET deposit = COALESCE(deposit, 0) + ? WHERE id = ? AND hotel_id = ?`, [
+          amount,
+          stayId || folio.stay_id,
+          user.hotelId,
+        ]);
+      }
+      recalcFolioBalance(user.hotelId, folioId);
+      writeLog(
+        user.hotelId,
+        user.realName,
+        "预收款",
+        `入住单 ${folio.stay_no} · 账单 ${folio.folio_no} · 房间 ${folio.room_no} · 方式 ${method} · 金额 ${fmtMoney(amount)}`
+      );
+    });
+  } catch (e) {
+    /* 并发双击：两次都通过查重 → 后到的撞唯一索引，事务整体回滚，按重放返回成功 */
+    if (isUniqueViolation(e)) return { ok: "该笔预收款已入账（并发重复提交已忽略）" };
+    throw e;
+  }
   revalidateCashier();
   return { ok: `已收预收款 ${fmtMoney(amount)}` };
 }
@@ -895,7 +1006,7 @@ export async function partialSettleAction(formData: FormData): Promise<ActionSta
  *   3. 本次挂账后超过额度 → 拒绝，并告知剩余可用额度
  */
 export async function chargeToCompanyAction(formData: FormData): Promise<ActionState> {
-  const user = await requirePermission("cashier.charge_company");
+  const user = await requirePermissionOrRedirect("cashier.charge_company");
   const folioId = numOf(formData, "folio_id");
   const stayId = numOf(formData, "stay_id");
   const companyId = numOf(formData, "company_id");
@@ -1014,7 +1125,7 @@ export async function chargeToCompanyAction(formData: FormData): Promise<ActionS
 /** 转账：把当前账单的部分金额转到另一个在住账单 */
 export async function transferAction(formData: FormData): Promise<ActionState> {
   // 权限边界（上线前加固）：账单转账涉及两个账单的金额搬移，原来只校验登录
-  const user = await requirePermission("cashier.transfer");
+  const user = await requirePermissionOrRedirect("cashier.transfer");
   const fromFolioId = numOf(formData, "folio_id");
   const targetFolioId = numOf(formData, "target_folio_id");
   const amount = round2(numOf(formData, "amount"));
@@ -1093,7 +1204,7 @@ export async function transferAction(formData: FormData): Promise<ActionState> {
  */
 export async function invoiceAction(formData: FormData): Promise<ActionState> {
   // 权限边界（上线前加固）：开票受财务权限约束（与收款同组），原来只校验登录
-  const user = await requirePermission("cashier.receive");
+  const user = await requirePermissionOrRedirect("cashier.receive");
   const folioId = numOf(formData, "folio_id");
   const title = str(formData, "title");
   const taxNo = str(formData, "tax_no");
@@ -1140,7 +1251,7 @@ export async function invoiceAction(formData: FormData): Promise<ActionState> {
  */
 export async function reverseCheckoutAction(formData: FormData): Promise<ActionState> {
   // 撤结账是高危操作：独立权限 + 必须填写原因
-  const user = await requirePermission("cashier.reverse_checkout");
+  const user = await requirePermissionOrRedirect("cashier.reverse_checkout");
   const stayId = numOf(formData, "stay_id");
   const folioId = numOf(formData, "folio_id");
   const reason = str(formData, "reason");
@@ -1275,7 +1386,7 @@ export async function delayCheckoutAction(formData: FormData): Promise<ActionSta
  */
 export async function reopenStayAction(formData: FormData): Promise<ActionState> {
   // 权限边界（上线前加固）：重新入住等同于撤销退房，仅 admin 可执行，原来只校验登录
-  const user = await requirePermission("cashier.reverse_checkout");
+  const user = await requirePermissionOrRedirect("cashier.reverse_checkout");
   const stayId = numOf(formData, "stay_id");
   const folioId = numOf(formData, "folio_id");
   if (!stayId) return { error: "入住信息不完整，请重新选择客人" };
@@ -1339,15 +1450,17 @@ export async function reopenStayAction(formData: FormData): Promise<ActionState>
   return { ok: "已重新入住，账单恢复为未结，房间恢复在住" };
 }
 
-/** 结账退房：补收 → 核销账单 → 退房 → 房态 VD → 打扫任务 */
+/** 结账退房：补收 → 无条件冲销押金 → 核销账单 → 退房 → 房态 VD → 打扫任务 */
 export async function checkoutAction(formData: FormData): Promise<ActionState> {
   // 权限边界（上线前加固）：结账退房同时改钱和房态，必须校验 cashier.checkout，原来只校验登录
-  const user = await requirePermission("cashier.checkout");
+  const user = await requirePermissionOrRedirect("cashier.checkout");
   const stayId = numOf(formData, "stay_id");
   const roomId = numOf(formData, "room_id");
   const folioId = numOf(formData, "folio_id");
   const payMethod = str(formData, "pay_method") || "现金";
   const payAmount = round2(numOf(formData, "pay_amount"));
+  /* 第十轮 P1：退房幂等键（补收流水 / 押金退款流水都写 payments.request_id） */
+  const requestId = readRequestId(formData);
 
   if (!stayId || !roomId || !folioId) return { error: "入住信息不完整，请重新选择客人" };
 
@@ -1356,7 +1469,17 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
     [folioId, user.hotelId]
   );
   if (!folio) return { error: "账务单不存在" };
-  if (folio.status === "SETTLED" || folio.status === "CHARGED") return { error: "该账单已结账，无需重复退房" };
+  if (folio.status === "SETTLED" || folio.status === "CHARGED") {
+    /*
+     * 双击退房：第一枪已经把账单置 SETTLED。
+     * 同一 request_id 的重放按幂等返回成功（不再写第二遍补收 / 押金退款 / 日志）；
+     * 换了一枚新键才说明是「真的再点一次」，那才是业务错误。
+     */
+    if (receivedPayment(user.hotelId, requestId)) {
+      return { ok: "该笔退房已处理（重复提交已忽略）" };
+    }
+    return { error: "该账单已结账，无需重复退房" };
+  }
 
   const stay = get<{
     id: number;
@@ -1386,11 +1509,26 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
   ensurePaymentKindSchema();
   try {
     result = tx((): { error: string } | { ok: string } => {
+    /*
+     * 0. 事务内再确认一次账单状态（并发双击兜底）
+     *
+     * 预检在事务外：两个请求可能都读到 OPEN。tx() 是 BEGIN IMMEDIATE（写锁串行），
+     * 第二个请求进来时第一枪已经提交，账单已 SETTLED ——
+     * 这里直接按幂等重放返回，不再写第二遍补收 / 押金退款 / 操作日志。
+     */
+    const folioNow = get<{ status: string }>(
+      `SELECT status FROM folios WHERE id = ? AND hotel_id = ?`,
+      [folioId, user.hotelId]
+    );
+    if (folioNow && (folioNow.status === "SETTLED" || folioNow.status === "CHARGED")) {
+      return { ok: "该笔退房已处理（重复提交已忽略）" };
+    }
+
     // 1. 补收（第 4 轮 P0-1：只加 paid_amount，余额交给 recalcFolioBalance 统一算）
     if (payAmount > 0) {
       run(
-        `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, operator, kind)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, request_id, operator, kind)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
         [
           user.hotelId,
           folioId,
@@ -1401,6 +1539,12 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
           todayStr(),
           "退房补收",
           nowIso(),
+          /*
+           * 第十轮 P1：补收流水带幂等键。
+           * 押金退款流水用 `${requestId}#dep` 派生键，避免与补收撞同一个唯一索引；
+           * 补收本身用「裸键」—— 双击时第二枪能靠 payments.request_id 认出重放。
+           */
+          requestId,
           user.realName ?? user.username,
           /* 补收的是消费欠款，不是押金 */
           "ROOM_PAYMENT",
@@ -1420,122 +1564,141 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
     }
 
     /*
-     * 2b. 退房时自动退还押金（第 4 轮 P0-2：原来提示与守卫互相矛盾，死锁）
+     * 2b. 退房「无条件冲销全部押金」（第十轮 P0）
      *
-     * 旧实现：退房时只提示「有应退押金，请去退款」，
-     * 但置 SETTLED 之后 refundPaymentAction 会以「账单已结账」拒绝退款 ——
-     * 前台按提示操作必然被拒，唯一出路是「撤销结账」，
-     * 而撤销结账会把已离店客人改回 INHOUSE、房间改回 OC（人离店了却被复活）。
+     * ── 缺陷（第九轮验收 agent 在真库实测）──
+     * 旧实现只按「应退余额」退押金：
+     *     refundDue  = max(0, −balance)
+     *     refundCash = min(refundDue, 押金明细)
+     *     if (refundCash > 0) { 写负数收款 + 冲销明细 + 减 stays.deposit }
+     * balance >= 0（客人不欠钱，或欠款已被补收抹平）时 refundCash = 0，
+     * **整段冲销被 if 跳过** —— 客人拿走行李走了，账上押金还挂着：
+     *   · stays.deposit 仍是 800，「在住押金」/在住列表虚高；
+     *   · folio_items 的 DEPOSIT 明细仍是 800，押金报表按明细汇总 → 收取额虚高；
+     *   · 再入住/再收费时前台按「还挂着押金」判断，容易重复退。
+     * 真库实测：11 张 CHECKED_OUT 单残留押金 6800，3 张 SETTLED 账单还挂 2100。
      *
-     * 现在：在置 SETTLED **之前**，同事务内把押金退掉：
-     *   ① 写负数收款流水（refund_of 指向押金那笔，method 同原方式）
-     *   ② 冲销 DEPOSIT 明细（押金不再挂账）
-     *   ③ 减 stays.deposit
-     *   ④ 减 folios.paid_amount，recalcFolioBalance 重算
-     * 退完 balance 归 0，账单才能真正「已结清」。
+     * ── 押金是担保，不是收入：退房必须清零 ──
+     * 账务上押金早就计入 folios.paid_amount（收款事实），所以「押金先抵扣房费」
+     * 在账面天然成立：应收 T、其它实收 R、押金 D 时 paid = R + D，balance = T − (R + D)。
+     *   · balance < 0（多收了钱）→ 退现金 refundCash = min(−balance, D)；
+     *     这部分写负数收款（refund_of 指向原押金），paid 同步减回去；
+     *   · balance >= 0（押金被房费吃掉 / 已被补收抹平）→ 不退现金，
+     *     押金明细与 stays.deposit 照样清零（担保结束）。
+     * 两种情况下押金都要清零，区别只在退多少现金。
      *
-     * 退款金额取 min(应退余额, 该账单还挂着的押金) ——
-     * 防止「部分结账后负余额里的非押金部分」被当成押金退掉。
+     * ── 与旧实现的唯一行为差异 ──
+     * balance >= 0 时旧代码什么都不做（残留），新代码做完整账面冲销（不动钱）。
+     * balance < 0 时 refundCash 与旧实现完全一致（min(应退, 押金)），
+     * 既有押金退回的流水 / 日志 / 报表口径不变。
      */
     const refundDue = money.balance < -0.01 ? round2(-money.balance) : 0;
-    /* 该账单当前还挂着的押金总额（明细口径） */
-    const depositOnFolio = round2(
-      get<{ t: number }>(
-        `SELECT COALESCE(SUM(amount), 0) AS t FROM folio_items
-          WHERE folio_id = ? AND hotel_id = ? AND item_type = 'DEPOSIT'`,
-        [folioId, user.hotelId]
-      )?.t ?? 0
+    /* 该账单还挂着的押金明细总额（押金负债的唯一权威口径，等同 lib/folio.depositHeld） */
+    const depositOnFolio = depositHeld(user.hotelId, folioId);
+    const stayDepositRow = get<{ d: number | null }>(
+      `SELECT COALESCE(deposit, 0) AS d FROM stays WHERE id = ? AND hotel_id = ?`,
+      [stayId, user.hotelId]
     );
+    const stayDeposit = round2(Math.max(0, Number(stayDepositRow?.d ?? 0)));
+    /* 退现金的部分：只能退「多收的钱」，且不超过押金本身 */
     const refundCash = round2(Math.min(refundDue, Math.max(0, depositOnFolio)));
+    /* 押金被房费吃掉的部分：不产生现金流动，钱本来就留在 paid_amount 里 */
+    const depositOffsetToRoom = round2(Math.max(0, depositOnFolio) - refundCash);
 
-    if (refundCash > 0) {
-      /*
-       * ① 找押金那笔原始收款（refund_of 要指向它，便于对账）
-       *
-       * 第九轮 P1-2：原来用 `remark LIKE '%押金%'` 找 —— 押金备注写成「订金」就找不到，
-       * refund_of 为空、押金退不回去，还可能被当成房费退款重复退。
-       * 现在走唯一口径 findDepositPayment：kind = 'DEPOSIT' 优先，旧数据（kind 为空）才按备注兜底。
-       */
-      const depositPay = findDepositPayment(user.hotelId, folioId);
-      run(
-        `INSERT INTO payments
-           (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, refund_of, operator, kind)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [
-          user.hotelId,
+    if (depositOnFolio > 0.005 || stayDeposit > 0.005) {
+      /* ① 押金退现金：写负数收款流水（refund_of 指向原押金那笔，method 同原方式） */
+      if (refundCash > 0.005) {
+        /*
+         * 找押金那笔原始收款（refund_of 要指向它，便于对账）
+         *
+         * 第九轮 P1-2：原来用 `remark LIKE '%押金%'` 找 —— 押金备注写成「订金」就找不到，
+         * refund_of 为空、押金退不回去，还可能被当成房费退款重复退。
+         * 现在走唯一口径 findDepositPayment：kind = 'DEPOSIT' 优先，旧数据（kind 为空）才按备注兜底。
+         */
+        const depositPay = findDepositPayment(user.hotelId, folioId);
+        run(
+          `INSERT INTO payments
+             (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, refund_of, request_id, operator, kind)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            user.hotelId,
+            folioId,
+            stayId,
+            nextPayNo(),
+            depositPay?.method ?? "现金",
+            -Math.abs(refundCash),
+            todayStr(),
+            "退房退还押金",
+            nowIso(),
+            depositPay?.id ?? null,
+            /* 第十轮 P1：派生幂等键（与补收的裸键区分；没有补收时用裸键，便于识别重放） */
+            requestId ? (payAmount > 0 ? `${requestId}#dep` : requestId) : null,
+            user.realName ?? user.username,
+            /* 押金退款的结构化标记（与手动退款 refundKindOf 的口径一致） */
+            "DEPOSIT_REFUND",
+          ]
+        );
+        /* ② 减已收：退出去的押金不再是酒店的钱 */
+        run(`UPDATE folios SET paid_amount = COALESCE(paid_amount,0) - ? WHERE id = ? AND hotel_id = ?`, [
+          refundCash,
           folioId,
-          stayId,
-          nextPayNo(),
-          depositPay?.method ?? "现金",
-          -Math.abs(refundCash),
-          todayStr(),
-          "退房退还押金",
-          nowIso(),
-          depositPay?.id ?? null,
-          user.realName ?? user.username,
-          /* 押金退款的结构化标记（与手动退款 refundKindOf 的口径一致） */
-          "DEPOSIT_REFUND",
-        ]
-      );
+          user.hotelId,
+        ]);
+      }
+
       /*
-       * ② 冲销押金明细：按行逐笔冲，单条 UPDATE 只改一行
+       * ③ 押金明细全部清零（含「被房费吃掉」的部分）
        *
-       * 同一张账单可以多次收押金（addDepositAction 每次插一条 DEPOSIT 明细）。
-       * 写成 `UPDATE ... WHERE item_type = 'DEPOSIT'` 的批量语句会把**每条**都减一遍：
-       * 账单挂了 3 条押金（各 600），退房应退 600，批量 UPDATE 之后
-       * 押金明细总额从 1800 变成 1200 —— 少掉的 600 是「被多冲了 2 次」。
-       * refundPaymentAction（本文件 610 行起）第九轮已修成同样的写法，这里对齐。
-       *
-       * 两条硬边界：
-       *   · 单笔冲销额不超过该行余额（否则会把某条冲成负押金）；
-       *   · 冲销总额不超过 stays.deposit（否则「在住押金」会变负，报表虚高）。
-       * 优先冲最新收的那笔（ORDER BY id DESC），符合前台「后收先退」的习惯。
+       * 按行逐笔 UPDATE，一条语句只改一行：
+       * 写成 `UPDATE ... WHERE item_type = 'DEPOSIT'` 的批量语句会把**每条**都减一遍，
+       * 账单挂 3 条押金（各 600）时总额会从 1800 掉到 1200 —— 被多冲了 2 次。
+       * 这里直接把每行置 0（而不是减 refundCash）：
+       * 旧实现只冲 refundCash、balance>=0 时一条都不冲，正是真库残留 6800 的成因。
        */
-      const stayDepositRow = get<{ d: number | null }>(
-        `SELECT COALESCE(deposit, 0) AS d FROM stays WHERE id = ? AND hotel_id = ?`,
-        [stayId, user.hotelId]
-      );
-      let depositLeft = round2(Math.min(refundCash, Math.max(0, Number(stayDepositRow?.d ?? 0))));
       const depositLines = all<{ id: number; amount: number | null }>(
         `SELECT id, amount FROM folio_items
           WHERE folio_id = ? AND hotel_id = ? AND item_type = 'DEPOSIT' AND COALESCE(amount, 0) > 0.005
           ORDER BY id DESC`,
         [folioId, user.hotelId]
       );
-      let depositOffset = 0;
       for (const line of depositLines) {
-        if (depositLeft <= 0.005) break;
-        const take = round2(Math.min(depositLeft, Number(line.amount ?? 0)));
-        if (take <= 0.005) continue;
         run(
-          `UPDATE folio_items SET amount = COALESCE(amount, 0) - ?
+          `UPDATE folio_items SET amount = 0
             WHERE id = ? AND folio_id = ? AND hotel_id = ? AND item_type = 'DEPOSIT'`,
-          [take, line.id, folioId, user.hotelId]
+          [line.id, folioId, user.hotelId]
         );
-        depositOffset = round2(depositOffset + take);
-        depositLeft = round2(depositLeft - take);
       }
-      /* ③ 减入住单押金（按实际冲销额；明细不足时不能把 stays.deposit 减成负数） */
-      if (depositOffset > 0.005) {
-        run(`UPDATE stays SET deposit = COALESCE(deposit, 0) - ? WHERE id = ? AND hotel_id = ?`, [
-          depositOffset,
-          stayId,
-          user.hotelId,
-        ]);
-      }
-      /* ④ 减已收并重算 */
-      run(`UPDATE folios SET paid_amount = COALESCE(paid_amount,0) - ? WHERE id = ? AND hotel_id = ?`, [
-        refundCash,
-        folioId,
-        user.hotelId,
-      ]);
+
+      /* ④ 入住单押金无条件归零（担保结束；明细不足 / 只有 stays 有值的历史脏数据也一并清掉） */
+      run(`UPDATE stays SET deposit = 0 WHERE id = ? AND hotel_id = ?`, [stayId, user.hotelId]);
+
+      /* ⑤ 重算余额 */
       recalcFolioBalance(user.hotelId, folioId);
       writeLog(
         user.hotelId,
         user.realName,
         "退房退还押金",
-        `入住单 ${stay.stay_no} · 账单 ${folio.folio_no} · 退还 ${fmtMoney(refundCash)}（${depositPay?.method ?? "现金"}）` +
-          ` · 冲销押金明细 ${fmtMoney(depositOffset)}（${depositLines.length} 条押金，逐笔冲销）`
+        `入住单 ${stay.stay_no} · 账单 ${folio.folio_no} · 押金 ${fmtMoney(depositOnFolio)} 全额冲销` +
+          `（退现金 ${fmtMoney(refundCash)} · 抵扣房费 ${fmtMoney(depositOffsetToRoom)} · ` +
+          `${depositLines.length} 条押金明细清零 · stays.deposit ${fmtMoney(stayDeposit)}→0）`
+      );
+    }
+
+    /*
+     * 2c. 冲销押金后再确认一次余额
+     *
+     * 理论上 balance 已归零（应退的钱退掉了、抵扣的部分留在 paid 里）。
+     * 若仍非 0（例如现金多收、超出押金的部分退不出去），写一条日志留痕，
+     * 不再静默把「已结清」的账单挂着一个非 0 余额 —— 缺陷 3 就是这种账。
+     */
+    const settledMoney = recalcFolioBalance(user.hotelId, folioId);
+    if (Math.abs(settledMoney.balance) > 0.01) {
+      writeLog(
+        user.hotelId,
+        user.realName,
+        "退房后余额未归零",
+        `入住单 ${stay.stay_no} · 账单 ${folio.folio_no} · 余额 ${fmtMoney(settledMoney.balance)}` +
+          `（应收 ${fmtMoney(settledMoney.total)} · 已收 ${fmtMoney(settledMoney.paid)}）需人工核对`
       );
     }
 
@@ -1585,19 +1748,27 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
       user.realName,
       "结账退房",
       `入住单 ${stay.stay_no} · 账单 ${folio.folio_no} · 房间 ${room.room_no} · 补收 ${fmtMoney(payAmount)}（${payMethod}）` +
-        (refundDue > 0 ? ` · **应退押金 ${fmtMoney(refundDue)}**` : "")
+        (refundDue > 0 ? ` · **应退押金 ${fmtMoney(refundDue)}**` : "") +
+        (depositOnFolio > 0.005 || stayDeposit > 0.005
+          ? ` · 押金冲销 ${fmtMoney(depositOnFolio)}（退现金 ${fmtMoney(refundCash)} / 抵扣房费 ${fmtMoney(depositOffsetToRoom)}）`
+          : "")
     );
 
     /*
      * 应退押金要明确告诉前台 —— 不能只写日志了事。
      * 客人在前台等着，系统不提示「还有 600 要退」，这钱就留下了。
+     *
+     * 第十轮 P0：押金是「无条件冲销」的，所以成功文案要把三件事讲清楚：
+     *   · 退了多少现金；
+     *   · 有多少押金被房费吃掉了（不退现金，但账已平）；
+     *   · 还有多少「没有押金可冲」的应退余额需要人工处理（例如现金多收）。
      */
-    return {
-      ok:
-        refundCash > 0
-          ? `退房成功，已退还押金 ${fmtMoney(refundCash)}` + (refundDue > refundCash ? `（另有 ${fmtMoney(refundDue - refundCash)} 需人工核对）` : "")
-          : "结账退房成功",
-    };
+    const notes: string[] = [];
+    if (refundCash > 0.005) notes.push(`已退还押金 ${fmtMoney(refundCash)}`);
+    if (depositOffsetToRoom > 0.005) notes.push(`押金 ${fmtMoney(depositOffsetToRoom)} 已抵扣房费`);
+    if (refundDue > refundCash + 0.005) notes.push(`另有 ${fmtMoney(refundDue - refundCash)} 无押金可冲，需人工核对`);
+    if (Math.abs(settledMoney.balance) > 0.01) notes.push(`账单余额 ${fmtMoney(settledMoney.balance)} 需人工核对`);
+    return { ok: notes.length > 0 ? `退房成功，${notes.join("，")}` : "结账退房成功" };
     });
   } catch (e) {
     /*

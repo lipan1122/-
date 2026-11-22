@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { Fragment, useActionState, useMemo, useState } from "react";
+import { Fragment, useActionState, useEffect, useMemo, useState } from "react";
 import {
   addChargeAction,
   splitFolioAction,
@@ -213,16 +213,71 @@ type OpenForm =
 const PAY_METHODS = ["现金", "微信", "支付宝", "银行卡", "会员储值卡", "挂账"];
 
 /**
- * 生成幂等请求号（第 4 轮 P1-11）
+ * 生成一次收银台操作的幂等请求号（第十轮 P1：4 个写动作补 request_id）
  *
- * 服务端 addPaymentAction 用 payments.request_id 的唯一索引做幂等，
- * 但前端从来没传过 —— 收银员双击提交就会重复收款。
- * 这里给每次收款生成一个，重试复用、成功后换新。
+ * ── 为什么必须三级降级 ──
+ * 收银台在酒店前台机上通常通过 `http://内网IP:3100` 访问，那是**非安全上下文**：
+ * `crypto.randomUUID()` 在那里不存在或直接抛错，只用它会让「确认收款 / 退房」按钮静默失效。
+ * 与第七轮 ShopPOS、第九轮 RoomBoard 同一套降级（三级都不抛错）：
+ *   1. crypto.randomUUID()      → https / localhost
+ *   2. crypto.getRandomValues() → http 也能用，手工拼 RFC4122 v4
+ *   3. 时间戳 + Math.random()   → 老浏览器 / 无 crypto 兜底
  */
 function newRequestId(): string {
   const c = globalThis.crypto as Crypto | undefined;
-  if (c && typeof c.randomUUID === "function") return c.randomUUID();
-  return "req-" + Date.now() + "-" + Math.random().toString(36).slice(2, 10);
+  if (c && typeof c.randomUUID === "function") {
+    try {
+      return c.randomUUID();
+    } catch {
+      /* 非安全上下文等场景：继续降级 */
+    }
+  }
+  if (c && typeof c.getRandomValues === "function") {
+    try {
+      const buf = new Uint8Array(16);
+      c.getRandomValues(buf);
+      /* RFC4122 v4：版本位与变体位 */
+      buf[6] = (buf[6] & 0x0f) | 0x40;
+      buf[8] = (buf[8] & 0x3f) | 0x80;
+      const hex = Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    } catch {
+      /* 继续降级 */
+    }
+  }
+  return `req-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}${Math.random()
+    .toString(36)
+    .slice(2, 10)}`;
+}
+
+/**
+ * 收银台「每个写操作各持一枚」的幂等键名
+ *
+ * 为什么不能全组件共用一枚：
+ *   押金提交「服务端已成功、网络断开」时客户端拿不到结果，必须复用同一枚重试；
+ *   此刻若改成去记房费，共用一枚键 —— 服务端按 request_id 查重会命中那笔押金，
+ *   把房费当重复提交丢掉（客人房费白记）。所以每种操作一枚，互不串号。
+ *
+ * 生命周期：
+ *   · 首帧是空串：服务端渲染与 hydration 必须一致，随机值只能在**挂载后**生成；
+ *   · 换账单 / 换客人（scope 变）→ 整组换新（同一枚键跨账单提交会被别单的
+ *     唯一索引命中，被当成重复提交丢掉）；
+ *   · 提交成功 → bump 换新；业务失败 / 网络结果未知 → 不动，重试复用同一枚。
+ */
+const REQUEST_KEYS = ["checkout", "receive", "deposit", "refund", "charge", "roomfee"] as const;
+
+function freshRequestIds(): Record<string, string> {
+  return Object.fromEntries(REQUEST_KEYS.map((k) => [k, newRequestId()]));
+}
+
+function useActionRequestIds(scope: string) {
+  const [ids, setIds] = useState<Record<string, string>>({});
+  useEffect(() => {
+    /* 挂载 / 切换账单：整组换新（服务端渲染时 ids 是空串，保证 hydration 一致） */
+    setIds(freshRequestIds());
+  }, [scope]);
+  const bump = (key: string) => setIds((prev) => ({ ...prev, [key]: newRequestId() }));
+  return { ids, bump };
 }
 const PAGE_SIZE = 10;
 
@@ -511,35 +566,59 @@ export default function CashierPanel({
   const isCredit = Boolean(creditMark);
   const isInhouse = stay.status === "INHOUSE";
 
-  // 加收消费 / 入账
+  /*
+   * 资金操作幂等键（第十轮 P1）
+   *
+   * scope 用「账单 + 入住单」：换客人 / 换账单时整组换新。
+   * 不换的后果是同一枚 request_id 跨账单提交 → 服务端按 (hotel_id, request_id)
+   * 查重会把它当成另一张账单的重复提交丢掉（钱收了但没记账）。
+   */
+  const { ids: requestIds, bump: bumpRequestId } = useActionRequestIds(`${folio.id}:${stay.stayId}`);
+
+  /**
+   * 包装「资金类 server action」：成功才换新幂等键
+   *
+   * 失败 / 网络结果未知时**保留同一枚** —— 服务端按 request_id 幂等重放，
+   * 重试不会变成两笔；成功后换新，下一笔才是新业务。
+   * 隐藏字段缺失时（理论上只在首帧渲染瞬间）兜底生成一枚，保证至少不裸奔。
+   */
+  const withRequestId = (
+    action: (fd: FormData) => Promise<{ error?: string; ok?: string } | undefined>,
+    key: string
+  ): ((_prev: FormState, formData: FormData) => Promise<FormState>) => async (_prev, formData) => {
+    if (!formData.get("request_id")) formData.set("request_id", requestIds[key] || newRequestId());
+    const out = (await action(formData)) ?? null;
+    if (out && out.ok) bumpRequestId(key);
+    return out;
+  };
+
+  // 加收消费 / 入账（与「加收房费」各持一枚键：押金/房费/其他消费不能共用）
   const [chargeState, chargeFormAction, chargePending] = useActionState<FormState, FormData>(
-    async (_prev: FormState, formData: FormData): Promise<FormState> => (await addChargeAction(formData)) ?? null,
+    withRequestId(addChargeAction, "charge"),
+    null
+  );
+  // 加收房费（同一 action，但键与「入账」分开）
+  const [roomFeeState, roomFeeFormAction, roomFeePending] = useActionState<FormState, FormData>(
+    withRequestId(addChargeAction, "roomfee"),
     null
   );
   // 收款
   /*
-   * 收款（第 4 轮 P1-11：客户端从不发 request_id，服务端的幂等完全是空转）
+   * 收款（第 4 轮 P1-11 + 第十轮 P1）
    *
    * addPaymentAction 里写了「同一 request_id 已收过就直接返回成功」，
-   * 但前端从来没传过 request_id，那个分支永远走不到 ——
+   * 但第九轮之前前端从来没传过 request_id，那个分支永远走不到 ——
    * 收银台双击、网络超时重试、点两下提交，都会真的收两笔钱。
-   *
-   * 这里每次提交生成一个 request_id（同一份表单内容复用同一个，
-   * 重试不会重复入账；成功后下次提交再生成新的）。
-   * 生成方式用 crypto.randomUUID，浏览器不支持时退回时间戳+随机数。
+   * 现在 request_id 由组件 state 持有并作为隐藏字段提交：
+   * 双击是同一枚键（服务端幂等重放），成功后换新（下一笔才是新业务）。
    */
   const [payState, payFormAction, payPending] = useActionState<FormState, FormData>(
-    async (_prev: FormState, formData: FormData): Promise<FormState> => {
-      if (!formData.get("request_id")) {
-        formData.set("request_id", newRequestId());
-      }
-      return (await addPaymentAction(formData)) ?? null;
-    },
+    withRequestId(addPaymentAction, "receive"),
     null
   );
   // 预收款
   const [depositState, depositFormAction, depositPending] = useActionState<FormState, FormData>(
-    async (_prev: FormState, formData: FormData): Promise<FormState> => (await addDepositAction(formData)) ?? null,
+    withRequestId(addDepositAction, "deposit"),
     null
   );
   // 部分结账
@@ -565,7 +644,7 @@ export default function CashierPanel({
   );
   // 退款（关联原收款，独立权限）
   const [refundState, refundFormAction, refundPending] = useActionState<FormState, FormData>(
-    async (_prev: FormState, formData: FormData): Promise<FormState> => (await refundPaymentAction(formData)) ?? null,
+    withRequestId(refundPaymentAction, "refund"),
     null
   );
   // 撤销结账
@@ -575,7 +654,7 @@ export default function CashierPanel({
   );
   // 结账退房
   const [checkoutState, checkoutFormAction, checkoutPending] = useActionState<FormState, FormData>(
-    async (_prev: FormState, formData: FormData): Promise<FormState> => (await checkoutAction(formData)) ?? null,
+    withRequestId(checkoutAction, "checkout"),
     null
   );
   // 联房
@@ -1614,6 +1693,8 @@ export default function CashierPanel({
           <input type="hidden" name="stay_id" value={stay.stayId} />
           <input type="hidden" name="room_id" value={stay.roomId} />
           <input type="hidden" name="folio_id" value={folio.id} />
+          {/* 幂等键：双击「确认退房」不会多写一笔补收 / 押金退款（第十轮 P1） */}
+          <input type="hidden" name="request_id" value={requestIds.checkout ?? ""} readOnly />
           {hasDebt ? (
             <>
               <div className="rounded border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-[12px] text-amber-700">
@@ -1706,6 +1787,8 @@ export default function CashierPanel({
           onClose={close}
         >
           <input type="hidden" name="folio_id" value={folio.id} />
+          {/* 幂等键：双击「确认入账」只记一条消费明细（第十轮 P1） */}
+          <input type="hidden" name="request_id" value={requestIds.charge ?? ""} readOnly />
           <div className="grid grid-cols-2 gap-2">
             <Field label="类型">
               <select name="item_type" className="input" defaultValue="OTHER">
@@ -1739,14 +1822,16 @@ export default function CashierPanel({
         <FormPanel
           title="加收房费"
           hint={<>按营业日入账</>}
-          submitLabel={chargePending ? "入账中…" : "确认加收房费"}
-          pending={chargePending}
-          state={chargeState}
-          onSubmit={chargeFormAction}
+          submitLabel={roomFeePending ? "入账中…" : "确认加收房费"}
+          pending={roomFeePending}
+          state={roomFeeState}
+          onSubmit={roomFeeFormAction}
           onClose={close}
         >
           <input type="hidden" name="folio_id" value={folio.id} />
           <input type="hidden" name="item_type" value="ROOM" />
+          {/* 幂等键：房费与「其他消费」各持一枚（共用会把后一笔当重复提交丢掉） */}
+          <input type="hidden" name="request_id" value={requestIds.roomfee ?? ""} readOnly />
           <div className="grid grid-cols-2 gap-2">
             <Field label="房费摘要">
               <input name="description" className="input" defaultValue="加收房费" />
@@ -1776,6 +1861,8 @@ export default function CashierPanel({
         >
           <input type="hidden" name="folio_id" value={folio.id} />
           <input type="hidden" name="stay_id" value={stay.stayId} />
+          {/* 幂等键：双击「确认收款」只收一笔 */}
+          <input type="hidden" name="request_id" value={requestIds.receive ?? ""} readOnly />
           <div className="grid grid-cols-2 gap-2">
             <Field label="支付方式">
               <select name="method" className="input" defaultValue="现金">
@@ -1815,6 +1902,8 @@ export default function CashierPanel({
         >
           <input type="hidden" name="folio_id" value={folio.id} />
           <input type="hidden" name="stay_id" value={stay.stayId} />
+          {/* 幂等键：双击「确认收取预收款」只记一笔押金（明细 + 流水两张表都写） */}
+          <input type="hidden" name="request_id" value={requestIds.deposit ?? ""} readOnly />
           <div className="grid grid-cols-3 gap-2">
             <Field label="预收金额">
               <input name="amount" type="number" min="0" step="0.01" defaultValue="0.00" className="input" />
@@ -1941,6 +2030,8 @@ export default function CashierPanel({
         >
           <div>
             <input type="hidden" name="folio_id" value={folio.id} />
+            {/* 幂等键：双击「退款」只退一笔 */}
+            <input type="hidden" name="request_id" value={requestIds.refund ?? ""} readOnly />
             <label className="label">原收款记录</label>
             <select name="payment_id" required className="input h-7 w-full text-[12px]">
               <option value="">请选择要退的收款</option>
