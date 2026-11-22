@@ -80,15 +80,26 @@ if (roomTypes.length === 0) {
   process.exit(1);
 }
 
-/* 每个房型挑可用房间（避开当前 OOO/LOCK 的） */
+/*
+ * 每个房型挑可用房间
+ *
+ * ⚠️ 必须排除两类，否则会造出「一间房两张在住单」的脏数据：
+ *   1. OOO(维修) / LOCK(锁房) —— 不能卖
+ *   2. **已经有 INHOUSE 在住单的房间** —— 这间房现在有客人
+ *
+ * 上一版只排除了第 1 类，结果 2 张 DEMO 在住单落在了 8402/8503
+ * （那两间本来就有 SI1111 / SI6001 在住），房态页出现「一间房两个客人」。
+ */
 const roomsByType = new Map();
 for (const rt of roomTypes) {
   roomsByType.set(
     rt.id,
     all(
-      `SELECT id, room_no FROM rooms
-        WHERE hotel_id = ? AND room_type_id = ? AND status NOT IN ('OOO','LOCK')
-        ORDER BY id`,
+      `SELECT id, room_no FROM rooms r
+        WHERE r.hotel_id = ? AND r.room_type_id = ?
+          AND r.status NOT IN ('OOO','LOCK')
+          AND NOT EXISTS (SELECT 1 FROM stays s WHERE s.room_id = r.id AND s.status = 'INHOUSE')
+        ORDER BY r.id`,
       [HOTEL, rt.id]
     )
   );
@@ -136,10 +147,40 @@ for (let n = 0; n <= DAYS; n++) {
     continue;
   }
 
-  /* 每天 3 个「已退房」+ 2 个「已确认预订」 */
+  /*
+   * 今天 vs 历史：造的单类型不同
+   *
+   * ⚠️ 这是上一版最严重的 bug：
+   *   上一版不分今天/历史，每天都造「check_in = 当天、check_out = 次日、状态 CHECKED_OUT」。
+   *   于是**今天入住的单当天就退房了**，结果：
+   *     · 远期房态今天这一列没有任何块（已退房不占房）
+   *     · 今日在住 0 张、今日预抵 0 张
+   *     · 用户点进今天：「怎么一条数据都没有」
+   *
+   * 现在的分工：
+   *   · 今天（n=0）：造「在住」（昨天/前天入住，明天/后天离店）+「今日预抵」（CONFIRMED、未排房）
+   *   · 历史（n>=1）：造「已退房」（当天入住、次日离店、账单结清）
+   */
+  const isToday = n === 0;
   const plans = [];
-  for (let i = 0; i < 3; i++) plans.push({ kind: "checked_out", idx: i });
-  for (let i = 0; i < 2; i++) plans.push({ kind: "booking", idx: i });
+  if (isToday) {
+    /* 今天：3 笔在住 + 3 笔今日预抵 */
+    for (let i = 0; i < 3; i++) plans.push({ kind: "inhouse", idx: i });
+    for (let i = 0; i < 3; i++) plans.push({ kind: "arrival", idx: i });
+  } else {
+    /*
+     * 历史：3 笔已退房 + 1 笔未来预订
+     *
+     * ⚠️ 未来预订**必须分散**，不能让每天那笔都堆在「未来 1~7 天」：
+     *   上一版每天造 2 笔、都落在今天+1~+7，跑几遍后未来一周堆了 900+ 条未排房预订，
+     *   而酒店只有 46 间房 → physicalSellable 变成 -45，远期房态整列「可售 0 间」。
+     *
+     * 现在每笔落在「今天 + 3 + n」上（n 是往前第几天），61 天覆盖到未来 60 天，
+     * 每天只有 1 条，永远不会把库存打穿。
+     */
+    for (let i = 0; i < 3; i++) plans.push({ kind: "checked_out", idx: i });
+    plans.push({ kind: "booking", idx: 0 });
+  }
   plan.push({ day, count: plans.length });
 
   if (CHECK) continue;
@@ -147,9 +188,26 @@ for (let n = 0; n <= DAYS; n++) {
   const outDay = shift(day, 1);
 
   for (const p of plans) {
-    const rt = roomTypes[(n + p.idx) % roomTypes.length];
-    const pool = roomsByType.get(rt.id) ?? [];
-    if (pool.length === 0) continue;
+    /*
+     * 挑一个有可用房间的房型
+     *
+     * ⚠️ 上一版是「先按 (n + idx) % 房型数 挑一个房型，如果它没房就 continue」，
+     * 结果某些日期直接少造了单（183 → 129）。正确做法是**从偏好的房型开始往后找**，
+     * 第一个有可用房间的就用。
+     */
+    let rt = null;
+    let pool = [];
+    const prefer = (n + p.idx) % roomTypes.length;
+    for (let k = 0; k < roomTypes.length; k++) {
+      const cand = roomTypes[(prefer + k) % roomTypes.length];
+      const candPool = roomsByType.get(cand.id) ?? [];
+      if (candPool.length > 0) {
+        rt = cand;
+        pool = candPool;
+        break;
+      }
+    }
+    if (!rt) continue; // 全店一个空房都没有（正常营业时不会发生）
     const room = pool[(n * 3 + p.idx) % pool.length];
     const guest = guests[(n * 5 + p.idx) % guests.length];
     const channel = channels.length ? channels[(n + p.idx) % channels.length] : null;
@@ -235,9 +293,103 @@ for (let n = 0; n <= DAYS; n++) {
           ]
         );
         created.bookings++;
+      } else if (p.kind === "inhouse") {
+        /*
+         * ---- 在住（只造「今天」这一批）----
+         *
+         * 三笔全部**今天入住**（这样押金流水的 biz_date 就是今天，报表有数）：
+         *   第 0 笔：今天入住 + 今天预离 → 房态页「今日预离」能看到
+         *   第 1 笔：今天入住 + 明天离店
+         *   第 2 笔：今天入住 + 后天离店
+         */
+        const checkIn = today;
+        const checkOut = p.idx === 0 ? today : shift(today, p.idx);
+        const stayNo = `DEMO-${day}-H${p.idx + 1}-${stamp}`;
+        const deposit = round2(rate * nights);
+
+        run(
+          `INSERT INTO stays (hotel_id, stay_no, room_id, guest_id, guest_name, mobile, check_in_time, expect_check_out, actual_check_out, nights, rate, deposit, status, channel_id, booking_id)
+           VALUES (?,?,?,?,?,?,?,?, NULL, ?,?,?, 'INHOUSE', ?, NULL)`,
+          [
+            HOTEL,
+            stayNo,
+            room.id,
+            guest.id,
+            guest.name,
+            guest.mobile ?? null,
+            `${checkIn} 14:00:00`,
+            checkOut,
+            nights,
+            rate,
+            deposit,
+            channel?.id ?? null,
+          ]
+        );
+        const stayId = one(`SELECT id FROM stays WHERE stay_no = ?`, [stayNo]).id;
+
+        /* 房间置 OC（在住） */
+        run(`UPDATE rooms SET status = 'OC' WHERE id = ? AND hotel_id = ?`, [room.id, HOTEL]);
+
+        /* 押金已收（kind=DEPOSIT），账单还是 OPEN（客人还没退房结账） */
+        const folioNo = `DEMO-${day}-HF${p.idx + 1}-${stamp}`;
+        run(
+          `INSERT INTO folios (hotel_id, folio_no, stay_id, guest_name, room_no, total_amount, paid_amount, balance, status, created_at)
+           VALUES (?,?,?,?,?,?,?,?, 'OPEN', ?)`,
+          [HOTEL, folioNo, stayId, guest.name, room.room_no, roomFee, roomFee, 0, `${checkIn} 14:05:00`]
+        );
+        const folioId = one(`SELECT id FROM folios WHERE folio_no = ?`, [folioNo]).id;
+        run(
+          `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at)
+           VALUES (?,?, 'ROOM', ?, ?, ?, ?, ?, ?)`,
+          [HOTEL, folioId, `房费 ${nights} 晚`, nights, rate, roomFee, checkIn, `${checkIn} 14:05:00`]
+        );
+        run(
+          `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at)
+           VALUES (?,?, 'DEPOSIT', '押金', 1, ?, ?, ?, ?)`,
+          [HOTEL, folioId, deposit, deposit, checkIn, `${checkIn} 14:06:00`]
+        );
+        run(
+          `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, operator, kind)
+           VALUES (?,?,?,?,?,?,?,?,?, '演示数据', 'DEPOSIT')`,
+          [HOTEL, folioId, stayId, `DEMO-HP-${day}-${p.idx + 1}-${stamp}`, "现金", deposit, checkIn, "预收款（押金）", `${checkIn} 14:06:00`]
+        );
+
+        created.stays++;
+        created.folios++;
+        created.items += 2;
+        created.payments++;
+      } else if (p.kind === "arrival") {
+        /*
+         * ---- 今日预抵（只造「今天」这一批）----
+         *
+         * check_in_date = 今天、状态 CONFIRMED、**不排房**（room_id 空）→
+         * 房态页的「今日预抵」和远期房态今天列的「待分房」都能看到。
+         * 也可以直接在前台「办理入住」里选它测试，不用自己新建预订。
+         */
+        run(
+          `INSERT INTO bookings (hotel_id, booking_no, guest_name, mobile, room_type_id, check_in_date, check_out_date, room_count, status, channel_id, created_at, remark)
+           VALUES (?,?,?,?,?,?,?,1,'CONFIRMED',?,?, '演示数据·今日预抵')`,
+          [
+            HOTEL,
+            `DEMO-${day}-AR${p.idx + 1}-${stamp}`,
+            guest.name,
+            guest.mobile ?? null,
+            rt.id,
+            today,
+            shift(today, nights),
+            channel?.id ?? null,
+            `${today} 08:30:00`,
+          ]
+        );
+        created.bookings++;
       } else {
-        /* ---- 已确认预订：覆盖未来入住，让预抵/预离有数 ---- */
-        const arrivals = shift(today, 1 + ((n + p.idx) % 7));
+        /*
+         * ---- 未来预订：每天 1 条，分散到「今天 + 3 + n」----
+         *
+         * n 是「往前第几天」，所以 61 天的数据会覆盖今天+3 到 今天+63，
+         * 每天恰好 1 条未排房预订（1 间），不会把 46 间的库存打穿。
+         */
+        const arrivals = shift(today, 3 + n);
         run(
           `INSERT INTO bookings (hotel_id, booking_no, guest_name, mobile, room_type_id, check_in_date, check_out_date, room_count, status, channel_id, created_at)
            VALUES (?,?,?,?,?,?,?,1,'CONFIRMED',?,?)`,
@@ -265,13 +417,22 @@ for (let n = 0; n <= DAYS; n++) {
 }
 
 /* ─────────── 自洽校验 ─────────── */
+/*
+ * 校验口径必须和生产代码一致：`src/lib/folio.ts` 的 NON_REVENUE_ITEM 把
+ * DEPOSIT（押金）排除在 total 之外 —— 押金是负债，不是消费。
+ *
+ * 第一版校验直接 SUM(folio_items.amount) 没排除 DEPOSIT，
+ * 于是押金单全是「total 328 / items 656」的假报警。
+ */
 const bad = all(
   `SELECT f.id, f.folio_no, f.total_amount, f.paid_amount, f.balance,
-          (SELECT COALESCE(SUM(amount),0) FROM folio_items WHERE folio_id = f.id) AS items_sum,
+          (SELECT COALESCE(SUM(amount),0) FROM folio_items
+            WHERE folio_id = f.id AND item_type <> 'DEPOSIT') AS items_sum,
           (SELECT COALESCE(SUM(amount),0) FROM payments WHERE folio_id = f.id) AS pay_sum
      FROM folios f
     WHERE f.hotel_id = ? AND f.folio_no LIKE 'DEMO-%'
-      AND (ABS(f.total_amount - (SELECT COALESCE(SUM(amount),0) FROM folio_items WHERE folio_id = f.id)) > 0.01
+      AND (ABS(f.total_amount - (SELECT COALESCE(SUM(amount),0) FROM folio_items
+                                   WHERE folio_id = f.id AND item_type <> 'DEPOSIT')) > 0.01
         OR ABS(f.paid_amount - (SELECT COALESCE(SUM(amount),0) FROM payments WHERE folio_id = f.id)) > 0.01)`,
   [HOTEL]
 );
