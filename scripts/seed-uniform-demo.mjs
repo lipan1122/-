@@ -238,7 +238,18 @@ for (let n = 0; n <= DAYS; n++) {
             `${outDay} 12:00:00`,
             nights,
             rate,
-            round2(rate * nights), // 押金按应收收
+            /*
+             * ⚠️ deposit 必须是 0 —— 这张单已经退房了
+             *
+             * 上一版这里写的是 `round2(rate * nights)`（按应收当押金），
+             * 于是 180 张 DEMO 已退房单全部残留押金 ¥114,350。
+             * 这正好又把「退房后 stays.deposit 必须归零」那条不变量破坏了 ——
+             * 而那条不变量是这一轮刚修好的（checkoutAction 无条件冲销 + 迁移脚本清零）。
+             *
+             * 演示数据是直接 INSERT 成 CHECKED_OUT 的，不走 checkoutAction，
+             * 所以必须在这里就把 deposit 设成 0，否则就是「凭空造出一笔已退房却还压着押金的单」。
+             */
+            0,
             channel?.id ?? null,
           ]
         );

@@ -174,7 +174,7 @@ export function seedUniformDemo(hotelId: number, days = 60, force = false): Seed
             const stayNo = `DEMO-${day}-S${p.idx + 1}-${stamp}`;
             run(
               `INSERT INTO stays (hotel_id, stay_no, room_id, guest_id, guest_name, mobile, check_in_time, expect_check_out, actual_check_out, nights, rate, deposit, status, channel_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'CHECKED_OUT', ?)`,
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,0, 'CHECKED_OUT', ?)`,
               [
                 hotelId,
                 stayNo,
@@ -187,7 +187,6 @@ export function seedUniformDemo(hotelId: number, days = 60, force = false): Seed
                 `${outDay} 12:00:00`,
                 nights,
                 rate,
-                round2(rate * nights),
                 channel?.id ?? null,
               ]
             );
