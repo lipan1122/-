@@ -2,6 +2,7 @@ import Link from "next/link";
 import { all, get } from "@/lib/db";
 import { requireUser } from "@/lib/session";
 import { fmtMoney, todayStr } from "@/lib/utils";
+import ConfirmForm from "@/components/ConfirmForm";
 import {
   createCategoryAction,
   ensureGoodsSchema,
@@ -714,64 +715,83 @@ export default async function GoodsPage({ searchParams }: { searchParams: Search
           <div className="grid gap-3 lg:grid-cols-3">
             {MOVE_FORMS.map((f) => {
               const meta = FLOW_META[f.type];
+              /* 退货 / 报废必须填原因（清单 一.3）：弹窗里强制输入，服务端同样校验 */
+              const reasonRequired = f.type !== "PURCHASE";
+              const fields = (
+                <>
+                  <div>
+                    <label className="label">商品 *</label>
+                    <select name="goods_id" required className="input" defaultValue="">
+                      <option value="" disabled>
+                        请选择商品
+                      </option>
+                      {goodsAll.map((g) => (
+                        <option key={g.id} value={g.id} disabled={g.status !== "ON"}>
+                          {`${g.name} · 库存 ${g.stock} ${g.unit}${g.status !== "ON" ? "（已下架）" : ""}`}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="label">数量 *</label>
+                      <input
+                        name="qty"
+                        type="number"
+                        min={1}
+                        max={99999}
+                        step={1}
+                        defaultValue="1"
+                        required
+                        className="input"
+                      />
+                    </div>
+                    <div>
+                      <label className="label">单价</label>
+                      <input
+                        name="unit_price"
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        className="input"
+                        placeholder="默认成本价"
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="label">{reasonRequired ? "原因（弹窗内必填）" : "备注"}</label>
+                    <input
+                      name="note"
+                      maxLength={60}
+                      className="input"
+                      placeholder={reasonRequired ? "如 破损 / 临期原因" : "如 供应商送货单号"}
+                    />
+                  </div>
+                  <button className={`${f.btn} w-full`}>{f.submit}</button>
+                  <p className="text-[11px] leading-4 text-gray-400">{f.desc}</p>
+                </>
+              );
               return (
                 <div key={f.type} className="card">
                   <div className="flex items-center justify-between border-b border-gray-100 px-4 py-2.5">
                     <span className="text-[13px] font-semibold text-gray-800">{f.title}</span>
                     <span className={`rounded border px-1.5 py-0.5 text-[11px] ${meta.cls}`}>{meta.label}</span>
                   </div>
-                  <form action={f.action} className="space-y-2.5 px-4 py-3">
-                    <div>
-                      <label className="label">商品 *</label>
-                      <select name="goods_id" required className="input" defaultValue="">
-                        <option value="" disabled>
-                          请选择商品
-                        </option>
-                        {goodsAll.map((g) => (
-                          <option key={g.id} value={g.id} disabled={g.status !== "ON"}>
-                            {`${g.name} · 库存 ${g.stock} ${g.unit}${g.status !== "ON" ? "（已下架）" : ""}`}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="grid grid-cols-2 gap-2">
-                      <div>
-                        <label className="label">数量 *</label>
-                        <input
-                          name="qty"
-                          type="number"
-                          min={1}
-                          max={99999}
-                          step={1}
-                          defaultValue="1"
-                          required
-                          className="input"
-                        />
-                      </div>
-                      <div>
-                        <label className="label">单价</label>
-                        <input
-                          name="unit_price"
-                          type="number"
-                          min="0"
-                          step="0.01"
-                          className="input"
-                          placeholder="默认成本价"
-                        />
-                      </div>
-                    </div>
-                    <div>
-                      <label className="label">备注</label>
-                      <input
-                        name="note"
-                        maxLength={60}
-                        className="input"
-                        placeholder={f.type === "PURCHASE" ? "如 供应商送货单号" : "如 破损 / 临期原因"}
-                      />
-                    </div>
-                    <button className={`${f.btn} w-full`}>{f.submit}</button>
-                    <p className="text-[11px] leading-4 text-gray-400">{f.desc}</p>
-                  </form>
+                  {reasonRequired ? (
+                    <ConfirmForm
+                      action={f.action}
+                      message={`确认${f.title}？`}
+                      detail={`${f.desc}。请填写${f.title}原因，原因会写入库存流水与操作日志，事后可追溯。`}
+                      requireReason={`${f.title}原因`}
+                      confirmLabel={f.submit}
+                    >
+                      <div className="space-y-2.5 px-4 py-3">{fields}</div>
+                    </ConfirmForm>
+                  ) : (
+                    <form action={f.action} className="space-y-2.5 px-4 py-3">
+                      {fields}
+                    </form>
+                  )}
                 </div>
               );
             })}

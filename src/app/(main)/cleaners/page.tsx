@@ -1,5 +1,5 @@
 import { all, get, getDb, run, tx } from "@/lib/db";
-import { requireUser } from "@/lib/session";
+import { hasPermission, requireUser } from "@/lib/session";
 import { addDays, nowIso, todayStr } from "@/lib/utils";
 import { addCleanerAction, setCleanerStatusAction } from "./actions";
 
@@ -160,6 +160,12 @@ function ensureCleaners(hotelId: number): void {
 export default async function CleanersPage({ searchParams }: { searchParams: SearchParams }) {
   const user = await requireUser();
   const hotelId = user.hotelId;
+  /*
+   * 打扫员档案 = 人事配置（整改清单 第六轮 一.9）：写操作要 settings.manage。
+   * housekeeper 岗位能进本页看自己的业绩，但**不能改档案** ——
+   * 服务端 addCleanerAction / setCleanerStatusAction 会直接 FORBIDDEN，页面也按同一权限隐藏入口。
+   */
+  const canManage = hasPermission(user.role, "settings.manage", hotelId);
   const today = todayStr();
   const sp = await searchParams;
 
@@ -279,6 +285,7 @@ export default async function CleanersPage({ searchParams }: { searchParams: Sea
       <div className="card overflow-hidden">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-gray-100 px-4 py-2.5">
           <span className="text-[13px] font-semibold text-gray-800">打扫员列表 · {cleaners.length} 名</span>
+          {canManage ? (
           <form action={addCleanerAction} className="flex flex-wrap items-center gap-2">
             <input
               type="text"
@@ -293,6 +300,11 @@ export default async function CleanersPage({ searchParams }: { searchParams: Sea
               新增打扫员
             </button>
           </form>
+          ) : (
+            <span className="rounded border border-gray-200 bg-gray-50 px-2 py-1 text-[11px] text-gray-500">
+              只读：改档案需要「系统设置」权限
+            </span>
+          )}
         </div>
         <div className="overflow-x-auto">
           <table className="w-full">
@@ -342,6 +354,7 @@ export default async function CleanersPage({ searchParams }: { searchParams: Sea
                     <td className="td text-right tabular-nums text-gray-800">{perf ? perf.month : 0} 间</td>
                     <td className="td">
                       <div className="flex items-center justify-end gap-1.5">
+                        {canManage ? (
                         <form action={setCleanerStatusAction}>
                           <input type="hidden" name="id" value={c.id} />
                           <input type="hidden" name="status" value={active ? "INACTIVE" : "ACTIVE"} />
@@ -354,6 +367,9 @@ export default async function CleanersPage({ searchParams }: { searchParams: Sea
                             {active ? "停用" : "启用"}
                           </button>
                         </form>
+                        ) : (
+                          <span className="text-[11px] text-gray-300">无权限</span>
+                        )}
                       </div>
                     </td>
                   </tr>

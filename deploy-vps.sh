@@ -135,6 +135,14 @@ node scripts/migrate-all.mjs
 log "补全表结构（缺表补表、缺列补列）"
 node scripts/sync-schema.mjs
 
+# 去掉单号列的全局 UNIQUE（多店部署必需）
+#
+# bookings/stays/folios 的单号列原本是列级 UNIQUE（全局唯一），
+# 但设计意图是「酒店内唯一」—— 多店部署时 hotel 999 用 hotel 1 的单号会冲突。
+# SQLite 不支持 DROP CONSTRAINT，必须重建表（自动 VACUUM INTO 备份 + 幂等）。
+log "检查单号唯一约束"
+node scripts/rebuild-unique-constraints.mjs
+
 # 可选：导入演示数据（默认不导，显式设 PMS_LOAD_DEMO=1 才导）
 #
 # 演示数据包含 46 间房 / 588 条预订 / 200 张账单 / 45 个客人 / 会员储值 / AR 应收，

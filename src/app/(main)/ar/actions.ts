@@ -130,7 +130,13 @@ function setBalance(hotelId: number, accountId: number, balance: number): void {
   run(`UPDATE ar_accounts SET balance = ? WHERE id = ? AND hotel_id = ?`, [balance, accountId, hotelId]);
 }
 
-/** 写一条流水并回填余额快照；amount 有符号（正=增加应收，负=减少应收） */
+/**
+ * 写一条流水并回填余额快照；amount 有符号（正=增加应收，负=减少应收）
+ *
+ * requestId（第六轮整改 一.5）：幂等键。同一酒店内 (hotel_id, request_id) 唯一，
+ * 重复提交（前台双击 / 网络超时后重试）第二次会撞唯一索引，整个事务回滚，
+ * 余额与流水都不会再变一次。
+ */
 function recordTx(opts: {
   hotelId: number;
   accountId: number;
@@ -140,15 +146,74 @@ function recordTx(opts: {
   note: string;
   operator: string;
   bizDate: string;
+  requestId?: string;
 }): number {
-  const { hotelId, accountId, type, amount, balanceAfter, note, operator, bizDate } = opts;
+  const { hotelId, accountId, type, amount, balanceAfter, note, operator, bizDate, requestId } = opts;
   const res = run(
     `INSERT INTO ar_transactions
-       (hotel_id, ar_account_id, type, amount, balance_after, note, operator, biz_date, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [hotelId, accountId, type, round2(amount), round2(balanceAfter), note || null, operator, bizDate, isoAt(bizDate)]
+       (hotel_id, ar_account_id, type, amount, balance_after, note, operator, biz_date, request_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      hotelId,
+      accountId,
+      type,
+      round2(amount),
+      round2(balanceAfter),
+      note || null,
+      operator,
+      bizDate,
+      requestId || null,
+      isoAt(bizDate),
+    ]
   );
   return res.lastInsertRowid;
+}
+
+/* ------------------------------------------------------- 幂等键 / 操作日志 */
+
+/**
+ * 幂等键归一：页面每次渲染生成一个 request_id 放进隐藏域，
+ * 双击 / 超时重试带的是同一个值 → 服务端只能记一次账。
+ * 只保留安全字符并限长，避免脏输入被写进唯一索引。
+ */
+function readRequestId(value: FormDataEntryValue | null): string {
+  return str(value)
+    .replace(/[^A-Za-z0-9._:#-]/g, "")
+    .slice(0, 56);
+}
+
+/** 该 request_id 是否已经记过账（命中 = 重复提交，直接返回提示，不再动余额） */
+function replayOf(hotelId: number, requestId: string): { id: number } | undefined {
+  if (!requestId) return undefined;
+  return get<{ id: number }>(
+    `SELECT id FROM ar_transactions WHERE hotel_id = ? AND request_id = ? LIMIT 1`,
+    [hotelId, requestId]
+  );
+}
+
+/** 异常文案（判唯一索引冲突用） */
+function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/** op_logs 表可能还没建的旧库：存在才写，避免日志表缺失把整笔账务拖失败 */
+let opLogsChecked = false;
+let opLogsPresent = false;
+function logArOp(hotelId: number, operator: string, action: string, detail: string): void {
+  if (!opLogsChecked) {
+    opLogsPresent =
+      (get<{ n: number }>(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'op_logs'`)?.n ?? 0) >
+      0;
+    opLogsChecked = true;
+  }
+  if (!opLogsPresent) return;
+  run(`INSERT INTO op_logs (hotel_id, operator, action, detail, created_at) VALUES (?,?,?,?,?)`, [
+    hotelId,
+    operator,
+    action,
+    detail,
+    nowIso(),
+  ]);
 }
 
 /* ------------------------------------------------------------------ 种子数据 */
@@ -383,9 +448,39 @@ export async function ensureArSchema(hotelId: number): Promise<void> {
         note TEXT,
         operator TEXT,
         biz_date TEXT NOT NULL,
+        request_id TEXT,
         created_at TEXT NOT NULL
       )
     `);
+    /*
+     * 幂等键（第六轮整改 一.5「余额不能因重复提交重复变化」）
+     *
+     * 老库的 ar_transactions 没有 request_id，这里补列（PRAGMA 查一次，幂等）；
+     * 唯一索引 (hotel_id, request_id) 是「重复提交只记一次账」的硬保证：
+     * 第二次插入直接 UNIQUE 失败 → 整个 tx 回滚 → 余额不会被加/减第二次。
+     * 用 partial index 是因为历史流水 request_id 全为 NULL（NULL 不参与唯一约束，
+     * 但显式 WHERE 让索引更小、意图更直白）。
+     */
+    const arTxCols = db
+      .prepare(`PRAGMA table_info(ar_transactions)`)
+      .all()
+      .map((c) => String((c as { name?: unknown }).name ?? ""));
+    if (!arTxCols.includes("request_id")) {
+      try {
+        db.exec(`ALTER TABLE ar_transactions ADD COLUMN request_id TEXT`);
+      } catch (e) {
+        /*
+         * 多实例并发首访时两个进程可能都读到「没有该列」并同时 ALTER：
+         * SQLite 串行执行，后到的那个会拿到 duplicate column name。
+         * 这不是故障（列已经被前一个进程加好了），吞掉即可，不能让 /ar 变成 500。
+         */
+        if (!/duplicate column name/i.test(errText(e))) throw e;
+      }
+    }
+    db.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_ar_tx_request
+         ON ar_transactions (hotel_id, request_id) WHERE request_id IS NOT NULL`
+    );
     db.exec(`
       CREATE TABLE IF NOT EXISTS ar_write_offs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -412,7 +507,13 @@ export async function ensureArSchema(hotelId: number): Promise<void> {
 
 /** 入账（POST）：增加应收余额，写一条正数流水 */
 export async function postArAction(formData: FormData): Promise<void> {
-  const user = await requireUser();
+  /*
+   * 权限（第六轮整改清单一.5）：
+   *   入账 = 把账单转成单位挂账（增加应收），语义上就是「挂公司账」，
+   *   复用已有的 cashier.charge_company（admin / cashier），不新造 ar.manage。
+   *   原来只 requireUser()：前台 / 客房都能给任意账户记应收。
+   */
+  const user = await requirePermission("cashier.charge_company");
   const hotelId = user.hotelId;
   await ensureArSchema(hotelId);
 
@@ -424,10 +525,15 @@ export async function postArAction(formData: FormData): Promise<void> {
 
   const note = str(formData.get("note"));
   const bizDate = parseBizDate(formData.get("biz_date"));
+  const requestId = readRequestId(formData.get("request_id"));
 
   let message = "";
   try {
     message = tx(() => {
+      // 幂等：同一 request_id 已经记过账 → 直接返回提示，不再加一次余额
+      const replay = replayOf(hotelId, requestId);
+      if (replay) return `该请求已处理过（流水 #${replay.id}），本次重复提交未再次增加应收`;
+
       const account = mustAccount(hotelId, accountId);
       if (account.status !== "ON") fail(`账户「${account.name}」已停用，不能办理入账`);
 
@@ -441,12 +547,24 @@ export async function postArAction(formData: FormData): Promise<void> {
         note: note || `挂账入账（${bizDate}）`,
         operator: user.realName,
         bizDate,
+        requestId,
       });
       setBalance(hotelId, accountId, after);
+      // 余额、流水、操作日志同一个事务：任何一步失败整体回滚
+      logArOp(
+        hotelId,
+        user.realName,
+        "AR 入账",
+        `${account.code} ${account.name} 入账 ${fmtMoney(amount)}，应收余额 ${fmtMoney(after)}（营业日 ${bizDate}）`
+      );
       return `已为「${account.name}」入账 ${fmtMoney(amount)}，当前应收余额 ${fmtMoney(after)}`;
     });
   } catch (e) {
     if (e instanceof ArError) back(accountId, "err", e.message);
+    // 并发重复提交：唯一索引拦下 → 事务已回滚，余额没有被改第二次
+    if (requestId && /UNIQUE/i.test(errText(e))) {
+      back(accountId, "ok", "同一请求的重复提交已被忽略（唯一索引拦下，应收余额未再次变动）");
+    }
     throw e;
   }
 
@@ -456,7 +574,10 @@ export async function postArAction(formData: FormData): Promise<void> {
 
 /** 付款（PAY）：客户还款，减少应收余额；不允许超过当前余额 */
 export async function payArAction(formData: FormData): Promise<void> {
-  const user = await requireUser();
+  /*
+   * 权限（清单第 82 行）：客户还款 = 收款，复用已有的 cashier.receive（admin / frontdesk / cashier）。
+   */
+  const user = await requirePermission("cashier.receive");
   const hotelId = user.hotelId;
   await ensureArSchema(hotelId);
 
@@ -468,14 +589,19 @@ export async function payArAction(formData: FormData): Promise<void> {
 
   const note = str(formData.get("note"));
   const bizDate = parseBizDate(formData.get("biz_date"));
+  const requestId = readRequestId(formData.get("request_id"));
 
   let message = "";
   try {
     message = tx(() => {
+      const replay = replayOf(hotelId, requestId);
+      if (replay) return `该请求已处理过（流水 #${replay.id}），本次重复提交未再次扣减应收`;
+
       const account = mustAccount(hotelId, accountId);
       if (account.status !== "ON") fail(`账户「${account.name}」已停用，不能办理付款`);
 
       const balance = round2(Number(account.balance));
+      // 清单第 87 行：不允许超过当前应收余额还款（否则余额被扣成负数 = 少收钱）
       if (amount > balance + 0.001) {
         fail(`付款金额不能超过应收余额，当前余额 ${fmtMoney(balance)}，本次付款 ${fmtMoney(amount)}`);
       }
@@ -490,12 +616,24 @@ export async function payArAction(formData: FormData): Promise<void> {
         note: note || `客户还款（${bizDate}）`,
         operator: user.realName,
         bizDate,
+        requestId,
       });
       setBalance(hotelId, accountId, after);
+      logArOp(
+        hotelId,
+        user.realName,
+        "AR 收款",
+        `${account.code} ${account.name} 还款 ${fmtMoney(amount)}，应收余额 ${fmtMoney(balance)} → ${fmtMoney(
+          after
+        )}（营业日 ${bizDate}）`
+      );
       return `「${account.name}」已付款 ${fmtMoney(amount)}，剩余应收 ${fmtMoney(after)}`;
     });
   } catch (e) {
     if (e instanceof ArError) back(accountId, "err", e.message);
+    if (requestId && /UNIQUE/i.test(errText(e))) {
+      back(accountId, "ok", "同一请求的重复提交已被忽略（唯一索引拦下，应收余额未再次变动）");
+    }
     throw e;
   }
 
@@ -505,7 +643,11 @@ export async function payArAction(formData: FormData): Promise<void> {
 
 /** 转账（TRANSFER）：把应收从本账户调账到目标账户，两账户各写一条流水 */
 export async function transferArAction(formData: FormData): Promise<void> {
-  const user = await requireUser();
+  /*
+   * 权限（清单第 83 行）：转账调账 = 账单 / 账务在账户之间转移，语义最接近已有的
+   * cashier.transfer（admin / cashier）；清单写的 ar.manage 不存在，不另造窄点。
+   */
+  const user = await requirePermission("cashier.transfer");
   const hotelId = user.hotelId;
   await ensureArSchema(hotelId);
 
@@ -521,10 +663,17 @@ export async function transferArAction(formData: FormData): Promise<void> {
 
   const note = str(formData.get("note"));
   const bizDate = parseBizDate(formData.get("biz_date"));
+  const requestId = readRequestId(formData.get("request_id"));
 
   let message = "";
   try {
     message = tx(() => {
+      // 一次调账写两条流水，幂等键各带 #OUT / #IN 后缀（唯一索引仍能逐条拦住重复）
+      const outKey = requestId ? `${requestId}#OUT` : "";
+      const inKey = requestId ? `${requestId}#IN` : "";
+      const replay = replayOf(hotelId, outKey);
+      if (replay) return `该请求已处理过（流水 #${replay.id}），本次重复提交未再次调账`;
+
       const from = mustAccount(hotelId, fromId);
       const to = mustAccount(hotelId, toId2);
       if (from.status !== "ON") fail(`转出账户「${from.name}」已停用，不能调账`);
@@ -548,6 +697,7 @@ export async function transferArAction(formData: FormData): Promise<void> {
         note: `调账转出至 ${to.code} ${to.name}${tail}`,
         operator: user.realName,
         bizDate,
+        requestId: outKey || undefined,
       });
       recordTx({
         hotelId,
@@ -558,14 +708,27 @@ export async function transferArAction(formData: FormData): Promise<void> {
         note: `调账转入自 ${from.code} ${from.name}${tail}`,
         operator: user.realName,
         bizDate,
+        requestId: inKey || undefined,
       });
 
       setBalance(hotelId, from.id, fromAfter);
       setBalance(hotelId, to.id, toAfter);
+      logArOp(
+        hotelId,
+        user.realName,
+        "AR 转账",
+        `${from.code} ${from.name} → ${to.code} ${to.name} 调账 ${fmtMoney(amount)}；` +
+          `转出余额 ${fmtMoney(fromBalance)} → ${fmtMoney(fromAfter)}，转入余额 ${fmtMoney(to.balance)} → ${fmtMoney(
+            toAfter
+          )}（营业日 ${bizDate}）`
+      );
       return `已将 ${fmtMoney(amount)} 从「${from.name}」调账至「${to.name}」`;
     });
   } catch (e) {
     if (e instanceof ArError) back(fromId, "err", e.message);
+    if (requestId && /UNIQUE/i.test(errText(e))) {
+      back(fromId, "ok", "同一请求的重复提交已被忽略（唯一索引拦下，账户余额未再次变动）");
+    }
     throw e;
   }
 
@@ -591,10 +754,14 @@ export async function writeOffArAction(formData: FormData): Promise<void> {
 
   const note = str(formData.get("note"));
   const bizDate = parseBizDate(formData.get("biz_date"));
+  const requestId = readRequestId(formData.get("request_id"));
 
   let message = "";
   try {
     message = tx(() => {
+      const replay = replayOf(hotelId, requestId);
+      if (replay) return `该请求已处理过（流水 #${replay.id}），本次重复提交未再次核销`;
+
       const account = mustAccount(hotelId, accountId);
       if (account.status !== "ON") fail(`账户「${account.name}」已停用，不能办理核销`);
 
@@ -634,6 +801,7 @@ export async function writeOffArAction(formData: FormData): Promise<void> {
         note: note || `核销 ${post.biz_date} 入账 ${fmtMoney(Number(post.amount))}`,
         operator: user.realName,
         bizDate,
+        requestId,
       });
       run(
         `INSERT INTO ar_write_offs
@@ -651,10 +819,20 @@ export async function writeOffArAction(formData: FormData): Promise<void> {
         ]
       );
       setBalance(hotelId, accountId, after);
+      logArOp(
+        hotelId,
+        user.realName,
+        "AR 坏账核销",
+        `${account.code} ${account.name} 核销 ${fmtMoney(amount)}（入账流水 #${post.id} ${post.biz_date}），` +
+          `应收余额 ${fmtMoney(balance)} → ${fmtMoney(after)}`
+      );
       return `已核销「${account.name}」${fmtMoney(amount)}，剩余应收 ${fmtMoney(after)}`;
     });
   } catch (e) {
     if (e instanceof ArError) back(accountId, "err", e.message);
+    if (requestId && /UNIQUE/i.test(errText(e))) {
+      back(accountId, "ok", "同一请求的重复提交已被忽略（唯一索引拦下，应收余额未再次变动）");
+    }
     throw e;
   }
 

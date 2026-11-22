@@ -1,9 +1,29 @@
 import Link from "next/link";
+import ConfirmForm from "@/components/ConfirmForm";
 import { all, get } from "@/lib/db";
-import { requireUser } from "@/lib/session";
+import { hasPermission, requireUser } from "@/lib/session";
 import { addDays, todayStr } from "@/lib/utils";
+import {
+  cancelAllOverdueAction,
+  cancelOverdueAction,
+  confirmAllArrivalsAction,
+  confirmArrivalAction,
+  convertOverdueAction,
+  overdueImpactAction,
+} from "./actions";
 
 export const dynamic = "force-dynamic";
+
+/** 预抵 / 逾期列表行（只查列表要显示的列） */
+type TodoBookingRow = {
+  id: number;
+  booking_no: string | null;
+  guest_name: string | null;
+  room_count: number | null;
+  check_in_date: string;
+  check_out_date: string;
+  nights: number | null;
+};
 
 const TODO_TABS = [
   { key: "front", label: "前台任务" },
@@ -120,6 +140,46 @@ export default async function WorkbenchPage() {
     [hotelId, today]
   ) ?? { consume: 0, receipt: 0 };
 
+  /* ---------------- 预抵 / 逾期处理（第六轮整改 一.4） ----------------
+   *
+   * 权限（服务端才作数，这里只决定按钮显不显示）：
+   *   booking.modify → 确认预抵、逾期转今日预订
+   *   booking.cancel → 取消逾期（单条 / 批量）
+   * 客房、收银也能进 /today-todo（ROLE_MODULES 放行），但他们没有这两个点，
+   * 所以列表与按钮一并隐藏，只显示「当前岗位无预订处理权限」。
+   *
+   * 逾期口径与 actions.ts 的取消 / 转预订条件逐字一致（PENDING/CONFIRMED/NOSHOW 且入住日 < 今天），
+   * 否则会出现「页面说有 3 单、点批量取消实际取消了 5 单」。
+   */
+  const canModifyBooking = hasPermission(user.role, "booking.modify", hotelId);
+  const canCancelBooking = hasPermission(user.role, "booking.cancel", hotelId);
+  const canHandleBooking = canModifyBooking || canCancelBooking;
+
+  const preArrivals: TodoBookingRow[] = canHandleBooking
+    ? all<TodoBookingRow>(
+        `SELECT id, booking_no, guest_name, room_count, check_in_date, check_out_date, nights
+           FROM bookings
+          WHERE hotel_id = ? AND check_in_date = ? AND status = 'PENDING'
+          ORDER BY id DESC
+          LIMIT 10`,
+        [hotelId, today]
+      )
+    : [];
+
+  const overdueRows: TodoBookingRow[] = canHandleBooking
+    ? all<TodoBookingRow>(
+        `SELECT id, booking_no, guest_name, room_count, check_in_date, check_out_date, nights
+           FROM bookings
+          WHERE hotel_id = ? AND check_in_date < ? AND status IN ('PENDING','CONFIRMED','NOSHOW')
+          ORDER BY check_in_date ASC, id ASC
+          LIMIT 10`,
+        [hotelId, today]
+      )
+    : [];
+
+  /* 批量取消确认框要显示「订单数量 / 日期范围 / 库存影响」，统一由 action 侧的同一口径算 */
+  const overdue = canHandleBooking ? await overdueImpactAction() : null;
+
   const Card = ({ title, extra, children }: { title: string; extra?: React.ReactNode; children: React.ReactNode }) => (
     <div className="rounded-[3px] border border-[#e8e8e8] bg-white">
       <div className="flex items-center justify-between border-b border-[#f0f0f0] px-3 py-2">
@@ -216,6 +276,218 @@ export default async function WorkbenchPage() {
             ))}
           </div>
         </Card>
+      </div>
+
+      {/* 预抵与逾期处理（第六轮整改 一.4：补权限 + 批量取消二次确认 + 库存影响） */}
+      <div className="grid gap-3 xl:grid-cols-2">
+        {/* 今日预抵 */}
+        <div className="rounded-[3px] border border-[#e8e8e8] bg-white">
+          <div className="flex items-center justify-between border-b border-[#f0f0f0] px-3 py-2">
+            <span className="text-[13px] font-medium text-[#333]">今日预抵（待确认）</span>
+            <span className="text-[11px] text-[#999]">
+              {canHandleBooking ? `共 ${preArrivals.length} 条待确认（最多显示 10 条）` : "当前岗位无预订处理权限"}
+            </span>
+          </div>
+          {canHandleBooking ? (
+            <>
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead>
+                    <tr className="bg-[#f2faf3]">
+                      <th className="border-b border-[#e8e8e8] px-2 py-2 text-left text-[12px] font-medium text-[#555]">单号</th>
+                      <th className="border-b border-[#e8e8e8] px-2 py-2 text-left text-[12px] font-medium text-[#555]">客人</th>
+                      <th className="border-b border-[#e8e8e8] px-2 py-2 text-left text-[12px] font-medium text-[#555]">入住 / 离店</th>
+                      <th className="w-24 border-b border-[#e8e8e8] px-2 py-2 text-right text-[12px] font-medium text-[#555]">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {preArrivals.length === 0 && (
+                      <tr>
+                        <td colSpan={4} className="px-2 py-6 text-center text-[12px] text-[#999]">
+                          今天没有待确认的预抵订单
+                        </td>
+                      </tr>
+                    )}
+                    {preArrivals.map((b) => (
+                      <tr key={b.id} className="hover:bg-[#f7f9f8]">
+                        <td className="border-b border-[#f6f6f6] px-2 py-1.5 text-[12px] tabular-nums text-[#555]">
+                          {b.booking_no ?? `#${b.id}`}
+                        </td>
+                        <td className="border-b border-[#f6f6f6] px-2 py-1.5 text-[12px] text-[#333]">
+                          {b.guest_name || "—"}
+                          {Number(b.room_count ?? 1) > 1 && (
+                            <span className="ml-1 text-[11px] text-[#999]">{b.room_count} 间</span>
+                          )}
+                        </td>
+                        <td className="border-b border-[#f6f6f6] px-2 py-1.5 text-[12px] tabular-nums text-[#555]">
+                          {b.check_in_date} → {b.check_out_date}
+                        </td>
+                        <td className="border-b border-[#f6f6f6] px-2 py-1.5 text-right">
+                          {canModifyBooking ? (
+                            <form action={confirmArrivalAction} className="inline">
+                              <input type="hidden" name="id" value={b.id} />
+                              <button className="rounded-[2px] border border-[#dcdcdc] px-2 py-0.5 text-[11.5px] text-[#555] hover:border-[#32c141] hover:text-[#2a9d5c]">
+                                确认预抵
+                              </button>
+                            </form>
+                          ) : (
+                            <span className="text-[11px] text-[#ccc]">—</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {canModifyBooking && (
+                <form
+                  action={confirmAllArrivalsAction}
+                  className="flex items-center justify-between gap-2 border-t border-[#f0f0f0] px-3 py-2"
+                >
+                  <span className="text-[11px] text-[#999]">
+                    批量确认会把今天全部「待排房」预抵置为已确认（只改状态，不排房）
+                  </span>
+                  <button className="rounded-[2px] bg-[#32c141] px-2.5 py-1 text-[11.5px] text-white hover:bg-[#2bb038]">
+                    批量确认预抵
+                  </button>
+                </form>
+              )}
+            </>
+          ) : (
+            <div className="px-3 py-6 text-center text-[12px] text-[#999]">
+              确认预抵需要「修改预订」权限（管理员 / 前台）
+            </div>
+          )}
+        </div>
+
+        {/* 逾期未到订单 */}
+        <div className="rounded-[3px] border border-[#e8e8e8] bg-white">
+          <div className="flex items-center justify-between border-b border-[#f0f0f0] px-3 py-2">
+            <span className="text-[13px] font-medium text-[#333]">逾期未到订单</span>
+            <span className="text-[11px] text-[#999]">
+              {overdue && overdue.orders > 0
+                ? `共 ${overdue.orders} 单 · ${overdue.minIn} ~ ${overdue.maxOut}`
+                : "无逾期订单"}
+            </span>
+          </div>
+
+          {!canHandleBooking ? (
+            <div className="px-3 py-6 text-center text-[12px] text-[#999]">
+              逾期处理需要「取消预订」/「修改预订」权限（管理员 / 前台）
+            </div>
+          ) : !overdue || overdue.orders === 0 ? (
+            <div className="px-3 py-6 text-center text-[12px] text-[#999]">没有应到未到 / 逾期未到的订单</div>
+          ) : (
+            <>
+              {/* 库存影响：与批量取消确认框、操作日志同一口径 */}
+              <div className="flex flex-wrap gap-x-3 gap-y-1 border-b border-[#f8f8f8] px-3 py-2 text-[11.5px] text-[#666]">
+                <span>
+                  合计 <b className="text-[#222]">{overdue.nights}</b> 间夜
+                </span>
+                <span>
+                  占房明细 <b className="text-[#222]">{overdue.rooms}</b> 间（已排房号 {overdue.assigned} 间）
+                </span>
+                <span>
+                  覆盖今日 <b className="text-[#e53935]">{overdue.occupyToday}</b> 间 → 取消后今日可售 +
+                  {overdue.occupyToday}
+                </span>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead>
+                    <tr className="bg-[#f2faf3]">
+                      <th className="border-b border-[#e8e8e8] px-2 py-2 text-left text-[12px] font-medium text-[#555]">单号</th>
+                      <th className="border-b border-[#e8e8e8] px-2 py-2 text-left text-[12px] font-medium text-[#555]">客人</th>
+                      <th className="border-b border-[#e8e8e8] px-2 py-2 text-left text-[12px] font-medium text-[#555]">原入住 / 离店</th>
+                      <th className="w-40 border-b border-[#e8e8e8] px-2 py-2 text-right text-[12px] font-medium text-[#555]">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {overdueRows.length === 0 && (
+                      <tr>
+                        <td colSpan={4} className="px-2 py-6 text-center text-[12px] text-[#999]">
+                          没有逾期订单
+                        </td>
+                      </tr>
+                    )}
+                    {overdueRows.map((b) => (
+                      <tr key={b.id} className="hover:bg-[#f7f9f8]">
+                        <td className="border-b border-[#f6f6f6] px-2 py-1.5 text-[12px] tabular-nums text-[#555]">
+                          {b.booking_no ?? `#${b.id}`}
+                        </td>
+                        <td className="border-b border-[#f6f6f6] px-2 py-1.5 text-[12px] text-[#333]">
+                          {b.guest_name || "—"}
+                          {Number(b.room_count ?? 1) > 1 && (
+                            <span className="ml-1 text-[11px] text-[#999]">{b.room_count} 间</span>
+                          )}
+                        </td>
+                        <td className="border-b border-[#f6f6f6] px-2 py-1.5 text-[12px] tabular-nums text-[#555]">
+                          {b.check_in_date} → {b.check_out_date}
+                          <span className="ml-1 text-[11px] text-[#999]">{b.nights ?? 1} 晚</span>
+                        </td>
+                        <td className="border-b border-[#f6f6f6] px-2 py-1.5 text-right">
+                          <div className="flex items-center justify-end gap-1">
+                            {canCancelBooking && (
+                              <ConfirmForm
+                                action={cancelOverdueAction}
+                                message={`确认取消逾期订单 ${b.booking_no ?? `#${b.id}`}？`}
+                                detail={`${b.check_in_date} → ${b.check_out_date}（${b.nights ?? 1} 晚）。取消后这间房的占用会立即释放，订单状态变为「已取消」，可在预订列表查到但不能恢复。`}
+                                confirmLabel="确认取消"
+                                requireReason="取消原因"
+                              >
+                                <input type="hidden" name="id" value={b.id} />
+                                <button className="rounded-[2px] border border-[#f0c9c6] px-2 py-0.5 text-[11.5px] text-[#d9534f] hover:bg-[#fdf3f3]">
+                                  取消
+                                </button>
+                              </ConfirmForm>
+                            )}
+                            {canModifyBooking && (
+                              <form action={convertOverdueAction} className="inline">
+                                <input type="hidden" name="id" value={b.id} />
+                                <button
+                                  className="rounded-[2px] border border-[#dcdcdc] px-2 py-0.5 text-[11.5px] text-[#555] hover:border-[#32c141] hover:text-[#2a9d5c]"
+                                  title="入住日顺延到今天，离店日按原晚数重算，房号释放回待排房"
+                                >
+                                  转今日预订
+                                </button>
+                              </form>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {canCancelBooking && (
+                <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[#f0f0f0] px-3 py-2">
+                  <span className="text-[11px] text-[#999]">
+                    批量取消会取消全部 {overdue.orders} 张逾期订单并释放房量占用（不可恢复）
+                  </span>
+                  <ConfirmForm
+                    action={cancelAllOverdueAction}
+                    message={`确认批量取消 ${overdue.orders} 张逾期订单？`}
+                    detail={
+                      `订单数量：${overdue.orders} 张；` +
+                      `日期范围：${overdue.minIn} ~ ${overdue.maxOut}（合计 ${overdue.nights} 间夜）；` +
+                      `库存影响：释放 ${overdue.rooms} 间房占用（其中 ${overdue.assigned} 间已排具体房号），` +
+                      `今日可售 +${overdue.occupyToday} 间，其他日期的可售量同步恢复；` +
+                      `取消后订单保留在预订列表可查询，但不能恢复`
+                    }
+                    confirmLabel="确认批量取消"
+                    requireReason="取消原因"
+                  >
+                    <button className="rounded-[2px] bg-[#d9534f] px-2.5 py-1 text-[11.5px] text-white hover:bg-[#c9302c]">
+                      批量取消逾期
+                    </button>
+                  </ConfirmForm>
+                </div>
+              )}
+            </>
+          )}
+        </div>
       </div>
 
       <div className="grid gap-3 xl:grid-cols-[1.55fr_1fr]">

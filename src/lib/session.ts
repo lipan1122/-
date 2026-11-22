@@ -242,6 +242,19 @@ const PERMISSIONS: Record<string, string[]> = {
   "cashier.charge_company": ["admin", "cashier"],
   "cashier.transfer": ["admin", "cashier"],
   "cashier.split": ["admin", "cashier"],
+  /*
+   * 红冲发票（第六轮整改清单一.6 新增）
+   *
+   * 为什么单列一个点、而不是复用已有的两个候选：
+   *   · report.view_finance 是**查看**财务报表，用它去控制「生成负数票 + 原票作废」这种
+   *     不可逆的账务写操作，语义错位：给某人开报表就会顺带给他红冲权；
+   *   · settings.manage 只授权 admin，而 ROLE_MODULES.cashier 明确放行了 /invoices
+   *     （收银员开票后要能查台账 / 红冲），挂 settings.manage 会把收银的红冲入口锁死，
+   *     等于把一个「收银台日常动作」变成管理员专属。
+   * 所以按清单「invoice.manage 或 admin」的意图拆出更窄的 invoice.void（红冲专用），
+   * 授权给真正做这件事的两个岗位：admin / cashier。
+   */
+  "invoice.void": ["admin", "cashier"],
   // 夜审 / 报表
   "night_audit.run": ["admin"],
   /* 第 4 轮 P1-18：撤销夜审（冲正房费 + 还原 NOSHOW + 删营收日报），不可逆，仅 admin */
@@ -256,7 +269,26 @@ const PERMISSIONS: Record<string, string[]> = {
   // 客人敏感数据
   "guest.view_sensitive": ["admin", "frontdesk"],
   "guest.modify": ["admin", "frontdesk"],
+  /*
+   * 会员等级变更（第六轮清单 一.7「会员等级变更必须有 member.manage」）
+   *
+   * 与 guest.modify 分开的理由：等级决定折扣与积分比例，是**会员权益**而不是档案字段。
+   * 建档（guest.modify）与抬等级（member.manage）分开授权后，酒店可以把「录会员」
+   * 交给前台，把「提等级 / 批量自动升级」留在更小的圈子里，不必为改等级而放开整个客史编辑。
+   */
+  "member.manage": ["admin", "frontdesk"],
   "member.view_sensitive": ["admin", "frontdesk", "cashier"],
+  /*
+   * 撤销早餐核销（整改报告第六轮 一.1 新增）
+   *
+   * 早餐的「核销」是把一份在住含早权益标记为已用餐，「撤销核销」是把它退回待核销。
+   * 现有权限点都表达不了这个语义：
+   *   · cashier.refund 是「把钱退给客人」——撤销核销不动任何金额；
+   *   · cashier.reverse_checkout 是「撤销退房」——撤销核销不碰房态与账务。
+   * 复用其中任何一个都会把「前台日常更正」错绑到收银/管理员的财务动作上，
+   * 所以单列一个权限点，角色集与早餐核销的实际操作者一致（admin / frontdesk）。
+   */
+  "breakfast.void": ["admin", "frontdesk"],
 };
 
 /** 全部内置权限点（顺序稳定；设置页在权限字典表为空时用它兜底渲染） */
@@ -286,6 +318,7 @@ export const PERMISSION_LABELS: Record<string, string> = {
   "cashier.charge_company": "挂公司账",
   "cashier.transfer": "账单转账",
   "cashier.split": "拆分账单",
+  "invoice.void": "红冲发票",
   "night_audit.run": "执行夜审",
   "night_audit.undo": "撤销夜审",
   "report.view_finance": "查看财务报表",
@@ -296,7 +329,9 @@ export const PERMISSION_LABELS: Record<string, string> = {
   "user.manage": "账号与岗位",
   "guest.view_sensitive": "查看客人敏感信息",
   "guest.modify": "修改客人资料",
+  "member.manage": "会员等级变更",
   "member.view_sensitive": "查看会员敏感信息",
+  "breakfast.void": "撤销早餐核销",
 };
 
 /** 权限点归属模块（降级兜底；权威来源是 permission_dict.module） */
@@ -320,6 +355,7 @@ export const PERMISSION_MODULE_OF: Record<string, string> = {
   "cashier.charge_company": "cashier",
   "cashier.transfer": "cashier",
   "cashier.split": "cashier",
+  "invoice.void": "cashier",
   "night_audit.run": "night_audit",
   "night_audit.undo": "night_audit",
   "report.view_finance": "report",
@@ -330,7 +366,9 @@ export const PERMISSION_MODULE_OF: Record<string, string> = {
   "user.manage": "settings",
   "guest.view_sensitive": "guest",
   "guest.modify": "guest",
+  "member.manage": "member",
   "member.view_sensitive": "member",
+  "breakfast.void": "breakfast",
 };
 
 /* ------------------------- 读库 + 进程内缓存 ------------------------- */

@@ -2,8 +2,9 @@ import Link from "next/link";
 import { all } from "@/lib/db";
 import { requireUser } from "@/lib/session";
 import { fmtMoney, todayStr } from "@/lib/utils";
+import ConfirmForm from "@/components/ConfirmForm";
 import { ShopPOS } from "@/components/ShopPOS";
-import { sellCartAction } from "./actions";
+import { ensureShopPageSchema, sellCartAction, voidSaleAction } from "./actions";
 
 export const dynamic = "force-dynamic";
 
@@ -27,6 +28,9 @@ export default async function ShopPage({ searchParams }: { searchParams: Promise
   const tab = sp.tab ?? "";
   const today = todayStr();
 
+  /* 旧库可能还没有 shop_sales.voided_at 等列：渲染前补一次结构，避免列表查询报错 */
+  await ensureShopPageSchema(hotelId);
+
   const items = all<{ id: number; name: string; price: number; stock: number; category: string | null }>(
     `SELECT id, name, price, stock, category FROM shop_items
      WHERE hotel_id = ? AND COALESCE(status, 'ON') = 'ON' ORDER BY id`,
@@ -40,13 +44,23 @@ export default async function ShopPage({ searchParams }: { searchParams: Promise
     [hotelId]
   );
 
-  const todaySales = all<{ id: number; item_name: string; qty: number; amount: number; method: string | null; created_at: string | null }>(
-    `SELECT id, item_name, qty, amount, method, created_at FROM shop_sales
+  const todaySales = all<{
+    id: number;
+    item_name: string;
+    qty: number;
+    amount: number;
+    method: string | null;
+    room_no: string | null;
+    created_at: string | null;
+    voided_at: string | null;
+    void_reason: string | null;
+  }>(
+    `SELECT id, item_name, qty, amount, method, room_no, created_at, voided_at, void_reason FROM shop_sales
      WHERE hotel_id = ? AND date(created_at, 'localtime') = ? ORDER BY id DESC`,
     [hotelId, today]
   );
 
-  const totalSales = todaySales.reduce((a, s) => a + Number(s.amount ?? 0), 0);
+  const totalSales = todaySales.reduce((a, s) => a + (s.voided_at ? 0 : Number(s.amount ?? 0)), 0);
 
   async function submitOrder(payload: { itemId: number; qty: number; roomNo: string; method: string }) {
     "use server";
@@ -104,24 +118,52 @@ export default async function ShopPage({ searchParams }: { searchParams: Promise
                   <th className="px-3 py-2 text-right text-[12px] font-medium text-[#555]">金额</th>
                   <th className="px-3 py-2 text-left text-[12px] font-medium text-[#555]">支付方式</th>
                   <th className="px-3 py-2 text-left text-[12px] font-medium text-[#555]">时间</th>
+                  <th className="px-3 py-2 text-right text-[12px] font-medium text-[#555]">操作</th>
                 </tr>
               </thead>
               <tbody>
                 {todaySales.length === 0 && (
                   <tr>
-                    <td colSpan={6} className="px-3 py-12 text-center text-[12px] text-[#999]">
+                    <td colSpan={7} className="px-3 py-12 text-center text-[12px] text-[#999]">
                       暂无订单数据
                     </td>
                   </tr>
                 )}
                 {todaySales.map((s, i) => (
-                  <tr key={s.id} className="border-t border-[#f5f5f5]">
+                  <tr key={s.id} className={`border-t border-[#f5f5f5] ${s.voided_at ? "text-[#aaa]" : ""}`}>
                     <td className="px-3 py-2 text-[12px] text-[#888]">{i + 1}</td>
-                    <td className="px-3 py-2 text-[12px] text-[#222]">{s.item_name}</td>
+                    <td className={`px-3 py-2 text-[12px] ${s.voided_at ? "line-through" : "text-[#222]"}`}>
+                      {s.item_name}
+                    </td>
                     <td className="px-3 py-2 text-right text-[12px] tabular-nums">{s.qty}</td>
                     <td className="px-3 py-2 text-right text-[12px] tabular-nums">{fmtMoney(s.amount)}</td>
                     <td className="px-3 py-2 text-[12px] text-[#555]">{s.method ?? "-"}</td>
                     <td className="px-3 py-2 text-[12px] tabular-nums text-[#888]">{(s.created_at ?? "").slice(11, 16)}</td>
+                    <td className="px-3 py-2 text-right text-[12px]">
+                      {s.voided_at ? (
+                        <span
+                          className="rounded border border-[#e5e5e5] bg-[#fafafa] px-1.5 py-0.5 text-[11px] text-[#999]"
+                          title={s.void_reason ? `原因：${s.void_reason}` : undefined}
+                        >
+                          已撤销
+                        </span>
+                      ) : (
+                        <ConfirmForm
+                          action={voidSaleAction}
+                          message={`确认撤销销售单 #${s.id}？`}
+                          detail={`${s.item_name} ×${s.qty} · ${fmtMoney(s.amount)} · ${
+                            s.room_no ? `挂账房 ${s.room_no}` : s.method ?? "现金"
+                          }。撤销后库存回加；挂房账的会在客人账单上补一笔负项。`}
+                          requireReason="撤销原因"
+                          confirmLabel="确认撤销"
+                        >
+                          <input type="hidden" name="id" value={s.id} />
+                          <button type="submit" className="btn-danger px-2 py-0.5 text-[11px]">
+                            撤销
+                          </button>
+                        </ConfirmForm>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>

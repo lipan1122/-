@@ -163,6 +163,7 @@ const RBAC_PERMISSIONS = {
   "cashier.charge_company": ["admin", "cashier"],
   "cashier.transfer": ["admin", "cashier"],
   "cashier.split": ["admin", "cashier"],
+  "invoice.void": ["admin", "cashier"],
   "night_audit.run": ["admin"],
   "report.view_finance": ["admin", "cashier"],
   "report.view_operation": ["admin", "frontdesk", "cashier"],
@@ -172,7 +173,10 @@ const RBAC_PERMISSIONS = {
   "user.manage": ["admin"],
   "guest.view_sensitive": ["admin", "frontdesk"],
   "guest.modify": ["admin", "frontdesk"],
+  "member.manage": ["admin", "frontdesk"],
   "member.view_sensitive": ["admin", "frontdesk", "cashier"],
+  // 第六轮整改 一.1：撤销早餐核销（cashier.refund 是退钱、reverse_checkout 是撤销退房，都不同义）
+  "breakfast.void": ["admin", "frontdesk"],
 };
 
 /**
@@ -199,6 +203,7 @@ const RBAC_PERMISSION_DICT = [
   { permission: "cashier.charge_company", label: "挂公司账", module: "cashier", description: "把账单转为单位挂账（AR）" },
   { permission: "cashier.transfer", label: "账单转账", module: "cashier", description: "在账单之间转移金额" },
   { permission: "cashier.split", label: "拆分账单", module: "cashier", description: "把一张账单拆成多张" },
+  { permission: "invoice.void", label: "红冲发票", module: "cashier", description: "对已开发票红冲：生成负数票并把原票置为已红冲" },
   { permission: "night_audit.run", label: "执行夜审", module: "night_audit", description: "过账房费、NOSHOW、营收汇总（影响全店）" },
   { permission: "report.view_finance", label: "查看财务报表", module: "report", description: "营收、账务类报表" },
   { permission: "report.view_operation", label: "查看经营报表", module: "report", description: "出租率、客源等经营类报表" },
@@ -208,7 +213,14 @@ const RBAC_PERMISSION_DICT = [
   { permission: "user.manage", label: "账号与岗位", module: "settings", description: "操作员账号、岗位与员工管理" },
   { permission: "guest.view_sensitive", label: "查看客人敏感信息", module: "guest", description: "证件号、手机号等敏感字段" },
   { permission: "guest.modify", label: "修改客人资料", module: "guest", description: "编辑客人档案与联系方式" },
+  { permission: "member.manage", label: "会员等级变更", module: "member", description: "升级 / 取消会员等级、按规则批量自动升级（影响折扣与积分权益）" },
   { permission: "member.view_sensitive", label: "查看会员敏感信息", module: "member", description: "会员余额、手机号等敏感字段" },
+  {
+    permission: "breakfast.void",
+    label: "撤销早餐核销",
+    module: "breakfast",
+    description: "把已核销的早餐记录退回待核销（不改金额、不退房）",
+  },
 ];
 
 /**

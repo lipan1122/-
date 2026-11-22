@@ -69,7 +69,7 @@
     "preflight:code": "node scripts/preflight-code.mjs",
     "check:report-map": "node scripts/check-report-map.mjs",
     "recalc:folios": "node scripts/recalc-all-folios.mjs",
-    "audit:all": "node scripts/audit.mjs && node scripts/audit-pages.mjs && node scripts/audit-reports.mjs && node scripts/preflight-db.mjs && node scripts/check-sql-params.mjs && node scripts/check-report-map.mjs && node scripts/test-channel-order-permissions.mjs && node scripts/test-channel-order-badge-status.mjs && node scripts/test-room-stock-today.mjs && node scripts/test-room-stock-multiroom.mjs && node scripts/test-room-stock-allotment.mjs && node scripts/test-occupancy-tenant-isolation.mjs && node scripts/test-room-tags-cleaning.mjs && node scripts/test-room-tags-pending-review.mjs && node scripts/test-refund-confirmation.mjs && node scripts/test-checkout-room-status.mjs && node scripts/test-night-audit-occupancy.mjs && node scripts/test-pre-arrival-buckets.mjs",
+    "audit:all": "node scripts/audit.mjs && node scripts/audit-pages.mjs && node scripts/audit-reports.mjs && node scripts/preflight-db.mjs && node scripts/check-sql-params.mjs && node scripts/check-report-map.mjs && node scripts/test-channel-order-permissions.mjs && node scripts/test-channel-order-badge-status.mjs && node scripts/test-room-stock-today.mjs && node scripts/test-room-stock-multiroom.mjs && node scripts/test-room-stock-allotment.mjs && node scripts/test-occupancy-tenant-isolation.mjs && node scripts/test-room-tags-cleaning.mjs && node scripts/test-room-tags-pending-review.mjs && node scripts/test-refund-confirmation.mjs && node scripts/test-checkout-room-status.mjs && node scripts/test-night-audit-occupancy.mjs && node scripts/test-pre-arrival-buckets.mjs && node scripts/test-breakfast-permissions.mjs && node scripts/test-shop-permissions.mjs && node scripts/test-goods-permissions.mjs && node scripts/test-today-todo-permissions.mjs && node scripts/test-ar-permissions.mjs && node scripts/test-invoice-permissions.mjs && node scripts/test-member-permissions.mjs && node scripts/test-quote-permissions.mjs",
     "db:ensure-schema": "node scripts/ensure-schema.mjs",
     "db:dump-schema": "node scripts/dump-schema.mjs",
     "db:sync-schema": "node scripts/sync-schema.mjs",
@@ -88,7 +88,16 @@
     "test:pre-arrival-buckets": "node scripts/test-pre-arrival-buckets.mjs",
     "test:all": "node scripts/verify-release.mjs",
     "verify:release": "node scripts/verify-release.mjs",
-    "smoke:business": "node scripts/smoke-business-flow.mjs"
+    "smoke:business": "node scripts/smoke-business-flow.mjs",
+    "db:rebuild-unique": "node scripts/rebuild-unique-constraints.mjs",
+    "test:breakfast-permissions": "node scripts/test-breakfast-permissions.mjs",
+    "test:shop-permissions": "node scripts/test-shop-permissions.mjs",
+    "test:goods-permissions": "node scripts/test-goods-permissions.mjs",
+    "test:today-todo-permissions": "node scripts/test-today-todo-permissions.mjs",
+    "test:ar-permissions": "node scripts/test-ar-permissions.mjs",
+    "test:invoice-permissions": "node scripts/test-invoice-permissions.mjs",
+    "test:member-permissions": "node scripts/test-member-permissions.mjs",
+    "test:quote-permissions": "node scripts/test-quote-permissions.mjs"
   },
   "dependencies": {
     "next": "16.4.6",

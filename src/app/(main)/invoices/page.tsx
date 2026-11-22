@@ -2,7 +2,7 @@ import Link from "next/link";
 import ConfirmForm from "@/components/ConfirmForm";
 import { bizToday } from "@/lib/biz-date";
 import { invoiceStats, listInvoices } from "@/lib/invoice";
-import { requireUser } from "@/lib/session";
+import { hasPermission, requireUser } from "@/lib/session";
 import { fmtMoney } from "@/lib/utils";
 import { redFlushInvoiceAction } from "./actions";
 
@@ -58,6 +58,12 @@ function fmtTime(iso: string | null): string {
 export default async function InvoicesPage({ searchParams }: { searchParams: SearchParams }) {
   const user = await requireUser();
   const hotelId = user.hotelId;
+  /*
+   * 红冲权限（第六轮整改清单一.6）：invoice.void 只授权 admin / cashier。
+   * 这里只决定按钮显不显示 —— 真正的拦截在 invoices/actions.ts 的
+   * requirePermission("invoice.void")，页面隐藏不能代替服务端校验。
+   */
+  const canVoid = hasPermission(user.role, "invoice.void", hotelId);
   const sp = await searchParams;
 
   const ok = first(sp.ok);
@@ -304,11 +310,11 @@ export default async function InvoicesPage({ searchParams }: { searchParams: Sea
                       </span>
                     </td>
                     <td className="td text-right">
-                      {canRedFlush ? (
+                      {canRedFlush && canVoid ? (
                         <ConfirmForm
                           action={redFlushInvoiceAction}
                           message={`确认红冲发票 ${r.invoice_no}？`}
-                          detail={`将生成一张金额 ${fmtMoney(-Math.abs(r.amount))} 的红冲票，原票标记为「已红冲」，该账单额度自动还回。红冲记录会保留，不能删除。`}
+                          detail={`将生成一张金额 ${fmtMoney(-Math.abs(r.amount))} 的红冲票，原票标记为「已红冲」，该账单额度自动还回。红冲记录会保留，不能删除，且同一张原票只能红冲一次。`}
                           confirmLabel="确认红冲"
                           requireReason="红冲原因"
                         >
@@ -320,6 +326,10 @@ export default async function InvoicesPage({ searchParams }: { searchParams: Sea
                             红冲
                           </button>
                         </ConfirmForm>
+                      ) : canRedFlush ? (
+                        <span className="text-[11px] text-gray-400" title="红冲需要「红冲发票」权限（管理员 / 收银）">
+                          无红冲权限
+                        </span>
                       ) : (
                         <span className="text-[11px] text-gray-300">—</span>
                       )}

@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { all, get, getDb, run, tx } from "@/lib/db";
-import { requireUser } from "@/lib/session";
+import { requirePermission, requireUser } from "@/lib/session";
 import { fmtMoney, nowIso } from "@/lib/utils";
 
 /**
@@ -126,6 +126,20 @@ function round2(n: number): number {
 /** 回跳页面：tab + 提示文案（msg 绿色 / err 红色） */
 function back(tab: string, key: "msg" | "err", message: string): never {
   redirect(`${PAGE}?tab=${tab}&${key}=${encodeURIComponent(message)}`);
+}
+
+/** 操作日志：op_logs 缺失（旧库）时静默跳过，审计失败不影响业务 */
+function writeOpLog(hotelId: number, operator: string, action: string, detail: string): void {
+  const exists =
+    get<{ n: number }>(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'op_logs'`)?.n ?? 0;
+  if (!exists) return;
+  run(`INSERT INTO op_logs (hotel_id, operator, action, detail, created_at) VALUES (?,?,?,?,?)`, [
+    hotelId,
+    operator,
+    action,
+    detail,
+    nowIso(),
+  ]);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -337,9 +351,15 @@ function revalidateGoods(): void {
 /* 商品类别                                                                    */
 /* -------------------------------------------------------------------------- */
 
-/** 新增商品类别：名称在当前酒店内唯一，排序取当前最大值 + 1 */
+/**
+ * 新增商品类别：名称在当前酒店内唯一，排序取当前最大值 + 1
+ *
+ * 权限（第六轮 一.3）：商品档案 / 类别 / 上下架都是配置变更 → settings.manage。
+ * 保留 goods.manage 这种「清单点名但库里没有」的权限点去新增一整套权限矩阵，
+ * 语义上并不比 settings.manage 更精确（/goods 页面的可见角色本来就只有 admin）。
+ */
 export async function createCategoryAction(formData: FormData): Promise<void> {
-  const user = await requireUser();
+  const user = await requirePermission("settings.manage");
   const hotelId = user.hotelId;
   await ensureGoodsSchema(hotelId);
 
@@ -374,7 +394,7 @@ export async function createCategoryAction(formData: FormData): Promise<void> {
 
 /** 新增 / 编辑商品（带 id 为编辑，编辑不改库存，库存只能通过进货 / 退货 / 报废调整） */
 export async function saveGoodsAction(formData: FormData): Promise<void> {
-  const user = await requireUser();
+  const user = await requirePermission("settings.manage");
   const hotelId = user.hotelId;
   await ensureGoodsSchema(hotelId);
 
@@ -412,7 +432,10 @@ export async function saveGoodsAction(formData: FormData): Promise<void> {
   const now = nowIso();
 
   if (id) {
-    const existed = get<{ id: number }>(`SELECT id FROM goods WHERE id = ? AND hotel_id = ?`, [id, hotelId]);
+    const existed = get<{ id: number; name: string; cost_price: number; sell_price: number; stock: number }>(
+      `SELECT id, name, cost_price, sell_price, stock FROM goods WHERE id = ? AND hotel_id = ?`,
+      [id, hotelId]
+    );
     if (!existed) back("goods", "err", "商品不存在或已被删除");
 
     run(
@@ -422,12 +445,29 @@ export async function saveGoodsAction(formData: FormData): Promise<void> {
       [categoryId || null, name, barcode || null, unit, costPrice, sellPrice, warnStock, id, hotelId]
     );
 
+    /*
+     * 价格修改必须留痕（整改清单 一.3）：成本价影响库存金额、售价影响商超收入，
+     * 都是会改变账面的改动。只记录「真的变了」的字段，避免每次保存都刷一条噪声日志。
+     */
+    const changes: string[] = [];
+    if (round2(Number(existed.cost_price ?? 0)) !== costPrice) {
+      changes.push(`成本价 ${fmtMoney(existed.cost_price)} → ${fmtMoney(costPrice)}`);
+    }
+    if (round2(Number(existed.sell_price ?? 0)) !== sellPrice) {
+      changes.push(`售价 ${fmtMoney(existed.sell_price)} → ${fmtMoney(sellPrice)}`);
+    }
+    if (existed.name !== name) changes.push(`名称 ${existed.name} → ${name}`);
+    if (changes.length > 0) {
+      writeOpLog(hotelId, operator, "商品改价", `商品 ${id} · ${name} · ${changes.join(" · ")}`);
+    }
+
     revalidateGoods();
     back("goods", "msg", `已保存商品「${name}」档案（库存请通过进货 / 退货 / 报废调整）`);
   }
 
   if (opening < 0) back("goods", "err", "期初库存不能为负数");
 
+  let createdId = 0;
   tx(() => {
     const goodsId = run(
       `INSERT INTO goods
@@ -447,6 +487,7 @@ export async function saveGoodsAction(formData: FormData): Promise<void> {
         now,
       ]
     ).lastInsertRowid;
+    createdId = goodsId;
 
     // 期初库存 > 0 时补一笔进货流水，保证流水结存与商品库存对得上
     if (opening > 0) {
@@ -470,6 +511,13 @@ export async function saveGoodsAction(formData: FormData): Promise<void> {
     }
   });
 
+  writeOpLog(
+    hotelId,
+    operator,
+    "新增商品",
+    `商品 ${createdId} · ${name} · 成本价 ${fmtMoney(costPrice)} · 售价 ${fmtMoney(sellPrice)} · 期初库存 ${opening} ${unit}`
+  );
+
   revalidateGoods();
   back(
     "goods",
@@ -480,7 +528,7 @@ export async function saveGoodsAction(formData: FormData): Promise<void> {
 
 /** 商品上架 / 下架切换（下架商品不出现在库存操作的默认可选列表，仍需先处理库存） */
 export async function toggleGoodsStatusAction(formData: FormData): Promise<void> {
-  const user = await requireUser();
+  const user = await requirePermission("settings.manage");
   const hotelId = user.hotelId;
   await ensureGoodsSchema(hotelId);
 
@@ -496,6 +544,8 @@ export async function toggleGoodsStatusAction(formData: FormData): Promise<void>
   const next = row.status === "ON" ? "OFF" : "ON";
   run(`UPDATE goods SET status = ? WHERE id = ? AND hotel_id = ?`, [next, id, hotelId]);
 
+  writeOpLog(hotelId, user.realName || user.username, "商品上下架", `商品 ${id} · ${row.name} · ${row.status} → ${next}`);
+
   revalidateGoods();
   back("goods", "msg", next === "ON" ? `已上架商品「${row.name}」` : `已下架商品「${row.name}」，下架后不可用于零售出库`);
 }
@@ -504,8 +554,18 @@ export async function toggleGoodsStatusAction(formData: FormData): Promise<void>
 /* 库存操作：进货 / 退货 / 报废（事务内同时写 goods.stock 与 goods_flows）        */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * 库存变动（进货 / 退货 / 报废）的统一实现
+ *
+ * 整改清单 一.3 的四条要求都落在这里：
+ *   · 权限：settings.manage（/goods 的可见角色本来只有 admin，复用现有权限点即可表达；
+ *     清单点名的 goods.manage 库里没有，不为此另建一套矩阵）
+ *   · 原因：退货 / 报废必须填 —— 页面 ConfirmForm 的 requireReason 收集，服务端同样强制
+ *   · 同事务：goods.stock 与 goods_flows 在同一个 tx() 内更新，stock_after 取更新后的真实值
+ *   · 不能为负：条件更新 stock + delta >= 0，changes === 0 立即回滚并按库存不足提示
+ */
 async function applyStockMove(type: FlowType, formData: FormData): Promise<void> {
-  const user = await requireUser();
+  const user = await requirePermission("settings.manage");
   const hotelId = user.hotelId;
   await ensureGoodsSchema(hotelId);
 
@@ -513,11 +573,18 @@ async function applyStockMove(type: FlowType, formData: FormData): Promise<void>
   const goodsId = toInt(formData.get("goods_id"));
   const qty = toInt(formData.get("qty"));
   const rawPrice = toNum(formData.get("unit_price"), -1);
-  const note = str(formData.get("note"));
+  /*
+   * 原因字段有两个来源：页面 ConfirmForm 的 requireReason 以 reason 提交，
+   * 直接提交库存表单时写的是 note。两条路都要能落地，服务端统一按「必须非空」校验。
+   */
+  const note = str(formData.get("note")) || str(formData.get("reason"));
 
   if (!goodsId) back("stock", "err", `请先选择要${label}的商品`);
   if (qty <= 0) back("stock", "err", `${label}数量必须大于 0`);
   if (qty > 99999) back("stock", "err", `${label}数量过大（上限 99999），请分次操作`);
+  if (type !== "PURCHASE" && !note) {
+    back("stock", "err", `${label}必须填写原因（页面会强制要求，接口同样不接受空原因）`);
+  }
 
   const goods = get<GoodsRow>(
     `SELECT id, name, unit, cost_price, sell_price, stock FROM goods WHERE id = ? AND hotel_id = ?`,
@@ -536,41 +603,66 @@ async function applyStockMove(type: FlowType, formData: FormData): Promise<void>
       goodsId,
       hotelId,
     ]);
-    if (!current) return { ok: false as const, current: 0 };
+    if (!current) return { ok: false as const, current: 0, reason: "notfound" as const };
 
     const before = Math.trunc(Number(current.stock ?? 0));
     const delta = type === "PURCHASE" ? qty : -qty;
-    const after = before + delta;
-    if (after < 0) return { ok: false as const, current: before };
+    if (before + delta < 0) return { ok: false as const, current: before, reason: "short" as const };
 
-    if (type === "PURCHASE" && unitPrice > 0) {
-      run(`UPDATE goods SET stock = ?, cost_price = ? WHERE id = ? AND hotel_id = ?`, [
-        after,
-        unitPrice,
-        goodsId,
-        hotelId,
-      ]);
-    } else {
-      run(`UPDATE goods SET stock = ? WHERE id = ? AND hotel_id = ?`, [after, goodsId, hotelId]);
-    }
+    /*
+     * 条件更新而不是「先读后写绝对值」：
+     * 两个库存操作并发时，`SET stock = stock + delta ... AND stock + delta >= 0`
+     * 由 SQLite 串行判定，库存永远不会被扣成负数；changes === 0 说明条件不成立。
+     */
+    const updated =
+      type === "PURCHASE" && unitPrice > 0
+        ? run(`UPDATE goods SET stock = stock + ?, cost_price = ? WHERE id = ? AND hotel_id = ? AND stock + ? >= 0`, [
+            delta,
+            unitPrice,
+            goodsId,
+            hotelId,
+            delta,
+          ])
+        : run(`UPDATE goods SET stock = stock + ? WHERE id = ? AND hotel_id = ? AND stock + ? >= 0`, [
+            delta,
+            goodsId,
+            hotelId,
+            delta,
+          ]);
+    if (updated.changes === 0) return { ok: false as const, current: before, reason: "short" as const };
+
+    /* 同一事务内取回真实结存，流水与商品库存不会对不上 */
+    const after =
+      get<{ stock: number }>(`SELECT stock FROM goods WHERE id = ? AND hotel_id = ?`, [goodsId, hotelId])?.stock ??
+      before + delta;
 
     run(
       `INSERT INTO goods_flows
          (hotel_id, goods_id, type, qty, stock_after, unit_price, amount, note, operator, created_at)
        VALUES (?,?,?,?,?,?,?,?,?,?)`,
-      [hotelId, goodsId, type, delta, after, unitPrice, amount, note || null, operator, nowIso()]
+      [hotelId, goodsId, type, delta, Math.trunc(Number(after)), unitPrice, amount, note || null, operator, nowIso()]
     );
 
-    return { ok: true as const, after };
+    return { ok: true as const, after: Math.trunc(Number(after)) };
   });
 
   if (!result.ok) {
+    if (result.reason === "notfound") back("stock", "err", "商品不存在或已被删除");
     back(
       "stock",
       "err",
       `商品「${goods.name}」库存不足：当前 ${result.current} ${goods.unit}，本次${label} ${qty} ${goods.unit}`
     );
   }
+
+  writeOpLog(
+    hotelId,
+    operator,
+    `库存${label}`,
+    `商品 ${goodsId} · ${goods.name} · ${type === "PURCHASE" ? "+" : "-"}${qty} ${goods.unit} · 单价 ${fmtMoney(
+      unitPrice
+    )} · 金额 ${fmtMoney(amount)} · 结存 ${result.after} ${goods.unit} · 原因/备注：${note || "—"}`
+  );
 
   revalidateGoods();
   back(

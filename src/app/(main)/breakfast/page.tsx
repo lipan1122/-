@@ -2,6 +2,7 @@ import Link from "next/link";
 import { all, get, getDb, run } from "@/lib/db";
 import { requireUser } from "@/lib/session";
 import { addDays, nowIso, todayStr } from "@/lib/utils";
+import ConfirmForm from "@/components/ConfirmForm";
 import { bulkRedeemAction, redeemAction, redeemAllAction, revokeAction, sellBreakfastAction } from "./actions";
 
 export const dynamic = "force-dynamic";
@@ -206,6 +207,16 @@ export default async function BreakfastPage({ searchParams }: { searchParams: Se
     [hotelId, date]
   );
 
+  /*
+   * 全部核销的二次确认要如实告诉用户「影响到谁」：
+   * 用待核销**房间数**（而不是总房间数），因为已核销的不会再被这条动作碰到。
+   */
+  const pendingRooms =
+    get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM breakfast_records WHERE hotel_id = ? AND date = ? AND status = 'PENDING'`,
+      [hotelId, date]
+    )?.n ?? 0;
+
   const stayOptions = all<StayOption>(
     `SELECT s.id, r.room_no, COALESCE(s.guest_name, '散客') AS guest_name, COALESCE(s.breakfast, 0) AS breakfast
        FROM stays s LEFT JOIN rooms r ON r.id = s.room_id
@@ -344,12 +355,17 @@ export default async function BreakfastPage({ searchParams }: { searchParams: Se
                 核销选中
               </button>
             </form>
-            <form action={redeemAllAction}>
+            <ConfirmForm
+              action={redeemAllAction}
+              message={`确认全部核销 ${date} 的早餐？`}
+              detail={`日期：${date}，影响 ${pendingRooms} 间房 / ${stats.pending} 份待核销早餐。核销后客人直接凭房卡用餐；如需更正，只能逐条撤销。`}
+              confirmLabel="全部核销"
+            >
               <input type="hidden" name="date" value={date} />
               <button type="submit" className="btn-default h-8" disabled={stats.pending === 0}>
                 全部核销
               </button>
-            </form>
+            </ConfirmForm>
           </div>
         </div>
         <div className="overflow-x-auto">
@@ -420,13 +436,18 @@ export default async function BreakfastPage({ searchParams }: { searchParams: Se
                             </button>
                           </form>
                         ) : (
-                          <form action={revokeAction}>
+                          <ConfirmForm
+                            action={revokeAction}
+                            message={`确认撤销 ${r.room_no ?? "该房"} 的早餐核销？`}
+                            detail={`日期：${date}，${r.count} 份。撤销后回到待核销，客人的含早权益不变。`}
+                            confirmLabel="撤销核销"
+                          >
                             <input type="hidden" name="id" value={r.id} />
                             <input type="hidden" name="date" value={date} />
                             <button type="submit" className="btn-danger px-2 py-0.5 text-[12px]">
                               撤销
                             </button>
-                          </form>
+                          </ConfirmForm>
                         )}
                       </div>
                     </td>

@@ -166,6 +166,16 @@ export default async function ArPage({ searchParams }: { searchParams: SearchPar
   const today = todayStr();
   const month = today.slice(0, 7);
 
+  /*
+   * 幂等键（第六轮整改清单一.5「余额不能因重复提交重复变化」）
+   *
+   * 每次页面渲染生成一组，写进各表单的隐藏域 request_id：
+   *   · 前台双击按钮 / 网络超时后刷新重试 → 带的是同一个 request_id → 服务端只记一次账；
+   *   · 提交成功后页面会 redirect 回来重新渲染 → 新的一组 key → 下一笔业务照常办理。
+   * 后缀区分动作（-post / -pay / -transfer / -writeoff），互不干扰。
+   */
+  const reqPrefix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+
   // 懒建表 + 首次写入 5 个 AR 账户种子
   await ensureArSchema(hotelId);
 
@@ -633,6 +643,7 @@ export default async function ArPage({ searchParams }: { searchParams: SearchPar
           {/* 入账 */}
           <form action={postArAction} className={`card flex flex-col gap-2.5 p-4${activeCls("post")}`}>
             <input type="hidden" name="account_id" value={selected.id} />
+            <input type="hidden" name="request_id" value={`${reqPrefix}-post`} />
             <div className="flex items-center justify-between">
               <span className="text-[13px] font-semibold text-gray-800">入账（POST）</span>
               <span className="text-[11px] text-gray-400">{selected.code}</span>
@@ -664,6 +675,7 @@ export default async function ArPage({ searchParams }: { searchParams: SearchPar
           {/* 付款 */}
           <form action={payArAction} className={`card flex flex-col gap-2.5 p-4${activeCls("pay")}`}>
             <input type="hidden" name="account_id" value={selected.id} />
+            <input type="hidden" name="request_id" value={`${reqPrefix}-pay`} />
             <div className="flex items-center justify-between">
               <span className="text-[13px] font-semibold text-gray-800">付款（PAY）</span>
               <span className="text-[11px] text-gray-400">{selected.code}</span>
@@ -697,6 +709,7 @@ export default async function ArPage({ searchParams }: { searchParams: SearchPar
           {/* 转账 */}
           <form action={transferArAction} className={`card flex flex-col gap-2.5 p-4${activeCls("tr")}`}>
             <input type="hidden" name="account_id" value={selected.id} />
+            <input type="hidden" name="request_id" value={`${reqPrefix}-transfer`} />
             <div className="flex items-center justify-between">
               <span className="text-[13px] font-semibold text-gray-800">转账调账（TRANSFER）</span>
               <span className="text-[11px] text-gray-400">{selected.code}</span>
@@ -738,6 +751,7 @@ export default async function ArPage({ searchParams }: { searchParams: SearchPar
           {/* 核销 */}
           <form action={writeOffArAction} className={`card flex flex-col gap-2.5 p-4${activeCls("wo")}`}>
             <input type="hidden" name="account_id" value={selected.id} />
+            <input type="hidden" name="request_id" value={`${reqPrefix}-writeoff`} />
             <div className="flex items-center justify-between">
               <span className="text-[13px] font-semibold text-gray-800">核销（WRITE_OFF）</span>
               <span className="text-[11px] text-gray-400">{selected.code}</span>
@@ -775,9 +789,15 @@ export default async function ArPage({ searchParams }: { searchParams: SearchPar
             <div className="text-[11px] text-gray-400">
               写 ar_write_offs 并减少余额；可核销入账 {postCandidates.length} 笔
             </div>
-            <button className="btn-danger mt-1" disabled={postCandidates.length === 0}>
-              确认核销
-            </button>
+            {user.role === "admin" ? (
+              <button className="btn-danger mt-1" disabled={postCandidates.length === 0}>
+                确认核销
+              </button>
+            ) : (
+              <div className="mt-1 rounded border border-gray-200 bg-gray-50 px-2 py-1 text-[11px] text-gray-500">
+                坏账核销仅管理员可操作（当前岗位无权限）
+              </div>
+            )}
           </form>
         </div>
       )}
@@ -904,7 +924,10 @@ export default async function ArPage({ searchParams }: { searchParams: SearchPar
 
       <p className="text-[11px] text-gray-400">
         入账 / 付款 / 转账 / 核销均在数据库事务内完成：先写 ar_transactions（含 balance_after 余额快照），
-        再更新 ar_accounts.balance，核销额外写 ar_write_offs，任何一步失败整体回滚，账户余额与流水始终一致。
+        再更新 ar_accounts.balance，核销额外写 ar_write_offs，并同步写一条 op_logs 操作日志，
+        任何一步失败整体回滚，账户余额与流水始终一致。每个表单都带 request_id 幂等键：
+        同一屏重复提交（双击 / 超时重试）只记一次账，不会重复加/减余额。
+        权限：入账需「挂公司账」、付款需「收款」、转账需「账单转账」、坏账核销仅管理员。
       </p>
     </div>
   );

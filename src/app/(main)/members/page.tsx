@@ -1,9 +1,11 @@
 import Link from "next/link";
+import ConfirmForm from "@/components/ConfirmForm";
 import { all, get } from "@/lib/db";
-import { requireUser } from "@/lib/session";
+import { hasPermission, requireUser } from "@/lib/session";
 import { fmtMoney } from "@/lib/utils";
 import {
   applyUpgradeAction,
+  autoUpgradeMembersAction,
   cancelMemberAction,
   createMemberAction,
   importMembersAction,
@@ -292,6 +294,16 @@ export default async function MembersPage({ searchParams }: { searchParams: Sear
   const birthdayDays = Math.max(0, Math.min(365, Math.trunc(Number(first(sp.birthdays)) || 0)));
   const showNewForm = first(sp.new) === "1";
 
+  /*
+   * 页面按钮按权限隐藏（真正的边界在 Server Action 里）：
+   *   建档 / 改档案 / 导入 / 取消会员 → guest.modify
+   *   升级 / 批量自动升级             → member.manage
+   */
+  const canModify = hasPermission(user.role, "guest.modify", hotelId);
+  const canManageLevel = hasPermission(user.role, "member.manage", hotelId);
+  /* 升级规则 = 全店权益政策，写操作要 settings.manage；页面同步隐藏保存入口 */
+  const canManageSettings = hasPermission(user.role, "settings.manage", hotelId);
+
   // 积分表由积分模块懒建（points/actions.ts），卡类型表由会员卡模块懒建：
   // 旧库可能还没有，先探测再取列，避免整页 500
   const hasScore = tableExists("score_records");
@@ -573,6 +585,7 @@ export default async function MembersPage({ searchParams }: { searchParams: Sear
                 <Link href="/members?tab=members&new=1" className="btn-default px-2.5 py-1 text-[12px]">
                   + 新增会员
                 </Link>
+                {canModify && (
                 <details className="relative">
                   <summary className="btn-default cursor-pointer list-none px-2.5 py-1 text-[12px] [&::-webkit-details-marker]:hidden">
                     导入
@@ -582,7 +595,10 @@ export default async function MembersPage({ searchParams }: { searchParams: Sear
                     className="absolute right-0 z-30 mt-1 flex w-[280px] flex-col gap-1.5 rounded border border-gray-200 bg-white p-2 shadow-lg"
                   >
                     <div className="text-[11px] text-gray-500">
-                      选择 CSV 文件（表头：姓名,手机号,会员等级,会员卡号,备注）
+                      选择 CSV 文件（表头需含「姓名」列，可选：手机号,会员等级,会员卡号,备注,身份证号）
+                    </div>
+                    <div className="text-[11px] text-gray-400">
+                      单文件 ≤4MB、≤5000 行；文件内重复手机号 / 身份证会整单拒绝；按手机号、证件号判重，不按姓名
                     </div>
                     <input
                       type="file"
@@ -596,6 +612,7 @@ export default async function MembersPage({ searchParams }: { searchParams: Sear
                     </button>
                   </form>
                 </details>
+                )}
                 <a href="/api/members/template" className="btn-default px-2.5 py-1 text-[12px]">
                   导入模版下载
                 </a>
@@ -605,7 +622,7 @@ export default async function MembersPage({ searchParams }: { searchParams: Sear
               </div>
             </div>
 
-            {showNewForm && (
+            {showNewForm && canModify && (
               <div className="card">
                 <div className="flex items-center justify-between border-b border-gray-100 px-4 py-2.5">
                   <span className="text-[13px] font-semibold text-gray-800">+ 新增会员</span>
@@ -727,19 +744,36 @@ export default async function MembersPage({ searchParams }: { searchParams: Sear
                                 消费
                               </Link>
                               {m.vip_level < 3 ? (
-                                <form action={upgradeMemberAction}>
-                                  <input type="hidden" name="id" value={m.id} />
-                                  <button className="text-[12px] text-brand-600 hover:underline">
-                                    升级 VIP{m.vip_level + 1}
-                                  </button>
-                                </form>
+                                canManageLevel ? (
+                                  <form action={upgradeMemberAction}>
+                                    <input type="hidden" name="id" value={m.id} />
+                                    <button className="text-[12px] text-brand-600 hover:underline">
+                                      升级 VIP{m.vip_level + 1}
+                                    </button>
+                                  </form>
+                                ) : (
+                                  <span className="text-[11px] text-gray-300">无升级权限</span>
+                                )
                               ) : (
                                 <span className="text-[11px] text-gray-300">已是最高等级</span>
                               )}
-                              <form action={cancelMemberAction}>
-                                <input type="hidden" name="id" value={m.id} />
-                                <button className="text-[12px] text-rose-600 hover:underline">取消会员</button>
-                              </form>
+                              {canModify && (
+                                /*
+                                  整改清单 一.7：会员取消必须二次确认。
+                                  弹窗默认挡住误点，且强制填写取消原因；服务端 cancelMemberAction
+                                  再校验一次原因非空（防绕过），并把原因写进 op_logs。
+                                */
+                                <ConfirmForm
+                                  action={cancelMemberAction}
+                                  message={`确认取消 ${m.name} 的会员资格？`}
+                                  detail={`当前 ${vip.label}，取消后等级归零、客史保留，可随时重新加入会员。`}
+                                  requireReason="取消原因"
+                                  confirmLabel="取消会员"
+                                >
+                                  <input type="hidden" name="id" value={m.id} />
+                                  <button className="text-[12px] text-rose-600 hover:underline">取消会员</button>
+                                </ConfirmForm>
+                              )}
                             </div>
                           </td>
                         </tr>
@@ -1055,7 +1089,13 @@ export default async function MembersPage({ searchParams }: { searchParams: Sear
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
-                  <button className="btn-primary">保存规则</button>
+                  {canManageSettings ? (
+                    <button className="btn-primary">保存规则</button>
+                  ) : (
+                    <span className="rounded border border-gray-200 bg-gray-50 px-2 py-1 text-[11px] text-gray-500">
+                      只读：保存升级规则需要「系统设置」权限（settings.manage）
+                    </span>
+                  )}
                   <span className="text-[11px] text-gray-400">
                     高等级门槛不得低于低等级；积分比例与折扣仅作会员权益展示，不改变账单金额。
                   </span>
@@ -1066,9 +1106,26 @@ export default async function MembersPage({ searchParams }: { searchParams: Sear
             <div className="card overflow-x-auto">
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-gray-100 px-4 py-2.5">
                 <span className="text-[13px] font-semibold text-gray-800">待升级会员</span>
-                <span className="text-[11px] text-gray-400">
-                  累计消费 / 入住次数已达下一等级门槛但等级未升级 · 共 {upgradeCandidates.length} 位
-                </span>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[11px] text-gray-400">
+                    累计消费 / 入住次数已达下一等级门槛但等级未升级 · 共 {upgradeCandidates.length} 位
+                  </span>
+                  {/*
+                    按规则批量自动升级（整改清单 一.7）：二次确认后由服务端逐会员按 settings 规则重算，
+                    只升不降，每位会员与整批都写 op_logs（含口径、实际值、门槛值）。
+                  */}
+                  {canManageLevel && (
+                    <ConfirmForm
+                      action={autoUpgradeMembersAction}
+                      message="确认按当前规则批量升级会员？"
+                      detail={`将把达到门槛的会员升到应得等级（只升不降），每位都会写操作日志。`}
+                      confirmLabel="批量升级"
+                      danger={false}
+                    >
+                      <button className="btn-primary h-[26px] px-2.5 text-[12px]">按规则批量升级</button>
+                    </ConfirmForm>
+                  )}
+                </div>
               </div>
               <table className="w-full">
                 <thead>
@@ -1127,11 +1184,19 @@ export default async function MembersPage({ searchParams }: { searchParams: Sear
                           {m.stay_count ?? 0} 次入住
                         </td>
                         <td className="td text-right">
-                          <form action={applyUpgradeAction} className="inline-block">
-                            <input type="hidden" name="guest_id" value={m.id} />
-                            <input type="hidden" name="target_level" value={m.target_level} />
-                            <button className="btn-primary px-2 py-0.5 text-[12px]">升级</button>
-                          </form>
+                          {/*
+                            整改清单 一.7「自动升级必须按配置规则执行」：
+                            这里只提交会员 id，目标等级由服务端按 settings 里的规则重算 ——
+                            原来把 target_level 一起提交，构造请求就能把任意会员抬到 VIP3。
+                          */}
+                          {canManageLevel ? (
+                            <form action={applyUpgradeAction} className="inline-block">
+                              <input type="hidden" name="id" value={m.id} />
+                              <button className="btn-primary px-2 py-0.5 text-[12px]">升级</button>
+                            </form>
+                          ) : (
+                            <span className="text-[11px] text-gray-300">无权限</span>
+                          )}
                         </td>
                       </tr>
                     );
