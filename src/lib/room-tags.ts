@@ -25,14 +25,27 @@
  *   会员   stays.member_card 非空 或 guests.vip_level > 0
  *   团队   stays.team_name 非空
  *   免费   stays.rate = 0
- *   自用   ❌ 缺字段（stays / rooms 上都没有「自用」标记）
+ *   自用   stays.self_use = 1（入住单上的显式标记，与免费房无关）
  *   待打扫 housekeeping.status = 'PENDING'（task_type='打扫'）
- *   打扫中 ❌ 缺字段（housekeeping.status 只有 PENDING / DONE / CANCELLED，没有「打扫中」）
- *   待审   cancel_requests.status = 'PENDING'
+ *   打扫中 housekeeping.status = 'DOING'（task_type='打扫'）
+ *   待审   housekeeping.review_status = 'PENDING_REVIEW'（task_type='打扫'）
  *   常客   guests 在该酒店的历史入住次数 >= 3
  *
- * 缺字段的两个标签**不硬编**：定义里 available=false，界面灰显并提示需要先加列，
- * 数量恒为 0，点击无效。等字段补齐后把 available 改 true 即可启用。
+ * ── 第 5 轮 P1-4 修正的三处语义错误（上一版做错了） ──
+ * 1. 「打扫中」上一版标成「缺字段」是错的：housekeeping.status 本来就有 DOING，
+ *    只是当时没有把任务推进到 DOING 的入口（只有 PENDING → DONE），库里没数据
+ *    被误判成没字段。现在补了「开始打扫」动作，标签直接查 DOING。
+ * 2. 「待审」上一版映射 cancel_requests.status = 'PENDING'，语义完全不对：
+ *    那是**取消入住审批**（客人要退房，等主管批不批），不是客房打扫验收。
+ *    现在改为 housekeeping.review_status = 'PENDING_REVIEW'，见下一条。
+ * 3. 客房审核是独立维度，新增 housekeeping.review_status（迁移第 20 段）：
+ *    status 表达任务流转（PENDING / DOING / DONE / CANCELLED），
+ *    review_status 表达验收结果（NULL / PENDING_REVIEW / APPROVED / REJECTED）。
+ *    混在一个字段里会让「已打扫但未验收」和「打扫中」无法区分。
+ * 4. 「自用」新增 stays.self_use（同样在迁移第 20 段），**不拿 rate=0 当自用**：
+ *    免费房有促销/赔付/招待等多种来源，用房价反推入住性质必然算错。
+ *
+ * 12 个标签现在全部有真实数据来源（available 均为 true），不再有灰显项。
  */
 
 /** 12 个快捷标签的 key（顺序即界面顺序，与去呼呼一致） */
@@ -55,9 +68,14 @@ export type RoomTagDef = {
   label: string;
   /** 悬浮提示：判定口径说明 */
   hint: string;
-  /** 是否已具备数据来源（false = 缺字段，界面灰显、不可点击） */
+  /**
+   * 是否已具备数据来源（false = 缺字段，界面灰显、不可点击）
+   *
+   * 第 5 轮 P1-4 修正后 12 个标签全部为 true（「自用 / 打扫中 / 待审」
+   * 三个原来有问题或灰显的标签都已接上真实字段）。
+   */
   available: boolean;
-  /** 缺字段时的说明（available=false 时展示） */
+  /** 缺字段时的说明（available=false 时展示；当前没有标签用到，保留给以后新增标签） */
   missing?: string;
 };
 
@@ -101,15 +119,14 @@ export const ROOM_TAGS: RoomTagDef[] = [
   {
     key: "free",
     label: "免费",
-    hint: "当日房价为 0（免费房 / 自用房未计价）",
+    hint: "当日房价为 0（免单 / 赠送 / 赔付等；自用房请在入住时勾选「自用」，不靠房价推断）",
     available: true,
   },
   {
     key: "selfUse",
     label: "自用",
-    hint: "自用房标记",
-    available: false,
-    missing: "缺字段：stays / rooms 上都没有「自用」标记列，需要先加列",
+    hint: "入住单勾选了「自用」（stays.self_use = 1），与房价为 0 无关",
+    available: true,
   },
   {
     key: "dirty",
@@ -120,14 +137,13 @@ export const ROOM_TAGS: RoomTagDef[] = [
   {
     key: "cleaning",
     label: "打扫中",
-    hint: "该房有进行中的打扫任务",
-    available: false,
-    missing: "缺字段：housekeeping.status 只有 PENDING / DONE / CANCELLED，没有「打扫中」状态",
+    hint: "该房有 DOING 状态的打扫任务（阿姨在客房中心/手机上点过「开始打扫」）",
+    available: true,
   },
   {
     key: "pendingApprove",
     label: "待审",
-    hint: "该房间/入住单有 PENDING 状态的取消申请",
+    hint: "该房打扫已完成、等主管验收（housekeeping.review_status = PENDING_REVIEW）；与取消入住审批无关",
     available: true,
   },
   {
@@ -175,9 +191,20 @@ export type RoomTagFields = {
   guest_stay_count?: number | null;
   /** room_links 同一联房组内的在住间数 */
   link_room_count?: number | null;
-  /** 该房 PENDING 打扫任务数 */
+  /** 该房 PENDING 打扫任务数（待打扫） */
   hk_pending?: number | null;
-  /** 该入住单 PENDING 取消申请数 */
+  /** 该房 DOING 打扫任务数（打扫中，第 5 轮 P1-4 修正） */
+  hk_doing?: number | null;
+  /** 该房 review_status = PENDING_REVIEW 的打扫任务数（待审，第 5 轮 P1-4 修正） */
+  hk_review_pending?: number | null;
+  /** 入住单是否自用（stays.self_use，1 = 自用；第 5 轮 P1-4 新增） */
+  stay_self_use?: number | null;
+  /**
+   * 该入住单 PENDING 取消申请数
+   *
+   * 第 5 轮 P1-4 之后**不再**用于「待审」标签：取消入住审批与客房审核是两件事。
+   * 字段与对应的 SQL 片段保留，只是不再参与任何标签判定。
+   */
   pending_cancel_count?: number | null;
 };
 
@@ -247,15 +274,16 @@ export function matchesRoomTag(
     case "free":
       return room.rate === 0;
     case "selfUse":
-      /* 缺字段：没有「自用」标记列，永远不匹配（界面也禁用） */
-      return false;
+      /* 第 5 轮 P1-4：只认入住单上的显式「自用」标记，不拿 rate=0 反推 */
+      return (room.stay_self_use ?? 0) === 1;
     case "dirty":
       return (room.hk_pending ?? 0) > 0;
     case "cleaning":
-      /* 缺字段：housekeeping 没有「打扫中」状态 */
-      return false;
+      /* 第 5 轮 P1-4：housekeeping.status 本来就有 DOING，不再当「缺字段」 */
+      return (room.hk_doing ?? 0) > 0;
     case "pendingApprove":
-      return (room.pending_cancel_count ?? 0) > 0;
+      /* 第 5 轮 P1-4：客房审核（review_status）而非取消入住审批（cancel_requests） */
+      return (room.hk_review_pending ?? 0) > 0;
     case "regular":
       return (room.guest_stay_count ?? 0) >= 3;
     default:
@@ -310,8 +338,13 @@ export const ROOM_TAG_SQL = {
   /** 免费：当日房价为 0 */
   free: `COALESCE(s.rate, -1) = 0`,
 
-  /** 自用：缺字段，SQL 恒为假（保持与 JS 判定同口径） */
-  selfUse: `0`,
+  /**
+   * 自用：入住单勾选了「自用」
+   *
+   * 第 5 轮 P1-4：改用 stays.self_use（迁移第 20 段新增）。
+   * 这里刻意**不写** `OR s.rate = 0` —— 免费房不等于自用房。
+   */
+  selfUse: `COALESCE(s.self_use, 0) = 1`,
 
   /** 待打扫：有 PENDING 打扫任务 */
   dirty: `(
@@ -320,13 +353,30 @@ export const ROOM_TAG_SQL = {
        AND hk.task_type = '打扫' AND hk.status = 'PENDING'
   ) > 0`,
 
-  /** 打扫中：缺字段，SQL 恒为假 */
-  cleaning: `0`,
+  /**
+   * 打扫中：有 DOING 打扫任务
+   *
+   * 第 5 轮 P1-4：housekeeping.status 一直有 DOING（只是当时没有入口把任务
+   * 从 PENDING 推进到 DOING，库里没数据被误判成缺字段）。入口补在
+   * housekeeping 页「开始打扫」/ 移动端「开始打扫」。
+   */
+  cleaning: `(
+    SELECT COUNT(*) FROM housekeeping hk
+     WHERE hk.hotel_id = r.hotel_id AND hk.room_id = r.id
+       AND hk.task_type = '打扫' AND hk.status = 'DOING'
+  ) > 0`,
 
-  /** 待审：有 PENDING 取消申请 */
+  /**
+   * 待审：有打扫完成、等主管验收的任务
+   *
+   * 第 5 轮 P1-4：review_status = 'PENDING_REVIEW'。
+   * 上一版查的是 cancel_requests.status = 'PENDING'（取消入住审批），
+   * 语义完全不同，已删除该口径。
+   */
   pendingApprove: `(
-    SELECT COUNT(*) FROM cancel_requests cr
-     WHERE cr.hotel_id = r.hotel_id AND cr.stay_id = s.id AND cr.status = 'PENDING'
+    SELECT COUNT(*) FROM housekeeping hk
+     WHERE hk.hotel_id = r.hotel_id AND hk.room_id = r.id
+       AND hk.task_type = '打扫' AND hk.review_status = 'PENDING_REVIEW'
   ) > 0`,
 
   /** 常客：本酒店历史入住次数 ≥ 3 */
@@ -365,6 +415,26 @@ export const ROOM_TAG_FIELD_SQL = {
      WHERE hk.hotel_id = r.hotel_id AND hk.room_id = r.id
        AND hk.task_type = '打扫' AND hk.status = 'PENDING'
   )`,
+  /** 打扫中（第 5 轮 P1-4）：DOING 打扫任务数 */
+  hk_doing: `(
+    SELECT COUNT(*) FROM housekeeping hk
+     WHERE hk.hotel_id = r.hotel_id AND hk.room_id = r.id
+       AND hk.task_type = '打扫' AND hk.status = 'DOING'
+  )`,
+  /** 待审（第 5 轮 P1-4）：review_status = PENDING_REVIEW 的打扫任务数 */
+  hk_review_pending: `(
+    SELECT COUNT(*) FROM housekeeping hk
+     WHERE hk.hotel_id = r.hotel_id AND hk.room_id = r.id
+       AND hk.task_type = '打扫' AND hk.review_status = 'PENDING_REVIEW'
+  )`,
+  /** 自用（第 5 轮 P1-4）：stays.self_use，未勾选为 0 */
+  stay_self_use: `COALESCE(s.self_use, 0)`,
+  /**
+   * 取消入住审批数
+   *
+   * 第 5 轮 P1-4 之后不再用于「待审」标签（那是客房验收，不是取消审批）。
+   * 保留片段是因为房态行里可能仍要展示这个数字，删掉会连带改其他调用方。
+   */
   pending_cancel_count: `(
     SELECT COUNT(*) FROM cancel_requests cr
      WHERE cr.hotel_id = r.hotel_id AND cr.stay_id = s.id AND cr.status = 'PENDING'

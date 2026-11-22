@@ -92,6 +92,9 @@ export default async function RoomsPage({
             ${ROOM_TAG_FIELD_SQL.guest_id_no} AS guest_id_no,
             ${ROOM_TAG_FIELD_SQL.guest_stay_count} AS guest_stay_count,
             ${ROOM_TAG_FIELD_SQL.hk_pending} AS hk_pending,
+            ${ROOM_TAG_FIELD_SQL.hk_doing} AS hk_doing,
+            ${ROOM_TAG_FIELD_SQL.hk_review_pending} AS hk_review_pending,
+            ${ROOM_TAG_FIELD_SQL.stay_self_use} AS stay_self_use,
             ${ROOM_TAG_FIELD_SQL.pending_cancel_count} AS pending_cancel_count
      FROM rooms r
      JOIN room_types rt ON rt.id = r.room_type_id
@@ -265,9 +268,10 @@ export default async function RoomsPage({
    * 判定条件与 `src/lib/room-tags.ts` 的 ROOM_TAG_SQL 一一对应；客户端点击筛选
    * 走同一个文件里的 matchesRoomTag，所以「标签上的数字」与「点进去的房间数」必然一致。
    *
-   * 「自用 / 打扫中」两个标签因数据库缺字段（stays/rooms 无自用标记列、
-   * housekeeping.status 无「打扫中」状态），ROOM_TAG_SQL 里恒为 0，
-   * 界面会灰显并提示需要先加列，不拿假数字充数。
+   * 第 5 轮 P1-4 修正后 12 个标签全部有真实数据来源，不再有恒为 0 的占位项：
+   *   打扫中 → housekeeping.status = 'DOING'（字段本来就有，缺的是推进入口）
+   *   待审   → housekeeping.review_status = 'PENDING_REVIEW'（客房验收新维度）
+   *   自用   → stays.self_use = 1（新字段；不拿 rate=0 反推）
    */
   const tagStats = ROOM_TAG_KEYS.reduce((acc, key) => {
     const row = get<{ c: number }>(

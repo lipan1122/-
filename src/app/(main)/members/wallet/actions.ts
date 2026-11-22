@@ -120,15 +120,30 @@ export async function refundWalletAction(formData: FormData): Promise<void> {
   const guestId = Number(str(formData.get("guest_id")));
   const amount = parseAmount(formData);
   const noteText = str(formData.get("note"));
+  /*
+   * 确认框里必填的「退款原因」必须落进流水备注
+   *
+   * ConfirmForm 会把必填原因注入 FormData.reason（该项目所有危险操作
+   * —— 退款/取消入住/夜审/清空 —— 都读这个字段）。这个 action 原来只读
+   * `note`（自由备注，可为空），导致前台在确认框里认真填的原因被直接丢掉，
+   * 资金流水上没有留痕。回归测试抓到了这一点。
+   *
+   * 两者都写进备注：原因是必填的审计信息，备注是补充说明。
+   */
+  const reasonText = str(formData.get("reason"));
 
   if (!guestId) redirect(`/members/wallet?err=${encodeURIComponent("请先选择会员")}`);
   const guest = loadMember(hotelId, guestId);
   if (!guest) redirect(failUrl(guestId, "会员不存在或已取消会员"));
   if (!(amount > 0)) redirect(failUrl(guestId, "请填写正确的退款金额（大于 0）"));
 
+  const remarkParts = [`储值退款`];
+  if (reasonText) remarkParts.push(`原因：${reasonText}`);
+  if (noteText) remarkParts.push(noteText);
+
   const r = refundWallet(hotelId, guest.id, amount, {
     operator: user.realName,
-    remark: `储值退款${noteText ? `；${noteText}` : ""}`,
+    remark: remarkParts.join("；"),
     requestId: str(formData.get("request_id")) || undefined,
   });
   if ("error" in r) redirect(failUrl(guestId, r.error));

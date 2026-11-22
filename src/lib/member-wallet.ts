@@ -475,14 +475,43 @@ export function refundWallet(
    */
   const bizCap = round2(sum.recharge - sum.consume + sum.adjust);
   const currentBalance = getWalletBalance(hotelId, memberId);
-  const cap = round2(Math.max(0, Math.min(bizCap, currentBalance)));
+  /*
+   * 两个上限必须**分开校验**，不能先取小再比累计
+   *
+   * 上一版是：
+   *     const cap = min(bizCap, currentBalance);
+   *     if (sum.refund + amount > cap) 拒;
+   *
+   * 问题是 currentBalance 里**已经扣过历史退款**，而 bizCap 没有。
+   * 于是「已退金额」被扣了两次：
+   *   充值 1000 / 消费 200 → bizCap 800，余额 800
+   *   退 300 → 余额 500，sum.refund 300
+   *   再退 500 → cap = min(800, 500) = 500，累计 800 > 500 → **被拒**
+   * 但累计退 800 正好等于 bizCap，业务上完全允许 —— 退一半后剩下的退不出来。
+   *
+   * 正确做法：
+   *   ① 累计约束：sum.refund + 本次 ≤ bizCap   （业务上限，与余额无关）
+   *   ② 单笔约束：本次 ≤ currentBalance       （不能退不存在的钱）
+   * 两条各自独立成立即可，不需要先取小。
+   */
   const afterRefund = round2(sum.refund + pre.amount);
-  if (afterRefund > cap + EPS) {
+
+  /* ① 累计退款不能超过「实际充进来且没消费掉的钱」 */
+  if (afterRefund > bizCap + EPS) {
     return {
       error:
         `退款超出可退上限：累计退款 ${fmtMoney(sum.refund)} + 本次 ${fmtMoney(pre.amount)} = ${fmtMoney(afterRefund)}，` +
-        `上限 ${fmtMoney(cap)}（累计充值 ${fmtMoney(sum.recharge)} − 累计消费 ${fmtMoney(sum.consume)}` +
-        `${sum.adjust !== 0 ? ` + 调整 ${fmtMoney(sum.adjust)}` : ""}，当前余额 ${fmtMoney(currentBalance)}）`,
+        `上限 ${fmtMoney(bizCap)}（累计充值 ${fmtMoney(sum.recharge)} − 累计消费 ${fmtMoney(sum.consume)}` +
+        `${sum.adjust !== 0 ? ` + 调整 ${fmtMoney(sum.adjust)}` : ""}）`,
+    };
+  }
+
+  /* ② 单笔不能超过当前真实余额（余额是唯一能付出去的钱） */
+  if (pre.amount > currentBalance + EPS) {
+    return {
+      error:
+        `退款金额 ${fmtMoney(pre.amount)} 超过会员当前储值余额 ${fmtMoney(currentBalance)}，` +
+        `不能退不存在的钱`,
     };
   }
 

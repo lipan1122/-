@@ -269,6 +269,15 @@ export default function CheckInForm({
     prefill && prefill.deposit > 0 ? String(prefill.deposit) : ""
   );
   const [remark, setRemark] = useState("");
+  /*
+   * 自用标记（第 5 轮 P1-4）
+   *
+   * 自用是「这一次入住的性质」（员工自己住 / 招待用房），不是房间属性，
+   * 也不是房价属性 —— 所以必须是前台显式勾选，绝不从 rate=0 反推：
+   * 免费房有促销免单、赔付、OTA 预付等多种来源，用房价推入住性质必然算错。
+   * 对应字段：stays.self_use（迁移第 20 段），房态页「自用」标签只认它。
+   */
+  const [selfUse, setSelfUse] = useState(false);
 
   // 住客
   const [guestDrafts, setGuestDrafts] = useState<GuestDraft[]>(() => [
@@ -719,6 +728,27 @@ export default function CheckInForm({
                   </div>
                 </Field>
               </div>
+
+              {/*
+                自用勾选（第 5 轮 P1-4）
+                放在订单信息最后一行：频率低，但必须在入住时能勾。
+                显式勾选才写 stays.self_use = 1；房态页「自用」标签只查这个字段，
+                免费房（rate = 0）不会被算成自用。
+              */}
+              <label className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-dashed border-gray-200 px-2.5 py-1.5">
+                <input
+                  type="checkbox"
+                  name="self_use"
+                  value="1"
+                  checked={selfUse}
+                  onChange={(e) => setSelfUse(e.target.checked)}
+                  className="h-3.5 w-3.5 accent-emerald-600"
+                />
+                <span className="text-[12px] text-gray-700">自用（员工 / 招待用房）</span>
+                <span className="text-[11px] text-gray-400">
+                  勾选后计入房态页「自用」标签；与房价为 0 的免费房无关，免费房请按实际房价填写
+                </span>
+              </label>
             </div>
           </div>
 
@@ -1063,6 +1093,12 @@ export default function CheckInForm({
               <span className="text-gray-500">押金</span>
               <span className="tabular-nums text-gray-800">{fmtMoney(totalDeposit)}</span>
             </div>
+            {selfUse && (
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-gray-500">入住性质</span>
+                <span className="text-[12px] font-medium text-amber-700">自用房</span>
+              </div>
+            )}
             <div className="flex items-center justify-between gap-2">
               <span className="text-gray-500">预计房费</span>
               <span className="text-[15px] font-semibold tabular-nums text-emerald-700">

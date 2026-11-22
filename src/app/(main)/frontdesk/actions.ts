@@ -170,6 +170,15 @@ export async function checkInAction(
   const channelOrderNo = readStr(formData, "channel_order_no");
   const remarkInput = readStr(formData, "remark");
   /*
+   * 自用标记（第 5 轮 P1-4）
+   *
+   * 只认表单上显式勾选的 self_use=1，**不拿 rate=0 反推**：
+   * 免费房有促销免单、赔付、招待、OTA 预付等多种来源，
+   * 用房价推「入住性质」必然把免费房错算成自用房（清单明确禁止）。
+   * 落库到 stays.self_use，房态页「自用」标签的唯一判定来源。
+   */
+  const selfUse = readStr(formData, "self_use") === "1" ? 1 : 0;
+  /*
    * 押金（整改 P1-7：预订定金转入住押金）
    * 用 let：下面查到来源预订后，若本次表单没填押金而预订阶段收过定金，
    * 会用预订定金兜底（见 booking 校验之后那段）。
@@ -495,8 +504,8 @@ export async function checkInAction(
               check_in_time, expect_check_out, actual_check_out, nights, rate, deposit,
               guest_count, status, channel_id, remark, channel_order_no,
               team_name, member_card, member_type, rate_code, salesman, package_code,
-              invoice_party, pay_type, breakfast, created_by, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+              invoice_party, pay_type, breakfast, self_use, created_by, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
           [
             hotelId,
             stayNo,
@@ -526,6 +535,8 @@ export async function checkInAction(
             invoiceParty,
             payType,
             breakfastTotal,
+            /* 第 5 轮 P1-4：自用标记（前台显式勾选；不拿 rate=0 反推） */
+            selfUse,
             user.id,
             now,
           ]

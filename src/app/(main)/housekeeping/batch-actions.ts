@@ -52,9 +52,21 @@ export async function batchCleanRoomsAction(formData: FormData): Promise<{ ok?: 
       skipped.push(`${r.room_no}(${res.error})`);
       continue;
     }
-    // 同步关闭该房间的待办打扫任务
+    /*
+     * 同步关闭该房间的待办打扫任务。
+     *
+     * 第 5 轮 P1-4：批量置净等价于「替阿姨点完成打扫」，所以打扫任务同样要进
+     * 待审（review_status = PENDING_REVIEW），否则从批量入口完成的打扫永远
+     * 绕过了验收，房态页「待审」标签会漏掉这一批。
+     * 维修/查房任务不需要验收，CASE 里留 NULL。
+     */
     run(
-      `UPDATE housekeeping SET status = 'DONE', done_at = ?
+      `UPDATE housekeeping
+          SET status = 'DONE',
+              done_at = ?,
+              review_status = CASE WHEN COALESCE(task_type, '打扫') = '打扫' THEN 'PENDING_REVIEW' ELSE NULL END,
+              reviewed_by = NULL,
+              reviewed_at = NULL
         WHERE hotel_id = ? AND room_id = ? AND status IN ('PENDING','DOING')`,
       [nowIso(), user.hotelId, r.id]
     );

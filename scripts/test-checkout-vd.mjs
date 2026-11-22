@@ -45,20 +45,64 @@ function req(pathname, { method = "GET", body = null, cookie = null } = {}) {
 }
 
 /* 找一间 OC 房间的在住客人，欠费为 0（能直接退房） */
-const target = one(
-  `SELECT s.id AS stay_id, s.stay_no, s.guest_name, r.id AS room_id, r.room_no, r.status AS room_status,
-          f.id AS folio_id, f.folio_no, COALESCE(f.balance,0) AS balance
-     FROM stays s
-     JOIN rooms r ON r.id = s.room_id
-     JOIN folios f ON f.stay_id = s.id
-    WHERE s.hotel_id = 1 AND s.status = 'INHOUSE' AND r.status = 'OC'
-      AND COALESCE(f.balance,0) <= 0.01 AND f.status = 'OPEN'
-    ORDER BY s.id LIMIT 1`
-);
+function findTarget() {
+  return one(
+    `SELECT s.id AS stay_id, s.stay_no, s.guest_name, r.id AS room_id, r.room_no, r.status AS room_status,
+            f.id AS folio_id, f.folio_no, COALESCE(f.balance,0) AS balance
+       FROM stays s
+       JOIN rooms r ON r.id = s.room_id
+       JOIN folios f ON f.stay_id = s.id
+      WHERE s.hotel_id = 1 AND s.status = 'INHOUSE' AND r.status = 'OC'
+        AND COALESCE(f.balance,0) <= 0.01 AND f.status = 'OPEN'
+      ORDER BY s.id LIMIT 1`
+  );
+}
 
+let target = findTarget();
+let synthetic = null;
+
+/*
+ * 没有现成目标就自己造一条
+ *
+ * 原来这里写的是 process.exit(0) + 「跳过」—— 那是**假通过**：
+ * 退出码 0 会让验收脚本把它算成通过，但实际一条断言都没跑。
+ * codex 上线前补充要求明确：不能把跳过/异常当成通过。
+ *
+ * 现在：造一间 OC 房 + 一张住净在住单 + 一张 OPEN 账单，跑完在 finally 里删干净。
+ */
 if (!target) {
-  console.log("没有「住净 + 无欠费」的在住客人可用于测试，跳过");
-  process.exit(0);
+  console.log("没有现成的住净在住客人，自建一条测试单\n");
+  const ts = Date.now();
+  const room = one(`SELECT id, room_no FROM rooms WHERE hotel_id = 1 AND status = 'VC' ORDER BY id LIMIT 1`);
+  if (!room) {
+    console.error("❌ 库里连一间空净房（VC）都没有，无法造测试数据");
+    process.exit(1);
+  }
+  db.exec("BEGIN");
+  try {
+    const stayNo = `TEST-VD-${ts}`;
+    const folioNo = `F-TEST-VD-${ts}`;
+    db.prepare(
+      `INSERT INTO stays (hotel_id, stay_no, room_id, guest_name, check_in_time, expect_check_out, nights, rate, status)
+       VALUES (1, ?, ?, '测试退房客人', date('now','localtime'), date('now','localtime','+1 day'), 1, 200, 'INHOUSE')`
+    ).run(stayNo, room.id);
+    const stayId = db.prepare(`SELECT id FROM stays WHERE stay_no = ?`).get(stayNo).id;
+    db.prepare(
+      `INSERT INTO folios (hotel_id, folio_no, stay_id, guest_name, total_amount, paid_amount, balance, status)
+       VALUES (1, ?, ?, '测试退房客人', 200, 200, 0, 'OPEN')`
+    ).run(folioNo, stayId);
+    db.prepare(`UPDATE rooms SET status = 'OC' WHERE id = ?`).run(room.id);
+    db.exec("COMMIT");
+    synthetic = { stayNo, folioNo, roomId: room.id, stayId };
+    target = findTarget();
+    console.log(`已造：${room.room_no} / ${stayNo} / ${folioNo}\n`);
+  } catch (e) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {}
+    console.error("❌ 造测试数据失败：", e.message);
+    process.exit(1);
+  }
 }
 
 console.log(`测试目标：${target.room_no} ${target.guest_name}（当前房态 ${target.room_status}，余额 ${target.balance}）\n`);
@@ -118,18 +162,41 @@ check("账单变成 SETTLED", folioAfter === "SETTLED", `实际 ${folioAfter}`);
 check("room_logs 记录 OC→VD", log?.from_status === "OC" && log?.to_status === "VD", JSON.stringify(log));
 check("自动生成打扫任务", hk?.status === "PENDING" && hk?.task_type === "打扫", JSON.stringify(hk));
 
-/* 清理：恢复原状，避免污染演示数据 */
+/* 清理：恢复原状，避免污染演示数据；自建的数据整条删掉 */
 db.exec("BEGIN");
 try {
   db.prepare(`UPDATE folios SET status='OPEN', settled_at=NULL WHERE id=?`).run(target.folio_id);
   db.prepare(`UPDATE stays SET status='INHOUSE', actual_check_out=NULL WHERE id=?`).run(target.stay_id);
   db.prepare(`UPDATE rooms SET status='OC' WHERE id=?`).run(target.room_id);
-  db.prepare(`DELETE FROM room_logs WHERE room_id=? ORDER BY id DESC LIMIT 1`).run(target.room_id);
-  db.prepare(`DELETE FROM housekeeping WHERE room_id=? ORDER BY id DESC LIMIT 1`).run(target.room_id);
+
+  /*
+   * 删「刚插入的那一条」日志/任务
+   *
+   * ⚠️ SQLite 默认**不支持** `DELETE ... ORDER BY ... LIMIT`
+   *   （需要编译时开启 SQLITE_ENABLE_UPDATE_DELETE_LIMIT），
+   * 写成那样会抛错 → 整个清理事务 ROLLBACK → 残留脏数据（踩过）。
+   * 正确写法：子查询先取出 max(id) 再按 id 删。
+   */
+  db
+    .prepare(`DELETE FROM room_logs WHERE id = (SELECT MAX(id) FROM room_logs WHERE room_id = ?)`)
+    .run(target.room_id);
+  db
+    .prepare(`DELETE FROM housekeeping WHERE id = (SELECT MAX(id) FROM housekeeping WHERE room_id = ?)`)
+    .run(target.room_id);
+
+  if (synthetic) {
+    /* 自建的数据：账单、入住单全删，房间恢复到空净 */
+    db.prepare(`DELETE FROM folios WHERE id=?`).run(target.folio_id);
+    db.prepare(`DELETE FROM stays WHERE id=?`).run(target.stay_id);
+    db.prepare(`UPDATE rooms SET status='VC' WHERE id=?`).run(synthetic.roomId);
+    db.prepare(`DELETE FROM room_logs WHERE room_id=? AND operator='测试'`).run(synthetic.roomId);
+    db.prepare(`DELETE FROM housekeeping WHERE room_id=? AND note='退房打扫'`).run(synthetic.roomId);
+  }
   db.exec("COMMIT");
-  console.log("\n（已恢复测试数据）");
-} catch {
+  console.log(synthetic ? "\n（已删除自建的测试数据）" : "\n（已恢复测试数据）");
+} catch (e) {
   db.exec("ROLLBACK");
+  console.error("\n⚠️ 清理失败（数据可能残留）：", e.message);
 }
 
 console.log(`\n通过 ${pass} / 失败 ${fail}`);

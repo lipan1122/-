@@ -40,7 +40,22 @@ export default function RefundForm({
 
   const num = Number(amount);
   const valid = Number.isFinite(num) && num > 0;
-  const after = valid ? Math.round((balance + num) * 100) / 100 : balance;
+  /*
+   * 退款后余额 = 当前余额 − 退款额
+   *
+   * ⚠️ 方向不能写反（第一版写成 +num，被回归测试抓到）
+   *
+   * 本项目「退款」的语义是**从会员储值账户出账**：
+   * 客人当初充值 1000，现在把没用完的部分退回给他，储值余额自然减少。
+   * 服务端 member-wallet.ts 记的就是 `REFUND → signedAmount: -amount`，
+   * 判定的可退上限也是「累计充值 − 累计消费 − 累计退款」。
+   *
+   * 以前这个页面写的是「退款金额退回会员储值账户，余额相应增加」——
+   * 那是把退款当充值了，方向完全相反。改成减号并与服务端口径一致。
+   */
+  const after = valid ? Math.round((balance - num) * 100) / 100 : balance;
+  /* 退款金额超过储值余额时，服务端会拒（不能退不存在的钱），这里提前提示 */
+  const exceed = valid && num > balance;
 
   return (
     <div className="card flex flex-col gap-2.5 p-4">
@@ -84,31 +99,31 @@ export default function RefundForm({
       </div>
 
       <div className="text-[11px] leading-relaxed text-gray-400">
-        退款金额退回会员储值账户，余额相应增加。
+        退款从会员储值账户出账，余额相应<b>减少</b>。
         <br />
         当前余额 <b className="tabular-nums text-gray-600">{fmtMoney(balance)}</b>
         {valid && (
           <>
             {" → 退款后 "}
-            <b className="tabular-nums text-emerald-700">{fmtMoney(after)}</b>
+            <b className={`tabular-nums ${exceed ? "text-rose-600" : "text-gray-800"}`}>{fmtMoney(after)}</b>
+            {exceed && <span className="ml-1 text-rose-600">（超过储值余额）</span>}
           </>
         )}
       </div>
 
       {/*
-        二次确认：显示会员姓名 + 金额 + 退款后余额（codex 清单 P2-1 要求
-        确认框必须显示「操作对象、金额或影响范围」）。
-        服务端仍会校验 cashier.refund 权限和「累计退款 ≤ 累计充值 − 已消费」上限。
+        二次确认：显示会员姓名 + 金额 + 退款后余额（codex 清单 P2-1 要求）
+        服务端仍会校验 cashier.refund 权限和「累计退款 ≤ 累计充值 − 累计消费」上限。
       */}
       <ConfirmForm
         action={action}
         message={valid ? `确认给「${guestName}」退款 ${fmtMoney(num)}？` : "请先填写退款金额"}
         detail={
           valid
-            ? `退款后退回储值账户，余额从 ${fmtMoney(balance)} 变为 ${fmtMoney(after)}。此操作会留下资金流水。`
+            ? `退款从储值账户出账，余额从 ${fmtMoney(balance)} 变为 ${fmtMoney(after)}。此操作会留下资金流水。`
             : "金额为空或不是正数时不会提交。"
         }
-        confirmLabel={valid ? "确认退款" : "请先填金额"}
+        confirmLabel={valid && !exceed ? "确认退款" : "请检查金额"}
         requireReason="退款原因"
         danger
       >
@@ -117,10 +132,10 @@ export default function RefundForm({
         <input type="hidden" name="amount" value={amount} />
         <button
           type="button"
-          disabled={!valid}
+          disabled={!valid || exceed}
           className="btn-default mt-1 w-full disabled:cursor-not-allowed disabled:opacity-40"
         >
-          {valid ? "退款" : "请先填写金额"}
+          {exceed ? "超过储值余额" : valid ? "退款" : "请先填写金额"}
         </button>
       </ConfirmForm>
     </div>

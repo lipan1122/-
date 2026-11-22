@@ -7,6 +7,8 @@ import { requirePermission } from "@/lib/session";
 import { conflictMessage, findRoomConflicts } from "@/lib/room-availability";
 import { isAssignable } from "@/lib/room-status";
 import { nightsBetween, nowIso } from "@/lib/utils";
+/* 预订号生成（按酒店隔离，多租户修复：原来这里自己算全局 MAX(id)，两家店会撞号） */
+import { nextBookingNo } from "@/lib/channels/booking-no";
 
 /** 读取字符串字段并去除首尾空格，非字符串一律视为空串 */
 function str(value: FormDataEntryValue | null): string {
@@ -271,14 +273,25 @@ export async function createBookingAction(formData: FormData) {
   if (remark) remarkParts.push(remark);
   const finalRemark = remarkParts.length > 0 ? remarkParts.join("；") : null;
 
-  // 预订号 = BK + (当前 bookings 表 MAX(id) + 1 + 3000)，多行时依次递增
+  // 预订号：复用 lib/channels/booking-no.ts 的 nextBookingNo(hotelId)
+  //
+  // 原来这里自己算 `BK${MAX(id)+1+3000}` —— 那是**全局** MAX(id)，
+  // 多店并行建单时两家店会算出同一个号，撞上 bookings.booking_no 的唯一约束
+  // （表上至今保留着列级 UNIQUE，见下方说明）。
+  //
+  // lib 里早就有按酒店隔离的 nextBookingNo()（查 hotel_id + booking_no、
+  // 撞号时加随机后缀），但建单没调用它。这里改成调用它。
+  //
+  // ⚠️ 遗留：bookings/stays/folios 三张表仍是**列级 UNIQUE**（全局唯一），
+  // 与 idx_bookings_no(hotel_id, booking_no) 的组合唯一并存。
+  // 这导致「两个酒店有同号预订」在多店部署下仍会失败（只是概率被随机后缀压低）。
+  // 彻底解决需要重建表去掉列级 UNIQUE（SQLite 不支持 DROP CONSTRAINT，
+  // 要走「建新表→复制→删旧表→改名→重建索引」12 步流程），风险较高，
+  // 已记录在 docs/已知问题.md，单店部署不受影响。
   let remainingLast = 0;
   tx(() => {
-    let seq =
-      get<{ next_id: number }>(`SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM bookings`)?.next_id ?? 1;
     for (const [lineIndex, line] of validLines.entries()) {
-      const bookingNo = `BK${seq + 3000}`;
-      seq += 1;
+      const bookingNo = nextBookingNo(user.hotelId);
       // 整单定金按房费占比拆到本行；最后一行吸收尾差，保证各行之和 = 实收定金
       const lineDeposit = splitDeposit(depositTotal, lineTotals, lineIndex);
       const inserted = run(

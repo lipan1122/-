@@ -2238,6 +2238,67 @@ export function runMigrations(db, { checkOnly = false } = {}) {
     }
   }
 
+  /* ---------- 20. 客房审核状态 + 入住自用标记（第 5 轮 P1-4 语义修复） ----------
+   *
+   * 背景：房态页 12 个快捷标签里有两个上一版把语义映射错了：
+   *   · 「待审」原来查 cancel_requests.status = 'PENDING' ——
+   *     那是**取消入住审批**（客人要退房、等主管批不批），与客房打扫验收毫无关系。
+   *     拿它当「待审」的后果是双向漏处理：真的有人申请取消入住在等着批，
+   *     前台看到的却是「房间要验收」；而真正打扫完等验收的房间，标签里没有。
+   *   · 「自用」没有任何字段可查，界面上只能显示「缺字段」。
+   *
+   * ── 为什么新增 housekeeping.review_status，而不是复用 housekeeping.status ──
+   * housekeeping.status 表达的是**任务流转**：
+   *   PENDING 待打扫 → DOING 打扫中 → DONE 已完成 / CANCELLED 已取消
+   * 而「审核」表达的是**验收**：这个任务做得合不合格、谁验的。
+   * 两者是正交的两个维度。塞进同一个字段会有两个绕不开的问题：
+   *   1. 「已打扫完但还没人验收」和「正在打扫」无法同时存在：
+   *      要么把 DONE 一律当待审（已验收过的历史任务也全进待审，越用越脏），
+   *      要么再造 DONE_REVIEW / APPROVED 之类状态 —— 那 status 里就一半流转
+   *      一半验收，任何按 status 做的统计（今日完成量、待打扫数）都开始算错。
+   *   2. 维修/查房任务共用这张表，它们不走打扫验收流程；
+   *      混一个字段后 `status = 'PENDING_REVIEW'` 到底是「打扫待验收」
+   *      还是「维修待验收」说不清，只能再加 task_type 条件去猜。
+   *
+   * 独立一列的取值约定（代码里只有这四个值，NULL 是默认）：
+   *   NULL           不需要审核（非打扫任务，以及本段之前的打扫历史数据）
+   *   PENDING_REVIEW 打扫完成，等主管验收     ← 房态页「待审」标签只数这个
+   *   APPROVED       验收通过
+   *   REJECTED       打回重做（同时把任务 status 退回 PENDING 重新进待打扫列表）
+   *
+   * ── 「自用」为什么放 stays 不放 rooms ──
+   * 自用是**这一次入住的性质**（员工自己住 / 招待用房），同一间房上一次自用
+   * 不代表这一次也是。放 rooms 等于把房间永久标成自用房，每次退房后还得手动清，
+   * 漏清一次就把正常售卖的房间一直算进「自用」。stays.self_use 随入住单按次生效，
+   * 退房即结束，不需要额外清理。
+   *
+   * 明确**不把 rate = 0（免费房）当自用**：免费房有促销免单、赔付、招待、OTA
+   * 预付等多种来源，用房价反推入住性质必然算错。自用必须由前台在入住时显式勾选。
+   */
+  addColumn("housekeeping", "review_status", "TEXT");
+  addColumn("housekeeping", "reviewed_by", "TEXT");
+  addColumn("housekeeping", "reviewed_at", "TEXT");
+  addColumn("stays", "self_use", "INTEGER DEFAULT 0");
+  /*
+   * 「打扫中」「待审」两个标签都是「按房间找任务」，房态页的子查询写法是
+   *   WHERE hotel_id = ? AND room_id = ? AND task_type = '打扫' AND status/review_status = ?
+   * 现有 idx_housekeeping_status 只有 (hotel_id, status)，room_id 不在索引里，
+   * 按房间反查仍要回表扫。补两条更贴实际写法的索引：
+   *   · (hotel_id, room_id, status)        待打扫 / 打扫中
+   *   · (hotel_id, room_id, review_status) 待审
+   * 分成两条而不是合成一条，是因为 status 的高频值（PENDING / DONE）与
+   * review_status 的筛选值（PENDING_REVIEW，绝大多数行是 NULL）在选择性上完全不同，
+   * 一条三列索引无法同时服务两种过滤。两个索引都很小（房子 × 任务），维护成本可忽略。
+   */
+  addIndex(
+    "idx_housekeeping_room_status",
+    "CREATE INDEX IF NOT EXISTS idx_housekeeping_room_status ON housekeeping(hotel_id, room_id, status)"
+  );
+  addIndex(
+    "idx_housekeeping_review",
+    "CREATE INDEX IF NOT EXISTS idx_housekeeping_review ON housekeeping(hotel_id, room_id, review_status)"
+  );
+
   return { changed, applied, skipped, notes, checkOnly };
 }
 

@@ -13,6 +13,9 @@ type TaskRow = {
   floor: number | null;
   task_type: string;
   status: string;
+  /** 验收状态：NULL / PENDING_REVIEW / APPROVED / REJECTED（第 5 轮 P1-4） */
+  review_status: string | null;
+  reviewed_by: string | null;
   assignee: string | null;
   note: string | null;
   created_at: string | null;
@@ -49,12 +52,33 @@ export default async function MobileHousekeepingPage({
 
   const tasks = all<TaskRow>(
     `SELECT h.id, r.id AS room_id, r.room_no, r.floor, COALESCE(h.task_type,'打扫') AS task_type, h.status,
+            h.review_status, h.reviewed_by,
             h.assignee, h.note, h.created_at, r.status AS room_status
        FROM housekeeping h
        JOIN rooms r ON r.id = h.room_id
       WHERE h.hotel_id = ? AND h.status IN ('PENDING','DOING')
         ${assignee ? "AND h.assignee = ?" : ""}
-      ORDER BY r.floor, r.room_no`,
+      ORDER BY CASE h.status WHEN 'PENDING' THEN 0 ELSE 1 END, r.floor, r.room_no`,
+    assignee ? [hotelId, assignee] : [hotelId]
+  );
+
+  /*
+   * 待验收任务（第 5 轮 P1-4）
+   *
+   * 单独查一份，不塞进上面的待办列表：验收是**主管**的动作，打扫阿姨手机页
+   * 默认只该看到自己要做的活。这里按「当前筛选的打扫员」取，
+   * 主管在顶部切到「全部」就能看到全店待验收。
+   */
+  const reviewTasks = all<TaskRow>(
+    `SELECT h.id, r.id AS room_id, r.room_no, r.floor, COALESCE(h.task_type,'打扫') AS task_type, h.status,
+            h.review_status, h.reviewed_by,
+            h.assignee, h.note, h.created_at, r.status AS room_status
+       FROM housekeeping h
+       JOIN rooms r ON r.id = h.room_id
+      WHERE h.hotel_id = ? AND h.review_status = 'PENDING_REVIEW'
+        ${assignee ? "AND h.assignee = ?" : ""}
+      ORDER BY h.done_at DESC, h.id DESC
+      LIMIT 20`,
     assignee ? [hotelId, assignee] : [hotelId]
   );
 
@@ -133,6 +157,8 @@ export default async function MobileHousekeepingPage({
               floor: t.floor,
               taskType: t.task_type,
               status: t.status,
+              reviewStatus: t.review_status,
+              reviewedBy: t.reviewed_by,
               assignee: t.assignee,
               note: t.note,
               createdAt: t.created_at,
@@ -140,6 +166,44 @@ export default async function MobileHousekeepingPage({
             }}
           />
         ))}
+
+        {/*
+         * 待验收区（第 5 轮 P1-4）
+         *
+         * 打扫完的任务不再直接算「收工」：主管在手机上点「验收通过」，
+         * 或者「打回重做」把任务退回待打扫。房态页「待审」标签数的就是这里。
+         */}
+        {reviewTasks.length > 0 && (
+          <div className="pt-3">
+            <div className="mb-1.5 flex items-baseline justify-between px-0.5">
+              <span className="text-[13px] font-semibold text-gray-800">
+                待验收（{reviewTasks.length}）
+              </span>
+              <span className="text-[11px] text-gray-400">主管验收后才算收工</span>
+            </div>
+            <div className="space-y-2">
+              {reviewTasks.map((t) => (
+                <MobileTaskCard
+                  key={`review-${t.id}`}
+                  task={{
+                    id: t.id,
+                    roomId: t.room_id,
+                    roomNo: t.room_no,
+                    floor: t.floor,
+                    taskType: t.task_type,
+                    status: t.status,
+                    reviewStatus: t.review_status,
+                    reviewedBy: t.reviewed_by,
+                    assignee: t.assignee,
+                    note: t.note,
+                    createdAt: t.created_at,
+                    roomStatus: t.room_status,
+                  }}
+                />
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

@@ -2,7 +2,7 @@ import Link from "next/link";
 import { all, get } from "@/lib/db";
 import { requireUser } from "@/lib/session";
 import { todayStr } from "@/lib/utils";
-import { completeTaskFormAction, setRoomCleanFormAction } from "./actions";
+import { completeTaskFormAction, reviewTaskFormAction, setRoomCleanFormAction, startTaskFormAction } from "./actions";
 import BatchCleanPanel from "@/components/BatchCleanPanel";
 import MaintenanceModal, { type MaintenanceRoom } from "@/components/MaintenanceModal";
 
@@ -12,9 +12,12 @@ type SearchParams = Promise<Record<string, string | string[] | undefined>>;
 
 type HkStats = {
   pending: number;
+  doing: number;
   vd: number;
   od: number;
   done_today: number;
+  /** 打扫完成、等主管验收的任务数（第 5 轮 P1-4） */
+  review_pending: number;
 };
 
 type HkTask = {
@@ -23,6 +26,10 @@ type HkTask = {
   room_type_name: string | null;
   task_type: string | null;
   status: string;
+  /** 验收状态：NULL 无需审核 / PENDING_REVIEW / APPROVED / REJECTED（第 5 轮 P1-4） */
+  review_status: string | null;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
   assignee: string | null;
   created_at: string | null;
   note: string | null;
@@ -49,7 +56,7 @@ const TASK_TYPE_CLS: Record<string, string> = {
 const STATUS_OPTIONS: { value: string; label: string }[] = [
   { value: "", label: "全部状态" },
   { value: "PENDING", label: "待打扫" },
-  { value: "DOING", label: "进行中" },
+  { value: "DOING", label: "打扫中" },
   { value: "DONE", label: "已完成" },
   { value: "CANCELLED", label: "已取消" },
 ];
@@ -58,9 +65,22 @@ const STATUS_VALUES = STATUS_OPTIONS.map((o) => o.value);
 /** 任务状态 → 徽标文案/配色 */
 const STATUS_BADGE: Record<string, { label: string; cls: string }> = {
   PENDING: { label: "待打扫", cls: "border-amber-200 bg-amber-50 text-amber-700" },
-  DOING: { label: "进行中", cls: "border-blue-200 bg-blue-50 text-blue-700" },
+  DOING: { label: "打扫中", cls: "border-blue-200 bg-blue-50 text-blue-700" },
   DONE: { label: "已完成", cls: "border-emerald-200 bg-emerald-50 text-emerald-700" },
   CANCELLED: { label: "已取消", cls: "border-gray-200 bg-gray-50 text-gray-500" },
+};
+
+/**
+ * 验收状态 → 徽标文案/配色（第 5 轮 P1-4）
+ *
+ * 与「任务状态」分开渲染：status 是流转（谁在打扫），review_status 是验收。
+ * NULL / APPROVED 不额外显示 （APPROVED 已由 status 的「已完成」表达），
+ * 只有 PENDING_REVIEW（待审）和 REJECTED（打回）需要显眼。
+ */
+const REVIEW_BADGE: Record<string, { label: string; cls: string }> = {
+  PENDING_REVIEW: { label: "待验收", cls: "border-violet-200 bg-violet-50 text-violet-700" },
+  REJECTED: { label: "已打回", cls: "border-rose-200 bg-rose-50 text-rose-700" },
+  APPROVED: { label: "已验收", cls: "border-emerald-200 bg-emerald-50 text-emerald-600" },
 };
 
 /** searchParams 的值可能是数组，取第一个 */
@@ -123,12 +143,15 @@ export default async function HousekeepingPage({ searchParams }: { searchParams:
     get<HkStats>(
       `SELECT
          (SELECT COUNT(*) FROM housekeeping WHERE hotel_id = ? AND status = 'PENDING') AS pending,
+         (SELECT COUNT(*) FROM housekeeping WHERE hotel_id = ? AND status = 'DOING') AS doing,
          (SELECT COUNT(*) FROM rooms WHERE hotel_id = ? AND status = 'VD') AS vd,
          (SELECT COUNT(*) FROM rooms WHERE hotel_id = ? AND status = 'OD') AS od,
          (SELECT COUNT(*) FROM housekeeping
-           WHERE hotel_id = ? AND status = 'DONE' AND date(done_at, 'localtime') = ?) AS done_today`,
-      [hotelId, hotelId, hotelId, hotelId, today]
-    ) ?? { pending: 0, vd: 0, od: 0, done_today: 0 };
+           WHERE hotel_id = ? AND status = 'DONE' AND date(done_at, 'localtime') = ?) AS done_today,
+         (SELECT COUNT(*) FROM housekeeping
+           WHERE hotel_id = ? AND review_status = 'PENDING_REVIEW') AS review_pending`,
+      [hotelId, hotelId, hotelId, hotelId, hotelId, today, hotelId]
+    ) ?? { pending: 0, doing: 0, vd: 0, od: 0, done_today: 0, review_pending: 0 };
 
   /* ---------- 客房任务（按筛选条件拼 WHERE，参数顺序与占位符一致） ---------- */
   const taskWhere: string[] = ["h.hotel_id = ?"];
@@ -148,12 +171,14 @@ export default async function HousekeepingPage({ searchParams }: { searchParams:
 
   const tasks = all<HkTask>(
     `SELECT h.id, h.task_type, h.status, h.assignee, h.created_at, h.note, h.photos,
+            h.review_status, h.reviewed_by, h.reviewed_at,
             r.room_no, rt.name AS room_type_name
      FROM housekeeping h
      LEFT JOIN rooms r ON r.id = h.room_id
      LEFT JOIN room_types rt ON rt.id = r.room_type_id
      WHERE ${taskWhere.join(" AND ")}
-     ORDER BY CASE h.status WHEN 'PENDING' THEN 0 ELSE 1 END, h.created_at DESC, h.id DESC
+     ORDER BY CASE h.status WHEN 'PENDING' THEN 0 WHEN 'DOING' THEN 1 ELSE 2 END,
+              h.created_at DESC, h.id DESC
      LIMIT 50`,
     taskParams
   );
@@ -226,6 +251,20 @@ export default async function HousekeepingPage({ searchParams }: { searchParams:
       tone: "bg-brand-50 text-brand-600",
     },
     {
+      label: "打扫中",
+      value: String(stats.doing),
+      unit: "条",
+      sub: "阿姨已开始打扫",
+      tone: "bg-blue-50 text-blue-600",
+    },
+    {
+      label: "待验收",
+      value: String(stats.review_pending),
+      unit: "条",
+      sub: "打扫完成等主管验收",
+      tone: "bg-violet-50 text-violet-600",
+    },
+    {
       label: "脏房 VD",
       value: String(stats.vd),
       unit: "间",
@@ -237,7 +276,7 @@ export default async function HousekeepingPage({ searchParams }: { searchParams:
       value: String(stats.od),
       unit: "间",
       sub: "退房后转脏房",
-      tone: "bg-violet-50 text-violet-600",
+      tone: "bg-rose-50 text-rose-600",
     },
     {
       label: "已完成今日",
@@ -264,19 +303,20 @@ export default async function HousekeepingPage({ searchParams }: { searchParams:
         <div>
           <h1 className="text-[16px] font-semibold text-gray-900">客房中心</h1>
           <p className="mt-0.5 text-[12px] text-gray-500">
-            今日 {today} · 待打扫 {stats.pending} 条 · 空脏 {stats.vd} 间 · 在住脏房 {stats.od} 间
+            今日 {today} · 待打扫 {stats.pending} 条 · 打扫中 {stats.doing} 条 · 待验收{" "}
+            {stats.review_pending} 条 · 空脏 {stats.vd} 间 · 在住脏房 {stats.od} 间
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <span className="rounded-md border border-gray-200 bg-white px-2.5 py-1 text-[11px] text-gray-500">
-            置净后房态变为空净 VC，可在房态图继续排房
+            打扫完成需主管验收（通过 / 打回重做），验收通过才算这间房彻底收工
           </span>
           {/* 报修：写维修任务 + 房间置 OOO（报告第 10 节） */}
           <MaintenanceModal rooms={maintenanceRooms} />
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
         {cards.map((c) => (
           <div key={c.label} className="card p-4">
             <div className="flex items-center justify-between">
@@ -366,7 +406,7 @@ export default async function HousekeepingPage({ searchParams }: { searchParams:
                   <th className="th text-right">费用</th>
                   <th className="th">状态</th>
                   <th className="th">工作内容</th>
-                  <th className="th">反馈</th>
+                  <th className="th">验收记录</th>
                   <th className="th">操作</th>
                 </tr>
               </thead>
@@ -382,6 +422,17 @@ export default async function HousekeepingPage({ searchParams }: { searchParams:
                   // 维修任务带图片：最多展示 3 张缩略图，剩下的用「+N」表示
                   const thumbs = t.task_type === "维修" ? parsePhotoList(t.photos) : [];
                   const badge = STATUS_BADGE[t.status] ?? STATUS_BADGE.PENDING;
+                  /*
+                   * 验收徽标（第 5 轮 P1-4）：与任务状态分开显示。
+                   * NULL（维修/查房/历史数据）不渲染；APPROVED 只在验收记录列显示验收人和时间，
+                   * 避免一行里挤三个绿色徽标。
+                   */
+                  const reviewBadge =
+                    t.review_status === "PENDING_REVIEW"
+                      ? REVIEW_BADGE.PENDING_REVIEW
+                      : t.review_status === "REJECTED"
+                        ? REVIEW_BADGE.REJECTED
+                        : null;
                   return (
                     <tr key={t.id} className="hover:bg-gray-50">
                       <td className="td text-gray-600">{t.assignee ?? "未指派"}</td>
@@ -405,7 +456,16 @@ export default async function HousekeepingPage({ searchParams }: { searchParams:
                       <td className="td tabular-nums text-gray-500">{fmtTime(t.created_at)}</td>
                       <td className="td text-right tabular-nums text-gray-500">¥0.00</td>
                       <td className="td">
-                        <span className={`rounded border px-1.5 py-0.5 text-[11px] ${badge.cls}`}>{badge.label}</span>
+                        <div className="flex flex-wrap items-center gap-1">
+                          <span className={`rounded border px-1.5 py-0.5 text-[11px] ${badge.cls}`}>
+                            {badge.label}
+                          </span>
+                          {reviewBadge && (
+                            <span className={`rounded border px-1.5 py-0.5 text-[11px] ${reviewBadge.cls}`}>
+                              {reviewBadge.label}
+                            </span>
+                          )}
+                        </div>
                       </td>
                       <td className="td max-w-[260px]">
                         <div className="truncate text-[12px] text-gray-500">{t.note || "打扫卫生,更换布草"}</div>
@@ -425,20 +485,64 @@ export default async function HousekeepingPage({ searchParams }: { searchParams:
                           </div>
                         )}
                       </td>
-                      <td className="td max-w-[160px] truncate text-[12px] text-gray-400">
-                        {t.status === "DONE" ? "已完成" : "—"}
+                      <td className="td max-w-[160px] text-[12px] text-gray-400">
+                        {/* 验收记录：谁在什么时候验的（第 5 轮 P1-4） */}
+                        {t.reviewed_by ? (
+                          <div className="truncate">
+                            {t.reviewed_by}
+                            <span className="ml-1 text-[11px] text-gray-400">{fmtTime(t.reviewed_at)}</span>
+                          </div>
+                        ) : t.status === "DONE" ? (
+                          "已完成"
+                        ) : (
+                          "—"
+                        )}
                       </td>
                       <td className="td">
-                        {t.status === "DONE" ? (
-                          <span className="text-[12px] text-gray-300">—</span>
-                        ) : (
-                          <form action={completeTaskFormAction}>
-                            <input type="hidden" name="taskId" value={t.id} />
-                            <button type="submit" className="btn-primary px-2.5 py-0.5 text-[12px]">
-                              完成
-                            </button>
-                          </form>
-                        )}
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {/* PENDING → DOING：房态页「打扫中」标签的数据来源（第 5 轮 P1-4） */}
+                          {t.status === "PENDING" && (
+                            <form action={startTaskFormAction}>
+                              <input type="hidden" name="taskId" value={t.id} />
+                              <button type="submit" className="btn-default px-2.5 py-0.5 text-[12px]">
+                                开始打扫
+                              </button>
+                            </form>
+                          )}
+                          {(t.status === "PENDING" || t.status === "DOING") && (
+                            <form action={completeTaskFormAction}>
+                              <input type="hidden" name="taskId" value={t.id} />
+                              <button type="submit" className="btn-primary px-2.5 py-0.5 text-[12px]">
+                                完成
+                              </button>
+                            </form>
+                          )}
+                          {/* 验收：通过 / 打回（只对待审任务出现） */}
+                          {t.review_status === "PENDING_REVIEW" && (
+                            <>
+                              <form action={reviewTaskFormAction}>
+                                <input type="hidden" name="taskId" value={t.id} />
+                                <input type="hidden" name="action" value="approve" />
+                                <button type="submit" className="btn-primary px-2.5 py-0.5 text-[12px]">
+                                  验收通过
+                                </button>
+                              </form>
+                              <form action={reviewTaskFormAction}>
+                                <input type="hidden" name="taskId" value={t.id} />
+                                <input type="hidden" name="action" value="reject" />
+                                <button
+                                  type="submit"
+                                  className="btn-default px-2.5 py-0.5 text-[12px] text-rose-600"
+                                >
+                                  打回重做
+                                </button>
+                              </form>
+                            </>
+                          )}
+                          {t.status === "DONE" && t.review_status !== "PENDING_REVIEW" && (
+                            <span className="text-[12px] text-gray-300">—</span>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   );
