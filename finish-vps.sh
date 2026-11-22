@@ -52,11 +52,23 @@ grep -q '^PMS_ALLOW_HTTP=' .env || echo "PMS_ALLOW_HTTP=1" >> .env
 
 # ─────────────── 2. 数据库 ───────────────
 mkdir -p data
-if [ ! -f data/pms.db ]; then
-  log "首次初始化数据库（建表 + 基础配置，不含演示订单）"
+# 判断「是否真的初始化过」，不能只看文件存不存在（VPS 上踩过这个坑）。
+#
+# npm run build 时 db.ts 会 new DatabaseSync(DB_FILE)，SQLite 会立刻创建
+# 一个 4KB 的空库文件（里面一张表都没有）。于是：
+#   [ -f data/pms.db ] 为真 → 跳过 init-db → migrate-all 在空库上跑 →
+#   Error: no such table: channel_orders
+#
+# 正确判据是「有多少张表」。init-db 建完 80+ 张，空库 0 张，
+# 用 10 作阈值足够区分，也不会因为个别表缺失就误删已有数据。
+# 用 node 数表（sqlite3 CLI 不一定装过；node 是硬前提）
+TABLE_COUNT=$(node scripts/db-table-count.mjs 2>/dev/null || echo 0)
+if [ "${TABLE_COUNT:-0}" -lt 10 ]; then
+  log "数据库为空或未初始化（${TABLE_COUNT:-0} 张表），重新建库"
+  rm -f data/pms.db data/pms.db-wal data/pms.db-shm
   node scripts/init-db.mjs
 else
-  log "数据库已存在（$(du -h data/pms.db | cut -f1)），跳过初始化"
+  log "数据库已初始化（${TABLE_COUNT} 张表），跳过建库"
 fi
 
 log "执行幂等迁移"
