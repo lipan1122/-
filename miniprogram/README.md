@@ -20,12 +20,25 @@ miniprogram/
 ├── utils/
 │   ├── api.js                    // 请求封装：BASE_URL、token、错误处理
 │   └── date.js                   // 日期工具（避开 iOS 的 UTC 解析坑）
-└── pages/
+└── pages/                        // 18 个页面，见「五、页面清单」
     ├── index/                    // 首页：查房 + 房型列表
     ├── booking/                  // 下单页
     ├── orders/                   // 我的订单
+    ├── order-detail/             // 订单详情
+    ├── pre-stay/                 // 到店前须知
+    ├── in-stay/                  // 在住
+    ├── folio/                    // 账单明细
+    ├── extend/                   // 续住申请
+    ├── change-room/              // 换房申请
+    ├── late-checkout/            // 延迟退房
+    ├── services/                 // 服务请求
+    ├── room-detail/              // 房型详情
     ├── member/                   // 会员中心
-    └── bind/                     // 绑定手机号
+    ├── wallet/                   // 储值钱包
+    ├── invoices/                 // 发票
+    ├── notifications/            // 通知
+    ├── bind/                     // 绑定手机号
+    └── contact/                  // 联系酒店
 ```
 
 每个页面目录都有 `.wxml` / `.js` / `.json` / `.wxss` 四个文件。
@@ -120,38 +133,101 @@ const BASE_URL = 'http://127.0.0.1:3100';
 
 ---
 
-## 五、接口清单
+## 五、页面清单（18 个）
 
-所有接口统一返回 `{ ok, data?, error?, code? }`，全部 `no-store`。
+`app.json` 里注册的全部页面：
 
-| 方法 | 路径 | 鉴权 | 说明 |
-| --- | --- | --- | --- |
-| POST | `/api/mini/login` | 无 | body `{ code }`，换 token（7 天） |
-| GET | `/api/mini/rooms?checkIn=&checkOut=` | 无 | 房型 + 剩余房量 + 价格 |
-| POST | `/api/mini/bookings` | Bearer | body `{ roomTypeId, checkInDate, checkOutDate, roomCount, guestName, mobile, remark? }` |
-| GET | `/api/mini/bookings` | Bearer | 我的订单（按 guest_id 或手机号匹配） |
-| POST | `/api/mini/bind` | Bearer | body `{ mobile, guestName }`，绑定 / 新建客史 |
-| GET | `/api/mini/member` | Bearer | 等级 / 储值余额 / 积分 / 累计消费 |
-
-鉴权头：`Authorization: Bearer <token>`（token 由 `/api/mini/login` 下发，有效期 7 天）。
-
-### 错误码
-
-| code | HTTP | 含义 / 处理 |
+| 页面 | 路径 | 作用 |
 | --- | --- | --- |
-| `NOT_CONFIGURED` | 200 | 管理员还没填 AppID/AppSecret 或未启用 → 去「设置 → 小程序配置」 |
-| `AUTH_FAILED` | 200 | 微信返回错误（code 无效 / AppSecret 错 / 频率限制），`error` 里是中文原因 |
-| `NETWORK` | 200 | 服务器调不通微信接口，或小程序调不通服务器（检查域名白名单 / 证书） |
-| `UNAUTHORIZED` | 401 | token 无效或过期 → 清本地 token 重新登录（`api.js` 已自动对 GET 重试一次） |
-| `NOT_BOUND` | 200 | 还没绑定手机号（会员中心据此显示「去绑定」） |
-| `ROOM_NOT_ENOUGH` | 200 | 该区间房量不足（并发下单也会在这里被挡住） |
-| `BAD_REQUEST` | 400 | 参数不合法（日期格式 / 手机号 / 间数） |
-
-房量口径：`物理房间数 − 该区间在住 − 该区间已排预订 − 维修房`（与 PC 端「房型可售预测」一致）。
+| 首页 | `pages/index` | 查房入口、活动、快捷入口 |
+| 预订 | `pages/booking` | 选房型 / 日期 / 间数 / 客人信息，提交下单 |
+| 订单列表 | `pages/orders` | 我的订单（待入住 / 在住 / 已完成 / 已取消） |
+| 订单详情 | `pages/order-detail` | 单笔订单详情 + 取消 / 修改入口 |
+| 预抵信息 | `pages/pre-stay` | 到店前须知（地址 / 入离时间 / 押金说明） |
+| 在住 | `pages/in-stay` | 当前在住：房号 / 离店日 / 账单余额 / 快捷服务 |
+| 账单 | `pages/folio` | 账单明细（房费 / 消费 / 已付 / 余额） |
+| 续住 | `pages/extend` | 续住申请（选新离店日，服务端校验远期冲突） |
+| 换房 | `pages/change-room` | 换房申请（选目标房型，服务端校验归属） |
+| 延迟退房 | `pages/late-checkout` | 延迟退房申请 |
+| 服务 | `pages/services` | 服务请求（送物 / 维修 / 叫醒 / 其他） |
+| 房型详情 | `pages/room-detail` | 单房型图片、设施、价格日历 |
+| 会员 | `pages/member` | 等级 / 积分 / 累计消费 |
+| 钱包 | `pages/wallet` | 储值余额与流水 |
+| 发票 | `pages/invoices` | 我的发票（开具 / 查看） |
+| 通知 | `pages/notifications` | 系统通知与消息 |
+| 绑定 | `pages/bind` | 手机号 + 姓名绑定客史 |
+| 联系 | `pages/contact` | 联系酒店（电话 / 地址 / 地图） |
 
 ---
 
-## 六、常见问题
+## 六、接口清单（28 个路由）
+
+所有接口统一返回 `{ ok, data?, error?, code? }`，全部 `no-store`。
+鉴权头：`Authorization: Bearer <token>`（token 由 `/api/mini/login` 下发，有效期 7 天）。
+
+### 6.1 登录与账号
+
+| 方法 | 路径 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| POST | `/api/mini/login` | 无 | body `{ code }`，换 token |
+| POST | `/api/mini/logout` | Bearer | 注销当前 token |
+| POST | `/api/mini/bind` | Bearer | body `{ mobile, guestName }`，绑定 / 新建客史 |
+| POST | `/api/mini/member/unbind` | Bearer | 解绑 |
+| GET | `/api/mini/member` | Bearer | 等级 / 储值余额 / 积分 / 累计消费 |
+| GET | `/api/mini/member/ledger` | Bearer | 储值流水 |
+
+### 6.2 房型与酒店信息（匿名，客人未登录也要能看）
+
+| 方法 | 路径 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/api/mini/rooms?checkIn=&checkOut=` | 无（有限流） | 房型 + 剩余房量 + 价格 |
+| GET | `/api/mini/room-types/[id]` | 无 | 单房型详情 |
+| GET | `/api/mini/hotel` | 无 | 酒店基础信息（名称/地址/电话/入离时间/押金说明，**不返回经营数据**） |
+
+### 6.3 订单
+
+| 方法 | 路径 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| POST | `/api/mini/bookings` | Bearer | 下单（`request_id` 幂等） |
+| GET | `/api/mini/bookings` | Bearer | 我的订单列表 |
+| GET | `/api/mini/bookings/[id]` | Bearer | 单笔详情（**校验归属**） |
+| POST | `/api/mini/bookings/[id]/cancel` | Bearer | 取消（**校验归属**） |
+| POST | `/api/mini/bookings/[id]/modify` | Bearer | 修改（**校验归属**） |
+
+### 6.4 在住服务
+
+| 方法 | 路径 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/api/mini/stays/current` | Bearer | 当前在住（**校验归属**） |
+| GET | `/api/mini/stays/[id]/folio` | Bearer | 账单明细（**校验归属**） |
+| POST | `/api/mini/stays/[id]/extend` | Bearer | 续住（校验远期冲突） |
+| POST | `/api/mini/stays/[id]/change-room` | Bearer | 换房申请 |
+| POST | `/api/mini/stays/[id]/late-checkout` | Bearer | 延迟退房 |
+| POST | `/api/mini/stays/[id]/service` | Bearer | 服务请求 |
+| POST | `/api/mini/stays/[id]/wakeup` | Bearer | 叫醒 |
+
+### 6.5 服务工单
+
+| 方法 | 路径 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/api/mini/service-orders` | Bearer | 我的服务请求列表 |
+| POST | `/api/mini/service-orders/[id]/cancel` | Bearer | 取消（**校验归属**） |
+
+### 6.6 其他
+
+| 方法 | 路径 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/api/mini/breakfast` | Bearer | 早餐购买情况 |
+| GET | `/api/mini/invoices` | Bearer | 我的发票（**校验归属**） |
+| GET | `/api/mini/notifications` | Bearer | 通知列表 |
+| POST | `/api/mini/notifications/read` | Bearer | 标记已读 |
+
+> **「校验归属」** 指接口会校验「这个订单 / 入住单 / 发票是不是当前 token 对应的那个客人」。
+> 缺了它就能按 id 枚举别人的数据（IDOR）。`scripts/test-mini-order-access.mjs` 的 100 条断言在守这条线。
+
+---
+
+## 七、常见问题
 
 **Q：登录报「小程序未配置」**
 A：PMS → 设置 → 小程序配置里 AppID/AppSecret 没填，或「启用」没勾。
@@ -174,7 +250,7 @@ A：没绑定手机号时，订单按小程序用户上留的手机号匹配；�
 
 ---
 
-## 七、安全提醒（务必看）
+## 八、安全提醒（务必看）
 
 1. **AppSecret 绝不能写进小程序代码**。小程序包是可以被反编译的，密钥只放在 PMS 服务端（`mini_program_config` 表）。
 2. 本目录里所有 appid 都是占位符 `wx0000000000000000`，**不要把真实 AppID/Secret 提交进 git**。
@@ -184,18 +260,37 @@ A：没绑定手机号时，订单按小程序用户上留的手机号匹配；�
 
 ---
 
-## 八、服务端自测
+## 九、服务端自测
 
-服务端有一套验收脚本（表结构 / 登录未配置分支 / token 过期 / 房量算法 / 目录结构 / 密钥泄露扫描）：
+服务端有 **6 套**验收脚本，全部真开数据库 / 真调路由：
 
 ```bash
-node scripts/test-miniprogram.mjs
-# 期望输出：通过 N / 失败 0
+node scripts/test-miniprogram-pages.mjs          # 78 项：18 个页面四件套齐全 + app.json 注册一致
+node scripts/test-miniprogram.mjs                # 82 项：表结构 / 登录未配置分支 / token / 房量 / 密钥泄露
+node scripts/test-mini-order-access.mjs          # 100 项：订单归属校验（防 IDOR）
+node scripts/test-mini-bind-security.mjs         # 66 项：绑定安全（手机号 / 姓名 / 重复绑定）
+node scripts/test-mini-booking-idempotency.mjs   # 47 项：下单幂等（同 request_id 只产生一笔）
+node scripts/test-mini-service-orders.mjs        # 68 项：服务请求幂等 + 归属
 ```
+
+每套都应输出 `通过 N / 失败 0`。
+
+> 这些测试要求 `.tmp` 目录可写（它们会 `VACUUM INTO` 出副本库）。
+> 如果在 Windows 上遇到 `EPERM` / `unable to open database file`，
+> 先确认项目根下的 `.tmp/` 有写权限，不要把它当「测试通过」。
 
 数据表由迁移脚本创建，老库升级跑一次即可（幂等）：
 
 ```bash
 node scripts/migrate-all.mjs
 ```
+
+### 还没做的验证（必须有真机才能做）
+
+| 项 | 为什么做不了 |
+| --- | --- |
+| 微信开发者工具编译 | 需要本机装开发者工具并登录 |
+| 真机 HTTPS / 合法域名 | 需要已备案域名 + 小程序后台配置 |
+| 断网重试 / token 过期真机表现 | 需要在真机上操作 |
+| 小程序真机下单全链路 | 需要真实 AppID / AppSecret |
 
