@@ -81,14 +81,13 @@ if (roomTypes.length === 0) {
 }
 
 /*
- * 每个房型挑可用房间
+ * 可用房间：排除三类
  *
- * ⚠️ 必须排除两类，否则会造出「一间房两张在住单」的脏数据：
  *   1. OOO(维修) / LOCK(锁房) —— 不能卖
  *   2. **已经有 INHOUSE 在住单的房间** —— 这间房现在有客人
- *
- * 上一版只排除了第 1 类，结果 2 张 DEMO 在住单落在了 8402/8503
- * （那两间本来就有 SI1111 / SI6001 在住），房态页出现「一间房两个客人」。
+ *   3. **挂着 PENDING 打扫任务的房间** —— 说明它刚从脏态出来还没打扫完，
+ *      造在住单占上去会让 test-checkin-rules 的
+ *      「在住房间没有残留待打扫任务」直接红
  */
 const roomsByType = new Map();
 for (const rt of roomTypes) {
@@ -99,6 +98,7 @@ for (const rt of roomTypes) {
         WHERE r.hotel_id = ? AND r.room_type_id = ?
           AND r.status NOT IN ('OOO','LOCK')
           AND NOT EXISTS (SELECT 1 FROM stays s WHERE s.room_id = r.id AND s.status = 'INHOUSE')
+          AND NOT EXISTS (SELECT 1 FROM housekeeping h WHERE h.room_id = r.id AND h.status = 'PENDING')
         ORDER BY r.id`,
       [HOTEL, rt.id]
     )
@@ -106,8 +106,24 @@ for (const rt of roomTypes) {
 }
 
 const channels = all(`SELECT id, name FROM channels WHERE hotel_id = ? ORDER BY id`, [HOTEL]);
-const guests = all(`SELECT id, name, mobile FROM guests WHERE hotel_id = ? ORDER BY id`, [HOTEL]);
-if (guests.length === 0) {
+
+/*
+ * 可用的客人：排除**已经有在住单的**
+ *
+ * 不排除会撞出「同一证件号 2 张在住单」（test-checkin-rules 的硬断言）。
+ * 上一版真撞了：SI1107 杨燕茨 + DEMO-H1 杨燕茨、SI1104 邹敏 + DEMO-H2 邹敏。
+ */
+const guests = all(
+  `SELECT id, name, mobile FROM guests g
+    WHERE g.hotel_id = ?
+      AND NOT EXISTS (SELECT 1 FROM stays s WHERE s.guest_id = g.id AND s.status = 'INHOUSE')
+    ORDER BY g.id`,
+  [HOTEL]
+);
+/* 万一全被占了（极端情况），退回全部客人 —— 宁可撞也不能造不出数据 */
+const guestsAll = all(`SELECT id, name, mobile FROM guests WHERE hotel_id = ? ORDER BY id`, [HOTEL]);
+const guestPool = guests.length > 0 ? guests : guestsAll;
+if (guestPool.length === 0) {
   console.error("❌ 没有客史，请先导入基础数据");
   process.exit(1);
 }
@@ -209,7 +225,13 @@ for (let n = 0; n <= DAYS; n++) {
     }
     if (!rt) continue; // 全店一个空房都没有（正常营业时不会发生）
     const room = pool[(n * 3 + p.idx) % pool.length];
-    const guest = guests[(n * 5 + p.idx) % guests.length];
+    /*
+     * 客人：每张单必须**不同**（同一证件号 2 张在住单会被 test-checkin-rules 判红）
+     *
+     * 用 `(n*3 + idx)`：同一天内 idx 0/1/2 落在 3 个不同偏移，
+     * 且跨天的偏移步长是 3（和每天的计划数一致），不会撞回同一客人。
+     */
+    const guest = guestPool[(n * 3 + p.idx) % guestPool.length];
     const channel = channels.length ? channels[(n + p.idx) % channels.length] : null;
     const rate = Number(rt.base_price ?? 300);
     const nights = 1 + ((n + p.idx) % 3); // 1~3 晚
@@ -233,9 +255,9 @@ for (let n = 0; n <= DAYS; n++) {
             guest.id,
             guest.name,
             guest.mobile ?? null,
-            `${day} 14:00:00`,
+            `${day}T14:0${p.idx}:00`,
             outDay,
-            `${outDay} 12:00:00`,
+            `${outDay}T12:00:00`,
             nights,
             rate,
             /*
@@ -259,27 +281,27 @@ for (let n = 0; n <= DAYS; n++) {
         run(
           `INSERT INTO folios (hotel_id, folio_no, stay_id, guest_name, room_no, total_amount, paid_amount, balance, status, created_at, settled_at)
            VALUES (?,?,?,?,?,?,?,?, 'SETTLED', ?, ?)`,
-          [HOTEL, folioNo, stayId, guest.name, room.room_no, total, total, 0, `${outDay} 12:05:00`, `${outDay} 12:05:00`]
+          [HOTEL, folioNo, stayId, guest.name, room.room_no, total, total, 0, `${outDay}T12:05:00`, `${outDay}T12:05:00`]
         );
         const folioId = one(`SELECT id FROM folios WHERE folio_no = ?`, [folioNo]).id;
 
         run(
           `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at)
            VALUES (?,?, 'ROOM', ?, ?, ?, ?, ?, ?)`,
-          [HOTEL, folioId, `房费 ${nights} 晚`, nights, rate, roomFee, day, `${day} 14:05:00`]
+          [HOTEL, folioId, `房费 ${nights} 晚`, nights, rate, roomFee, day, `${day}T14:0${p.idx}:30`]
         );
         if (otherFee > 0) {
           run(
             `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at)
              VALUES (?,?, 'OTHER', '其他消费', 1, ?, ?, ?, ?)`,
-            [HOTEL, folioId, otherFee, otherFee, day, `${day} 20:00:00`]
+            [HOTEL, folioId, otherFee, otherFee, day, `${day}T20:00:00`]
           );
         }
 
         run(
           `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, operator, kind)
            VALUES (?,?,?,?,?,?,?,?,?, '演示数据', 'ROOM_PAYMENT')`,
-          [HOTEL, folioId, stayId, `DEMO-P-${day}-${p.idx + 1}-${stamp}`, "现金", total, day, "退房结账", `${outDay} 12:05:00`]
+          [HOTEL, folioId, stayId, `DEMO-P-${day}-${p.idx + 1}-${stamp}`, "现金", total, day, "退房结账", `${outDay}T12:05:00`]
         );
 
         created.stays++;
@@ -289,8 +311,8 @@ for (let n = 0; n <= DAYS; n++) {
 
         /* ---- 预订：已退房（走完整个生命周期） ---- */
         run(
-          `INSERT INTO bookings (hotel_id, booking_no, guest_name, mobile, room_type_id, check_in_date, check_out_date, room_count, status, channel_id, created_at)
-           VALUES (?,?,?,?,?,?,?,1,'CHECKED_OUT',?,?)`,
+          `INSERT INTO bookings (hotel_id, booking_no, guest_name, mobile, room_type_id, check_in_date, check_out_date, room_count, nights, status, channel_id, created_at)
+           VALUES (?,?,?,?,?,?,?,1,?,'CHECKED_OUT',?,?)`,
           [
             HOTEL,
             `DEMO-${day}-B${p.idx + 1}-${stamp}`,
@@ -299,22 +321,45 @@ for (let n = 0; n <= DAYS; n++) {
             rt.id,
             day,
             outDay,
+            nights,
             channel?.id ?? null,
-            `${shift(day, -3)} 10:00:00`,
+            `${shift(day, -3)}T10:00:00`,
           ]
         );
         created.bookings++;
+        /*
+         * 补房间明细（booking_rooms）
+         *
+         * `test-booking-rooms` 要求「每条有效预订都有房间明细」，
+         * 缺了会导致两个红灯：
+         *   · test-booking-rooms「每条有效预订都有房间明细」
+         *   · test-booking-p1「migrate-all --check 已是目标状态」
+         *     （migrate-all 有一段迁移专门「为 N 条预订补 N 条房间明细」，缺明细就会报待处理）
+         *
+         * 真实预订一定有这一行；DEMO 预订也必须补。
+         */
+        const bkId = one(`SELECT id FROM bookings WHERE booking_no = ?`, [`DEMO-${day}-B${p.idx + 1}-${stamp}`])?.id;
+        if (bkId) {
+          run(
+            `INSERT INTO booking_rooms (hotel_id, booking_id, room_type_id, room_id, guest_name, mobile, rate, status, check_in_date, check_out_date, guest_id, created_at)
+             VALUES (?,?,?,NULL,?,?,?, 'CHECKED_OUT', ?,?,?, ?)`,
+            [HOTEL, bkId, rt.id, guest.name, guest.mobile, rate, day, outDay, guest.id, new Date().toISOString()]
+          );
+        }
       } else if (p.kind === "inhouse") {
         /*
          * ---- 在住（只造「今天」这一批）----
          *
          * 三笔全部**今天入住**（这样押金流水的 biz_date 就是今天，报表有数）：
-         *   第 0 笔：今天入住 + 今天预离 → 房态页「今日预离」能看到
-         *   第 1 笔：今天入住 + 明天离店
-         *   第 2 笔：今天入住 + 后天离店
+         *   第 0 笔：明天离店（**不能是今天** —— ci == co 是非法区间，
+         *            test-room-availability 会抓「所有在住单的日期区间自身合法 ci < co」）
+         *   第 1 笔：+2 天
+         *   第 2 笔：+3 天
+         *
+         * 「今日预离」由**已有数据**覆盖就够了，不能靠造非法区间来凑。
          */
         const checkIn = today;
-        const checkOut = p.idx === 0 ? today : shift(today, p.idx);
+        const checkOut = shift(today, 1 + p.idx);
         const stayNo = `DEMO-${day}-H${p.idx + 1}-${stamp}`;
         const deposit = round2(rate * nights);
 
@@ -328,7 +373,7 @@ for (let n = 0; n <= DAYS; n++) {
             guest.id,
             guest.name,
             guest.mobile ?? null,
-            `${checkIn} 14:00:00`,
+            `${checkIn}T14:1${p.idx}:00`,
             checkOut,
             nights,
             rate,
@@ -346,23 +391,23 @@ for (let n = 0; n <= DAYS; n++) {
         run(
           `INSERT INTO folios (hotel_id, folio_no, stay_id, guest_name, room_no, total_amount, paid_amount, balance, status, created_at)
            VALUES (?,?,?,?,?,?,?,?, 'OPEN', ?)`,
-          [HOTEL, folioNo, stayId, guest.name, room.room_no, roomFee, roomFee, 0, `${checkIn} 14:05:00`]
+          [HOTEL, folioNo, stayId, guest.name, room.room_no, roomFee, roomFee, 0, `${checkIn}T14:1${p.idx}:30`]
         );
         const folioId = one(`SELECT id FROM folios WHERE folio_no = ?`, [folioNo]).id;
         run(
           `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at)
            VALUES (?,?, 'ROOM', ?, ?, ?, ?, ?, ?)`,
-          [HOTEL, folioId, `房费 ${nights} 晚`, nights, rate, roomFee, checkIn, `${checkIn} 14:05:00`]
+          [HOTEL, folioId, `房费 ${nights} 晚`, nights, rate, roomFee, checkIn, `${checkIn}T14:1${p.idx}:30`]
         );
         run(
           `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at)
            VALUES (?,?, 'DEPOSIT', '押金', 1, ?, ?, ?, ?)`,
-          [HOTEL, folioId, deposit, deposit, checkIn, `${checkIn} 14:06:00`]
+          [HOTEL, folioId, deposit, deposit, checkIn, `${checkIn}T14:1${p.idx}:45`]
         );
         run(
           `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, operator, kind)
            VALUES (?,?,?,?,?,?,?,?,?, '演示数据', 'DEPOSIT')`,
-          [HOTEL, folioId, stayId, `DEMO-HP-${day}-${p.idx + 1}-${stamp}`, "现金", deposit, checkIn, "预收款（押金）", `${checkIn} 14:06:00`]
+          [HOTEL, folioId, stayId, `DEMO-HP-${day}-${p.idx + 1}-${stamp}`, "现金", deposit, checkIn, "预收款（押金）", `${checkIn}T14:1${p.idx}:45`]
         );
 
         created.stays++;
@@ -378,8 +423,8 @@ for (let n = 0; n <= DAYS; n++) {
          * 也可以直接在前台「办理入住」里选它测试，不用自己新建预订。
          */
         run(
-          `INSERT INTO bookings (hotel_id, booking_no, guest_name, mobile, room_type_id, check_in_date, check_out_date, room_count, status, channel_id, created_at, remark)
-           VALUES (?,?,?,?,?,?,?,1,'CONFIRMED',?,?, '演示数据·今日预抵')`,
+          `INSERT INTO bookings (hotel_id, booking_no, guest_name, mobile, room_type_id, check_in_date, check_out_date, room_count, nights, status, channel_id, created_at, remark)
+           VALUES (?,?,?,?,?,?,?,1,?,'CONFIRMED',?,?, '演示数据·今日预抵')`,
           [
             HOTEL,
             `DEMO-${day}-AR${p.idx + 1}-${stamp}`,
@@ -388,11 +433,21 @@ for (let n = 0; n <= DAYS; n++) {
             rt.id,
             today,
             shift(today, nights),
+            nights,
             channel?.id ?? null,
-            `${today} 08:30:00`,
+            `${today}T08:30:00`,
           ]
         );
         created.bookings++;
+        /* 今日预抵也要有房间明细（同「已退房」分支的理由） */
+        const arId = one(`SELECT id FROM bookings WHERE booking_no = ?`, [`DEMO-${day}-AR${p.idx + 1}-${stamp}`])?.id;
+        if (arId) {
+          run(
+            `INSERT INTO booking_rooms (hotel_id, booking_id, room_type_id, room_id, guest_name, mobile, rate, status, check_in_date, check_out_date, guest_id, created_at)
+             VALUES (?,?,?,NULL,?,?,?, 'CONFIRMED', ?,?,?, ?)`,
+            [HOTEL, arId, rt.id, guest.name, guest.mobile, rate, today, shift(today, nights), guest.id, new Date().toISOString()]
+          );
+        }
       } else {
         /*
          * ---- 未来预订：每天 1 条，分散到「今天 + 3 + n」----
@@ -402,8 +457,8 @@ for (let n = 0; n <= DAYS; n++) {
          */
         const arrivals = shift(today, 3 + n);
         run(
-          `INSERT INTO bookings (hotel_id, booking_no, guest_name, mobile, room_type_id, check_in_date, check_out_date, room_count, status, channel_id, created_at)
-           VALUES (?,?,?,?,?,?,?,1,'CONFIRMED',?,?)`,
+          `INSERT INTO bookings (hotel_id, booking_no, guest_name, mobile, room_type_id, check_in_date, check_out_date, room_count, nights, status, channel_id, created_at)
+           VALUES (?,?,?,?,?,?,?,1,?,'CONFIRMED',?,?)`,
           [
             HOTEL,
             `DEMO-${day}-BQ${p.idx + 1}-${stamp}`,
@@ -412,11 +467,21 @@ for (let n = 0; n <= DAYS; n++) {
             rt.id,
             arrivals,
             shift(arrivals, nights),
+            nights,
             channel?.id ?? null,
-            `${day} 09:30:00`,
+            `${day}T09:30:00`,
           ]
         );
         created.bookings++;
+        /* 未来预订也要有房间明细（同「已退房」分支的理由） */
+        const bqId = one(`SELECT id FROM bookings WHERE booking_no = ?`, [`DEMO-${day}-BQ${p.idx + 1}-${stamp}`])?.id;
+        if (bqId) {
+          run(
+            `INSERT INTO booking_rooms (hotel_id, booking_id, room_type_id, room_id, guest_name, mobile, rate, status, check_in_date, check_out_date, guest_id, created_at)
+             VALUES (?,?,?,NULL,?,?,?, 'CONFIRMED', ?,?,?, ?)`,
+            [HOTEL, bqId, rt.id, guest.name, guest.mobile, rate, arrivals, shift(arrivals, nights), guest.id, new Date().toISOString()]
+          );
+        }
       }
 
       db.exec("COMMIT");

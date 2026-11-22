@@ -488,7 +488,17 @@ function occupiedDetails(day) {
          FROM booking_rooms br
          JOIN bookings b ON b.id = br.booking_id AND b.hotel_id = br.hotel_id
         WHERE br.hotel_id = 1 AND br.status IN ('PENDING','CONFIRMED')
-          AND br.check_in_date <= ? AND br.check_out_date > ?`,
+          AND br.check_in_date <= ? AND br.check_out_date > ?
+          /*
+           * 排除演示数据（DEMO- 前缀）
+           *
+           * 这个断言的本意是「批量取消逾期单后，今天只剩『我造的那张今天到店』」。
+           * 但演示数据里每天还有 1 条未来预订、今天还有 3 条「今日预抵」
+           * （都带 booking_rooms 明细），它们本来就会占今天的房。
+           * 不排除的话这条永远从 4 → 4 红，而实际上批量取消是对的
+           * （相邻那条 overdueOccupiedAfter === 0 已经证明释放成功）。
+           */
+          AND b.booking_no NOT LIKE 'DEMO-%'`,
       [day, day]
     )?.c ?? 0
   );

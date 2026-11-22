@@ -42,6 +42,49 @@ function shiftDay(day: string, n: number): string {
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
+/**
+ * 给一张 DEMO 预订补一条房间明细（booking_rooms）
+ *
+ * `test-booking-rooms` 要求「每条有效预订都有房间明细」，缺了会红两个测试：
+ *   · test-booking-rooms「每条有效预订都有房间明细」
+ *   · test-booking-p1「migrate-all --check 已是目标状态」
+ *     （migrate-all 有一段迁移专门「为 N 条预订补 N 条房间明细」，缺明细就报待处理）
+ *
+ * 真实预订一定有这一行，DEMO 预订也必须补。
+ */
+function addBookingRooms(opts: {
+  hotelId: number;
+  bookingNo: string;
+  roomTypeId: number;
+  guestName: string;
+  mobile: string | null;
+  guestId: number;
+  rate: number;
+  status: string;
+  checkIn: string;
+  checkOut: string;
+}): void {
+  const bk = get<{ id: number }>(`SELECT id FROM bookings WHERE booking_no = ?`, [opts.bookingNo]);
+  if (!bk) return;
+  run(
+    `INSERT INTO booking_rooms (hotel_id, booking_id, room_type_id, room_id, guest_name, mobile, rate, status, check_in_date, check_out_date, guest_id, created_at)
+     VALUES (?,?,?,NULL,?,?,?, ?,?,?,?, ?)`,
+    [
+      opts.hotelId,
+      bk.id,
+      opts.roomTypeId,
+      opts.guestName,
+      opts.mobile,
+      opts.rate,
+      opts.status,
+      opts.checkIn,
+      opts.checkOut,
+      opts.guestId,
+      new Date().toISOString(),
+    ]
+  );
+}
+
 export type SeedResult = {
   ok?: string;
   error?: string;
@@ -85,9 +128,11 @@ export function seedUniformDemo(hotelId: number, days = 60, force = false): Seed
   if (roomTypes.length === 0) return { ...res, error: "还没有房型，请先导入基础数据（房间/房型）" };
 
   /*
-   * 可用房间：排除 OOO/LOCK，也**排除已有在住单的房间**
-   *
-   * 不排除后者会造出「一间房两张在住单」（8402/8503 曾经就是这样）。
+   * 可用房间：排除三类
+   *   1. OOO(维修) / LOCK(锁房)
+   *   2. 已有 INHOUSE 在住单的房间
+   *   3. **挂着 PENDING 打扫任务的房间** —— 说明刚退房还没打扫完，
+   *      造在住单占上去会让 test-checkin-rules 的「在住房间没有残留待打扫任务」红
    */
   const roomsByType = new Map<number, { id: number; room_no: string }[]>();
   for (const rt of roomTypes) {
@@ -98,6 +143,7 @@ export function seedUniformDemo(hotelId: number, days = 60, force = false): Seed
           WHERE r.hotel_id = ? AND r.room_type_id = ?
             AND r.status NOT IN ('OOO','LOCK')
             AND NOT EXISTS (SELECT 1 FROM stays s WHERE s.room_id = r.id AND s.status = 'INHOUSE')
+            AND NOT EXISTS (SELECT 1 FROM housekeeping h WHERE h.room_id = r.id AND h.status = 'PENDING')
           ORDER BY r.id`,
         [hotelId, rt.id]
       )
@@ -108,10 +154,23 @@ export function seedUniformDemo(hotelId: number, days = 60, force = false): Seed
     `SELECT id, name FROM channels WHERE hotel_id = ? ORDER BY id`,
     [hotelId]
   );
-  const guests = all<{ id: number; name: string; mobile: string | null }>(
+  /*
+   * 可用客人：排除**已经有在住单的**
+   *
+   * 不排除会撞出「同一证件号 2 张在住单」（test-checkin-rules 的硬断言）。
+   */
+  const guestsInhouseFree = all<{ id: number; name: string; mobile: string | null }>(
+    `SELECT g.id, g.name, g.mobile FROM guests g
+      WHERE g.hotel_id = ?
+        AND NOT EXISTS (SELECT 1 FROM stays s WHERE s.guest_id = g.id AND s.status = 'INHOUSE')
+      ORDER BY g.id`,
+    [hotelId]
+  );
+  const guestsAll = all<{ id: number; name: string; mobile: string | null }>(
     `SELECT id, name, mobile FROM guests WHERE hotel_id = ? ORDER BY id`,
     [hotelId]
   );
+  const guests = guestsInhouseFree.length > 0 ? guestsInhouseFree : guestsAll;
   if (guests.length === 0) return { ...res, error: "还没有客史，请先导入基础数据（客人档案）" };
 
   for (let n = 0; n <= days; n++) {
@@ -160,7 +219,11 @@ export function seedUniformDemo(hotelId: number, days = 60, force = false): Seed
       if (!rt) continue;
 
       const room = pool[(n * 3 + p.idx) % pool.length];
-      const guest = guests[(n * 5 + p.idx) % guests.length];
+      /*
+       * 客人：每张单必须不同（同一证件号 2 张在住单会被 test-checkin-rules 判红）
+       * 用 (n*3 + idx)：同一天内 idx 0/1/2 落在 3 个不同偏移。
+       */
+      const guest = guests[(n * 3 + p.idx) % guests.length];
       const channel = channels.length ? channels[(n + p.idx) % channels.length] : null;
       const rate = Number(rt.base_price ?? 300);
       const nights = 1 + ((n + p.idx) % 3);
@@ -182,9 +245,9 @@ export function seedUniformDemo(hotelId: number, days = 60, force = false): Seed
                 guest.id,
                 guest.name,
                 guest.mobile,
-                `${day} 14:00:00`,
+                `${day}T14:0${p.idx}:00`,
                 outDay,
-                `${outDay} 12:00:00`,
+                `${outDay}T12:00:00`,
                 nights,
                 rate,
                 channel?.id ?? null,
@@ -196,30 +259,30 @@ export function seedUniformDemo(hotelId: number, days = 60, force = false): Seed
             run(
               `INSERT INTO folios (hotel_id, folio_no, stay_id, guest_name, room_no, total_amount, paid_amount, balance, status, created_at, settled_at)
                VALUES (?,?,?,?,?,?,?,0, 'SETTLED', ?, ?)`,
-              [hotelId, folioNo, stayId, guest.name, room.room_no, total, total, `${outDay} 12:05:00`, `${outDay} 12:05:00`]
+              [hotelId, folioNo, stayId, guest.name, room.room_no, total, total, `${outDay}T12:05:00`, `${outDay}T12:05:00`]
             );
             const folioId = Number(get<{ id: number }>(`SELECT id FROM folios WHERE folio_no = ?`, [folioNo])?.id);
 
             run(
               `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at)
                VALUES (?,?, 'ROOM', ?, ?, ?, ?, ?, ?)`,
-              [hotelId, folioId, `房费 ${nights} 晚`, nights, rate, roomFee, day, `${day} 14:05:00`]
+              [hotelId, folioId, `房费 ${nights} 晚`, nights, rate, roomFee, day, `${day}T14:0${p.idx}:30`]
             );
             if (otherFee > 0) {
               run(
                 `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at)
                  VALUES (?,?, 'OTHER', '其他消费', 1, ?, ?, ?, ?)`,
-                [hotelId, folioId, otherFee, otherFee, day, `${day} 20:00:00`]
+                [hotelId, folioId, otherFee, otherFee, day, `${day}T20:00:00`]
               );
             }
             run(
               `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, operator, kind)
                VALUES (?,?,?,?,?,?,?,?,?, '演示数据', 'ROOM_PAYMENT')`,
-              [hotelId, folioId, stayId, `DEMO-P-${day}-${p.idx + 1}-${stamp}`, "现金", total, day, "退房结账", `${outDay} 12:05:00`]
+              [hotelId, folioId, stayId, `DEMO-P-${day}-${p.idx + 1}-${stamp}`, "现金", total, day, "退房结账", `${outDay}T12:05:00`]
             );
             run(
-              `INSERT INTO bookings (hotel_id, booking_no, guest_name, mobile, room_type_id, check_in_date, check_out_date, room_count, status, channel_id, created_at)
-               VALUES (?,?,?,?,?,?,?,1,'CHECKED_OUT',?,?)`,
+              `INSERT INTO bookings (hotel_id, booking_no, guest_name, mobile, room_type_id, check_in_date, check_out_date, room_count, nights, status, channel_id, created_at)
+               VALUES (?,?,?,?,?,?,?,1,?,'CHECKED_OUT',?,?)`,
               [
                 hotelId,
                 `DEMO-${day}-B${p.idx + 1}-${stamp}`,
@@ -228,6 +291,7 @@ export function seedUniformDemo(hotelId: number, days = 60, force = false): Seed
                 rt.id,
                 day,
                 outDay,
+                nights,
                 channel?.id ?? null,
                 `${shiftDay(day, -3)} 10:00:00`,
               ]
@@ -237,6 +301,18 @@ export function seedUniformDemo(hotelId: number, days = 60, force = false): Seed
             res.items += otherFee > 0 ? 2 : 1;
             res.payments++;
             res.bookings++;
+            addBookingRooms({
+              hotelId,
+              bookingNo: `DEMO-${day}-B${p.idx + 1}-${stamp}`,
+              roomTypeId: rt.id,
+              guestName: guest.name,
+              mobile: guest.mobile,
+              guestId: guest.id,
+              rate,
+              status: "CHECKED_OUT",
+              checkIn: day,
+              checkOut: outDay,
+            });
           } else if (p.kind === "inhouse") {
             /*
              * 在住：全部**今天入住**（押金流水的 biz_date 就是今天，报表有数）
@@ -244,7 +320,8 @@ export function seedUniformDemo(hotelId: number, days = 60, force = false): Seed
              *   第 1/2 笔：明天/后天离店
              */
             const checkIn = today;
-            const checkOut = p.idx === 0 ? today : shiftDay(today, p.idx);
+            /* 离店日至少 +1 天：ci == co 是非法区间（test-room-availability 会抓） */
+            const checkOut = shiftDay(today, 1 + p.idx);
             const stayNo = `DEMO-${day}-H${p.idx + 1}-${stamp}`;
             const deposit = round2(rate * nights);
 
@@ -258,7 +335,7 @@ export function seedUniformDemo(hotelId: number, days = 60, force = false): Seed
                 guest.id,
                 guest.name,
                 guest.mobile,
-                `${checkIn} 14:00:00`,
+                `${checkIn}T14:1${p.idx}:00`,
                 checkOut,
                 nights,
                 rate,
@@ -273,23 +350,23 @@ export function seedUniformDemo(hotelId: number, days = 60, force = false): Seed
             run(
               `INSERT INTO folios (hotel_id, folio_no, stay_id, guest_name, room_no, total_amount, paid_amount, balance, status, created_at)
                VALUES (?,?,?,?,?,?,?,0, 'OPEN', ?)`,
-              [hotelId, folioNo, stayId, guest.name, room.room_no, roomFee, roomFee, `${checkIn} 14:05:00`]
+              [hotelId, folioNo, stayId, guest.name, room.room_no, roomFee, roomFee, `${checkIn}T14:1${p.idx}:30`]
             );
             const folioId = Number(get<{ id: number }>(`SELECT id FROM folios WHERE folio_no = ?`, [folioNo])?.id);
             run(
               `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at)
                VALUES (?,?, 'ROOM', ?, ?, ?, ?, ?, ?)`,
-              [hotelId, folioId, `房费 ${nights} 晚`, nights, rate, roomFee, checkIn, `${checkIn} 14:05:00`]
+              [hotelId, folioId, `房费 ${nights} 晚`, nights, rate, roomFee, checkIn, `${checkIn}T14:1${p.idx}:30`]
             );
             run(
               `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at)
                VALUES (?,?, 'DEPOSIT', '押金', 1, ?, ?, ?, ?)`,
-              [hotelId, folioId, deposit, deposit, checkIn, `${checkIn} 14:06:00`]
+              [hotelId, folioId, deposit, deposit, checkIn, `${checkIn}T14:1${p.idx}:45`]
             );
             run(
               `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, operator, kind)
                VALUES (?,?,?,?,?,?,?,?,?, '演示数据', 'DEPOSIT')`,
-              [hotelId, folioId, stayId, `DEMO-HP-${day}-${p.idx + 1}-${stamp}`, "现金", deposit, checkIn, "预收款（押金）", `${checkIn} 14:06:00`]
+              [hotelId, folioId, stayId, `DEMO-HP-${day}-${p.idx + 1}-${stamp}`, "现金", deposit, checkIn, "预收款（押金）", `${checkIn}T14:1${p.idx}:45`]
             );
             res.stays++;
             res.folios++;
@@ -298,8 +375,8 @@ export function seedUniformDemo(hotelId: number, days = 60, force = false): Seed
           } else if (p.kind === "arrival") {
             /* 今日预抵：CONFIRMED、未排房 → 前台可直接办理入住测试 */
             run(
-              `INSERT INTO bookings (hotel_id, booking_no, guest_name, mobile, room_type_id, check_in_date, check_out_date, room_count, status, channel_id, created_at, remark)
-               VALUES (?,?,?,?,?,?,?,1,'CONFIRMED',?,?, '演示数据·今日预抵')`,
+              `INSERT INTO bookings (hotel_id, booking_no, guest_name, mobile, room_type_id, check_in_date, check_out_date, room_count, nights, status, channel_id, created_at, remark)
+               VALUES (?,?,?,?,?,?,?,1,?,'CONFIRMED',?,?, '演示数据·今日预抵')`,
               [
                 hotelId,
                 `DEMO-${day}-AR${p.idx + 1}-${stamp}`,
@@ -308,17 +385,29 @@ export function seedUniformDemo(hotelId: number, days = 60, force = false): Seed
                 rt.id,
                 today,
                 shiftDay(today, nights),
+                nights,
                 channel?.id ?? null,
-                `${today} 08:30:00`,
+                `${today}T08:30:00`,
               ]
             );
             res.bookings++;
+            addBookingRooms({
+              hotelId,
+              bookingNo: `DEMO-${day}-AR${p.idx + 1}-${stamp}`,
+              roomTypeId: rt.id,
+              guestName: guest.name,
+              mobile: guest.mobile,
+              guestId: guest.id,
+              rate,
+              status: "CONFIRMED",
+              checkIn: today,
+              checkOut: shiftDay(today, nights),
+            });
           } else {
-            /* 未来预订：落在 今天+3+n，分散开 */
             const arrivals = shiftDay(today, 3 + n);
             run(
-              `INSERT INTO bookings (hotel_id, booking_no, guest_name, mobile, room_type_id, check_in_date, check_out_date, room_count, status, channel_id, created_at)
-               VALUES (?,?,?,?,?,?,?,1,'CONFIRMED',?,?)`,
+              `INSERT INTO bookings (hotel_id, booking_no, guest_name, mobile, room_type_id, check_in_date, check_out_date, room_count, nights, status, channel_id, created_at)
+               VALUES (?,?,?,?,?,?,?,1,?,'CONFIRMED',?,?)`,
               [
                 hotelId,
                 `DEMO-${day}-BQ${p.idx + 1}-${stamp}`,
@@ -327,11 +416,24 @@ export function seedUniformDemo(hotelId: number, days = 60, force = false): Seed
                 rt.id,
                 arrivals,
                 shiftDay(arrivals, nights),
+                nights,
                 channel?.id ?? null,
-                `${day} 09:30:00`,
+                `${day}T09:30:00`,
               ]
             );
             res.bookings++;
+            addBookingRooms({
+              hotelId,
+              bookingNo: `DEMO-${day}-BQ${p.idx + 1}-${stamp}`,
+              roomTypeId: rt.id,
+              guestName: guest.name,
+              mobile: guest.mobile,
+              guestId: guest.id,
+              rate,
+              status: "CONFIRMED",
+              checkIn: arrivals,
+              checkOut: shiftDay(arrivals, nights),
+            });
           }
         });
       } catch {
