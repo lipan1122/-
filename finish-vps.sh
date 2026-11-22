@@ -59,7 +59,7 @@ mkdir -p data
 #   [ -f data/pms.db ] 为真 → 跳过 init-db → migrate-all 在空库上跑 →
 #   Error: no such table: channel_orders
 #
-# 正确判据是「有多少张表」。init-db 建完 80+ 张，空库 0 张，
+# 正确判据是「有多少张表」。init-db 建完 22 张核心表（其余靠 ensure-schema 补），空库 0 张，
 # 用 10 作阈值足够区分，也不会因为个别表缺失就误删已有数据。
 # 用 node 数表（sqlite3 CLI 不一定装过；node 是硬前提）
 TABLE_COUNT=$(node scripts/db-table-count.mjs 2>/dev/null || echo 0)
@@ -73,6 +73,16 @@ fi
 
 log "执行幂等迁移"
 node scripts/migrate-all.mjs
+
+# 补全懒建表（全新部署必跑）
+#
+# 本项目有 60 张表的建表语句散落在各个 page/action 里，只有页面被访问时才创建。
+# 老库上没问题（用久了都建出来了），但全新部署会缺表 —— VPS 上
+# /rooms 和 /settings 报 500 就是这个原因（当时只有 30 张表，需要 90 张）。
+# ensure-schema.mjs 执行 scripts/schema-full.sql（从跑起来的库导出的完整 schema），
+# 幂等：已存在的表/索引跳过，不影响已有数据。
+log "补全表结构（懒建表）"
+node scripts/ensure-schema.mjs
 
 log "数据库概况"
 sqlite3 data/pms.db "SELECT '房间 ' || COUNT(*) || ' 间' FROM rooms; SELECT '用户 ' || COUNT(*) || ' 个' FROM users;" 2>/dev/null || true
