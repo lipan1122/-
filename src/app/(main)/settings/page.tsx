@@ -260,6 +260,15 @@ const NAV_GROUPS: NavGroup[] = [
       { label: "高级设置", tab: "advanced" },
       /* 小程序配置（整改清单 F12） */
       { label: "小程序配置", tab: "miniprogram" },
+      /*
+       * 演示数据：一键导入 46 房 / 588 预订 / 200 账单，给客户演示、同事试用、培训用。
+       *
+       * 注意：这个 Tab 必须同时出现在两处 ——
+       *   · 上面的 TABS（决定 tab 是否合法、共几项）
+       *   · 这里的 NAV_GROUPS（左侧菜单实际渲染的就是它）
+       * 只加 TABS 的话 `?tab=demo` 能打开，但菜单里找不到入口（踩过）。
+       */
+      { label: "演示数据", tab: "demo" },
     ],
   },
   {
