@@ -15,6 +15,7 @@
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { countBusinessDataAction, loadDemoDataAction } from "./demo-actions";
+import { clearBusinessDataAction } from "./clear-data-actions";
 
 type Counts = { rooms: number; bookings: number; stays: number; folios: number };
 
@@ -24,6 +25,9 @@ export default function DemoDataPanel() {
   const [counts, setCounts] = useState<Counts | null>(null);
   const [checking, setChecking] = useState(false);
   const [msg, setMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  /* 清空数据：展开确认区 + 「清空」两字校验 */
+  const [clearOpen, setClearOpen] = useState(false);
+  const [clearText, setClearText] = useState("");
 
   const check = () => {
     setChecking(true);
@@ -50,11 +54,30 @@ export default function DemoDataPanel() {
         } else {
           setMsg({ kind: "ok", text: r.ok });
           setCounts(null);
-          /* 数据变了，刷新当前页让各处统计同步 */
           router.refresh();
         }
       } catch (e) {
         setMsg({ kind: "err", text: e instanceof Error ? e.message : "导入失败" });
+      }
+    });
+  };
+
+  const clearAll = () => {
+    setMsg(null);
+    startTransition(async () => {
+      try {
+        const r = await clearBusinessDataAction(clearText);
+        if ("error" in r) {
+          setMsg({ kind: "err", text: r.error });
+        } else {
+          setMsg({ kind: "ok", text: r.ok });
+          setCounts(null);
+          setClearOpen(false);
+          setClearText("");
+          router.refresh();
+        }
+      } catch (e) {
+        setMsg({ kind: "err", text: e instanceof Error ? e.message : "清空失败" });
       }
     });
   };
@@ -146,9 +169,74 @@ export default function DemoDataPanel() {
           <span className="ml-1 font-mono">front/123456</span> ·
           <span className="ml-1 font-mono">cashier/123456</span> ·
           <span className="ml-1 font-mono">housekeeper/123456</span>
-          <div className="mt-1">
-            正式使用前请清空：<span className="font-mono">node scripts/init-db.mjs --reset</span>
+        </div>
+
+        {/* ===== 清空业务数据（正式上线前用） ===== */}
+        <div className="border-t border-gray-200 pt-3">
+          <div className="mb-1.5 text-[12px] font-semibold text-gray-700">清空业务数据</div>
+          <div className="mb-2 text-[11.5px] leading-relaxed text-gray-500">
+            删掉所有预订、入住单、账单、流水、客人档案、会员储值、应收台账、发票、渠道订单，
+            房间状态重置为空净。
+            <b className="text-gray-600">保留</b>房间与房型、渠道、协议单位、参数、账号与权限矩阵。
           </div>
+
+          {!clearOpen && (
+            <button
+              type="button"
+              onClick={() => {
+                setClearOpen(true);
+                setMsg(null);
+              }}
+              className="rounded border border-rose-200 bg-rose-50 px-3 py-1.5 text-[12px] text-rose-700 hover:bg-rose-100"
+            >
+              清空业务数据
+            </button>
+          )}
+
+          {clearOpen && (
+            <div className="rounded border border-rose-300 bg-rose-50 p-3">
+              <div className="mb-1.5 text-[11.5px] font-medium text-rose-800">
+                确认清空？此操作不可撤销。
+              </div>
+              <div className="mb-2 text-[11px] leading-relaxed text-rose-700">
+                输入「<b>清空</b>」两个字以确认：
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  value={clearText}
+                  onChange={(e) => setClearText(e.target.value)}
+                  placeholder="清空"
+                  disabled={pending}
+                  className="input h-7 w-[110px] px-2 text-[12px]"
+                />
+                <button
+                  type="button"
+                  onClick={clearAll}
+                  disabled={pending || clearText.trim() !== "清空"}
+                  className="rounded bg-rose-600 px-3 py-1.5 text-[12px] text-white hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {pending ? "清空中…" : "确认清空"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setClearOpen(false);
+                    setClearText("");
+                  }}
+                  disabled={pending}
+                  className="px-2 py-1.5 text-[12px] text-gray-500 hover:underline"
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="border-t border-gray-100 pt-2 text-[11px] leading-relaxed text-gray-400">
+          命令行等价操作：
+          <span className="ml-1 font-mono">node scripts/init-db.mjs --reset</span>
+          （会连表结构和房型一起重建）
         </div>
       </div>
     </div>

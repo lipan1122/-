@@ -88,17 +88,27 @@ export async function loadDemoDataAction(): Promise<DemoLoadResult> {
   }
 
   /*
-   * 切分语句
+   * 切分语句（这里踩过坑，注释要单独处理）
    *
-   * 导出的 SQL 是「每行一条语句」的格式（DELETE ...; / INSERT ... VALUES ...;），
-   * 且字符串里的分号已经转义成 ''，所以按「分号+换行」切分是安全的。
-   * 注释行（-- 开头）单独丢弃。
+   * 导出的 SQL 长这样：
+   *     -- ar_accounts：5 行          ← 注释
+   *     DELETE FROM "ar_accounts";    ← 语句
+   *     INSERT INTO "ar_accounts" ...;
+   *
+   * 如果按「分号+换行」切完后过滤 startsWith("--")，会把
+   * 「注释 + DELETE」那一整块丢掉 → DELETE 不执行 → 插入时主键冲突：
+   *     UNIQUE constraint failed: ar_accounts.id
+   *
+   * 所以先逐行去掉注释，再按分号切。
    */
   const statements = sqlText
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("--"))
+    .join("\n")
     .split(/;\s*\n/)
     .map((s) => s.trim())
-    .filter((s) => s.length > 0 && !s.startsWith("--"))
-    .map((s) => s + ";");
+    .filter((s) => s.length > 0)
+    .map((s) => (s.endsWith(";") ? s : s + ";"));
 
   if (statements.length === 0) {
     return { error: "演示数据文件里没有可执行的语句" };
