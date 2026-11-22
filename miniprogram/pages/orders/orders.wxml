@@ -23,7 +23,14 @@
       <button class="btn" bindtap="goBook">去查房</button>
     </view>
     <block wx:else>
-      <view class="card" wx:for="{{bookings}}" wx:key="bookingId">
+      <view
+        class="card order-card"
+        wx:for="{{bookings}}"
+        wx:key="bookingId"
+        data-id="{{item.bookingId}}"
+        bindtap="onOrderDetail"
+        hover-class="order-card-hover"
+      >
         <view class="row">
           <text class="subtitle">{{item.bookingNo}}</text>
           <text class="chip {{item.chipClass}}">{{item.statusLabel}}</text>
@@ -39,7 +46,7 @@
         </view>
         <view class="row gap-top">
           <text class="muted">下单时间 {{item.createdAtText}}</text>
-          <text class="muted">{{item.guestName}}</text>
+          <text class="muted">详情 ›</text>
         </view>
       </view>
     </block>

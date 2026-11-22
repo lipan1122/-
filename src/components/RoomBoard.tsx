@@ -1785,6 +1785,8 @@ function QuickOpForm({
   onDone: () => void;
 }) {
   const [state, setState] = useState<{ ok: boolean; message: string } | null>(null);
+  /* 资金操作幂等键：本弹窗一次只渲染一个操作，按 op 取对应那一枚 */
+  const { ids: requestIds, bump: bumpRequestId } = useMoneyRequestIds();
   const stayId = room.stay_id;
 
   // rooms/actions 统一返回 { error?, ok? }，这里转成弹窗内的提示
@@ -1792,7 +1794,11 @@ function QuickOpForm({
     async (fd: FormData) => {
       const r = await action(fd);
       setState({ ok: !r.error, message: r.error ?? r.ok ?? "已完成" });
-      if (!r.error) setTimeout(onDone, 900);
+      if (!r.error) {
+        /* 成功才换新幂等键；失败/结果未知保留同一枚，重试不会变成两笔 */
+        bumpRequestId(op);
+        setTimeout(onDone, 900);
+      }
     };
 
   const Field = ({ label, children }: { label: string; children: ReactNode }) => (
@@ -1876,6 +1882,8 @@ function QuickOpForm({
         return (
           <form action={wrap(addDepositAction)}>
             <input type="hidden" name="stay_id" value={stayId ?? ""} />
+            {/* 幂等键：同一枚 request_id 重复提交只会记一笔押金 */}
+            <input type="hidden" name="request_id" value={requestIds.deposit ?? ""} />
             <Field label="收款金额"><input name="amount" type="number" step="0.01" required className={inputCls} /></Field>
             <Field label="收款方式">
               <select name="method" className={inputCls}>
@@ -1900,6 +1908,7 @@ function QuickOpForm({
         return (
           <form action={wrap(addRoomFeeAction)}>
             <input type="hidden" name="stay_id" value={stayId ?? ""} />
+            <input type="hidden" name="request_id" value={requestIds.addfee ?? ""} />
             <Field label="加收金额"><input name="amount" type="number" step="0.01" required className={inputCls} /></Field>
             <Field label="业务日期"><input name="biz_date" type="date" defaultValue={todayStr()} className={inputCls} /></Field>
             <Field label="备注"><input name="remark" placeholder="如：加床费" className={inputCls} /></Field>
@@ -1910,6 +1919,7 @@ function QuickOpForm({
         return (
           <form action={wrap(addOtherChargeAction)}>
             <input type="hidden" name="stay_id" value={stayId ?? ""} />
+            <input type="hidden" name="request_id" value={requestIds.consume ?? ""} />
             <Field label="消费项目"><input name="description" placeholder="如：矿泉水" required className={inputCls} /></Field>
             <Field label="金额"><input name="amount" type="number" step="0.01" required className={inputCls} /></Field>
             <button className={btnCls}>确认入账</button>
@@ -1982,6 +1992,7 @@ function QuickOpForm({
         return (
           <form action={wrap(memberRechargeAction)}>
             <input type="hidden" name="stay_id" value={stayId ?? ""} />
+            <input type="hidden" name="request_id" value={requestIds.recharge ?? ""} />
             <Field label="充值金额"><input name="amount" type="number" min="0.01" max="50000" step="0.01" required className={inputCls} /></Field>
             {/* 第 4 轮 P2-22b：充值原因必填（写进操作日志，事后可追） */}
             <Field label="充值原因"><input name="reason" required defaultValue="会员卡充值" maxLength={80} className={inputCls} /></Field>
@@ -2199,6 +2210,85 @@ function SubmitButton({ label, danger }: { label: string; danger?: boolean }) {
 }
 
 /* ------------------------------------------------------------------ *
+ * 资金操作幂等键（第九轮 §一.4 房间卡资金操作补 request_id）
+ * ------------------------------------------------------------------ */
+
+/**
+ * 生成一次资金操作的 request_id
+ *
+ * ── 为什么必须三级降级 ──
+ * 房间卡（房态页）在酒店前台机上通过 `http://内网IP:3100` 访问，
+ * 那是**非安全上下文**：`crypto.randomUUID()` 在那里不存在或直接抛错，
+ * 只用它会让「收押金」按钮静默失效。所以与第七轮 ShopPOS 保持同一套降级：
+ *   1. crypto.randomUUID()      → https / localhost
+ *   2. crypto.getRandomValues() → http 也能用，手工拼 RFC4122 v4
+ *   3. 时间戳 + Math.random()   → 老浏览器 / 无 crypto 兜底
+ * 三级都不抛错。
+ */
+function newRequestId(): string {
+  const c = globalThis.crypto as Crypto | undefined;
+  if (c && typeof c.randomUUID === "function") {
+    try {
+      return c.randomUUID();
+    } catch {
+      /* 非安全上下文等场景：继续降级 */
+    }
+  }
+  if (c && typeof c.getRandomValues === "function") {
+    try {
+      const buf = new Uint8Array(16);
+      c.getRandomValues(buf);
+      /* RFC4122 v4：版本位与变体位 */
+      buf[6] = (buf[6] & 0x0f) | 0x40;
+      buf[8] = (buf[8] & 0x3f) | 0x80;
+      const hex = Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    } catch {
+      /* 继续降级 */
+    }
+  }
+  return `rid-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}${Math.random()
+    .toString(36)
+    .slice(2, 10)}`;
+}
+
+/**
+ * 四种资金操作各自的幂等键（**每种一枚，互不串号**）
+ *
+ * 为什么不是全组件共用一枚：
+ *   押金请求「服务端已成功、网络断开」时客户端拿不到结果，按清单要求要复用同一枚
+ *   request_id 重试。如果此时改成去记房费，却共用同一枚键 —— 服务端的查重会命中
+ *   那笔押金的 folio_items，把房费当成重复提交丢掉。四种操作各持一枚才不会串。
+ *
+ * 生命周期（清单 §一.4）：
+ *   · 首帧是空串：服务端渲染与 hydration 必须一致，随机值只能在**挂载后**生成，
+ *     否则 React 会报 hydration mismatch；
+ *   · 提交成功 → bump(key) 换新（下一笔是新业务）；
+ *   · 业务失败 / 网络结果未知 → 不动，重试复用同一枚，服务端按幂等重放。
+ */
+const MONEY_REQUEST_KEYS = ["deposit", "addfee", "consume", "recharge"] as const;
+
+function useMoneyRequestIds() {
+  const [ids, setIds] = useState<Record<string, string>>({});
+  useEffect(() => {
+    setIds((prev) => {
+      const next = { ...prev };
+      let changed = false;
+      for (const key of MONEY_REQUEST_KEYS) {
+        if (!next[key]) {
+          next[key] = newRequestId();
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+    /* MONEY_REQUEST_KEYS 是模块常量，不参与依赖 */
+  }, []);
+  const bump = (key: string) => setIds((prev) => ({ ...prev, [key]: newRequestId() }));
+  return { ids, bump };
+}
+
+/* ------------------------------------------------------------------ *
  * 房间抽屉
  * ------------------------------------------------------------------ */
 
@@ -2219,13 +2309,24 @@ function RoomDrawer({
   const meta = ROOM_STATUS[room.status] ?? ROOM_STATUS.VC;
   const days = daysToCheckout(room.expect_check_out);
   const stayId = room.stay_id ?? 0;
+  /* 资金操作幂等键：押金 / 房费 / 其他消费 / 会员充值各一枚，互不串号 */
+  const { ids: requestIds, bump: bumpRequestId } = useMoneyRequestIds();
 
-  /** 包装 server action：提交后把 { ok } / { error } 抛到页面顶部提示 */
-  const submitWith = (action: ActionFn) => async (formData: FormData) => {
+  /**
+   * 包装 server action：提交后把 { ok } / { error } 抛到页面顶部提示
+   *
+   * moneyKey：资金操作的幂等键名。成功才换新键；失败或网络结果未知时
+   * 保留同一枚（重试 → 服务端幂等重放 → 不会记成两笔）。
+   */
+  const submitWith = (action: ActionFn, moneyKey?: string) => async (formData: FormData) => {
     const result = await action(formData);
-    if (result && result.error) onNotice("error", result.error);
-    else if (result && result.ok) onNotice("ok", result.ok);
+    if (result && result.error) {
+      onNotice("error", result.error);
+      return;
+    }
+    if (result && result.ok) onNotice("ok", result.ok);
     else onNotice("ok", "操作已提交");
+    if (moneyKey) bumpRequestId(moneyKey);
   };
 
   // 换房：可选 VC / VD 空房
@@ -2375,8 +2476,10 @@ function RoomDrawer({
                   </ActionPanel>
 
                   <ActionPanel label="预收款(押金)">
-                    <form action={submitWith(addDepositAction)} className="space-y-2">
+                    <form action={submitWith(addDepositAction, "deposit")} className="space-y-2">
                       <input type="hidden" name="stay_id" value={stayId} />
+                      {/* 幂等键：双击「确认收取预收款」只记一笔押金 */}
+                      <input type="hidden" name="request_id" value={requestIds.deposit ?? ""} />
                       <div className="grid grid-cols-2 gap-2">
                         <Field label="金额（元）">
                           <input name="amount" type="number" min="0.01" step="0.01" defaultValue="500.00" required className="input" />
@@ -2552,8 +2655,9 @@ function RoomDrawer({
                   </ActionPanel>
 
                   <ActionPanel label="加收房费">
-                    <form action={submitWith(addRoomFeeAction)} className="space-y-2">
+                    <form action={submitWith(addRoomFeeAction, "addfee")} className="space-y-2">
                       <input type="hidden" name="stay_id" value={stayId} />
+                      <input type="hidden" name="request_id" value={requestIds.addfee ?? ""} />
                       <div className="grid grid-cols-2 gap-2">
                         <Field label="金额（元）">
                           <input name="amount" type="number" min="0.01" step="0.01" defaultValue={String(room.rate ?? 0)} required className="input" />
@@ -2570,8 +2674,9 @@ function RoomDrawer({
                   </ActionPanel>
 
                   <ActionPanel label="客房消费">
-                    <form action={submitWith(addOtherChargeAction)} className="space-y-2">
+                    <form action={submitWith(addOtherChargeAction, "consume")} className="space-y-2">
                       <input type="hidden" name="stay_id" value={stayId} />
+                      <input type="hidden" name="request_id" value={requestIds.consume ?? ""} />
                       <div className="grid grid-cols-2 gap-2">
                         <Field label="消费项目">
                           <input name="description" required placeholder="如：迷你吧饮料" className="input" />
@@ -2628,8 +2733,9 @@ function RoomDrawer({
                   <ActionLink label="打印账单" href={`/cashier/print?stay=${stayId}`} hint="打印 →" />
 
                   <ActionPanel label="会员充值">
-                    <form action={submitWith(memberRechargeAction)} className="space-y-2">
+                    <form action={submitWith(memberRechargeAction, "recharge")} className="space-y-2">
                       <input type="hidden" name="guest_name" value={room.guest_name ?? ""} />
+                      <input type="hidden" name="request_id" value={requestIds.recharge ?? ""} />
                       <div className="grid grid-cols-2 gap-2">
                         <Field label="充值金额（元）">
                           <input name="amount" type="number" min="0.01" max="50000" step="0.01" defaultValue="1000.00" required className="input" />

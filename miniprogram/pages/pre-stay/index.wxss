@@ -1,0 +1,93 @@
+/* 入住前服务专有样式 */
+
+.not-ready-box {
+  background: #fff8eb;
+  border: 1rpx solid #ffe2b8;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.chip-tap {
+  margin: 0 12rpx 12rpx 0;
+}
+
+/* 选中态：用蓝色实心，和 chip-gray 的「未选中」明显区分 */
+.chip-on {
+  background: #007aff;
+  color: #ffffff;
+}
+
+.picker-value {
+  flex: 1;
+  text-align: right;
+  font-size: 28rpx;
+  color: #1c1c1e;
+}
+
+.textarea {
+  width: 100%;
+  min-height: 140rpx;
+  padding: 16rpx;
+  box-sizing: border-box;
+  background: #f7f7fa;
+  border-radius: 12rpx;
+  font-size: 26rpx;
+  color: #1c1c1e;
+}
+
+.policy {
+  font-size: 26rpx;
+  color: #3a3a3c;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+.warn-text {
+  display: block;
+  margin-top: 8rpx;
+  color: #c26a00;
+}
+
+/* 份数步进器 */
+.stepper {
+  display: flex;
+  align-items: center;
+}
+
+.step-btn {
+  width: 64rpx;
+  height: 64rpx;
+  line-height: 64rpx;
+  text-align: center;
+  border-radius: 50%;
+  background: #f2f2f7;
+  color: #007aff;
+  font-size: 34rpx;
+}
+
+.step-value {
+  min-width: 72rpx;
+  text-align: center;
+  font-size: 30rpx;
+  font-weight: 600;
+  color: #1c1c1e;
+}
+
+.btn-row {
+  display: flex;
+}
+
+.btn-half {
+  flex: 1;
+  margin: 0 8rpx;
+}
+
+.retry-link {
+  display: inline-block;
+  margin-left: 12rpx;
+  color: #007aff;
+  font-weight: 600;
+}

@@ -66,21 +66,33 @@
         <text class="chip {{item.soldOut ? 'chip-gray' : 'chip-green'}}">
           {{item.soldOut ? '已售完' : '可预订'}}
         </text>
-        <button
-          class="btn-small"
-          data-id="{{item.roomTypeId}}"
-          data-name="{{item.name}}"
-          data-total="{{item.totalPrice}}"
-          data-remaining="{{item.remainingRooms}}"
-          bindtap="onBook"
-          disabled="{{item.soldOut}}"
-        >
-          立即预订
-        </button>
+        <view class="room-actions">
+          <!-- 详情：图片 / 床型 / 设施 / 取消政策 / 价格日历 -->
+          <button
+            class="btn-small btn-detail"
+            data-id="{{item.roomTypeId}}"
+            data-name="{{item.name}}"
+            bindtap="onRoomDetail"
+          >
+            详情
+          </button>
+          <button
+            class="btn-small"
+            data-id="{{item.roomTypeId}}"
+            data-name="{{item.name}}"
+            data-total="{{item.totalPrice}}"
+            data-remaining="{{item.remainingRooms}}"
+            bindtap="onBook"
+            disabled="{{item.soldOut}}"
+          >
+            立即预订
+          </button>
+        </view>
       </view>
     </view>
-    <view class="muted" style="text-align: center; padding: 8rpx 0 24rpx;">
-      房量为实时计算，最终以到店确认为准
+    <view class="footer-row">
+      <text class="muted">房量为实时计算，最终以到店确认为准</text>
+      <button class="btn-small btn-contact" bindtap="goContact">联系酒店</button>
     </view>
   </block>
 </view>

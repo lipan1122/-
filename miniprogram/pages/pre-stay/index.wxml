@@ -1,0 +1,194 @@
+<!--*
+ * 入住前服务
+ *
+ * 数据来源：GET /api/mini/bookings/:id（到店时间 / 特殊要求 / 入住人）+ GET /api/mini/hotel（须知）
+ * 提交：POST /api/mini/bookings/:id/modify（到店时间 / 特殊要求 / 证件预录入）
+ *       POST /api/mini/breakfast（早餐预购，单独降级）
+ *
+ * 注意：身份证只做「预录入」，页面不出现任何「已核验」字样 —— 到店仍需人证核验。
+ -->
+<view class="container">
+  <view wx:if="{{loading}}" class="loading-box">正在加载…</view>
+
+  <view wx:if="{{!loading && error}}" class="error-box">
+    {{error}}
+    <view class="retry-link" bindtap="onRetry" data-key="main">点击重试</view>
+  </view>
+
+  <!-- 订单接口还没就绪：只降级表单，不挡住酒店须知 -->
+  <view wx:if="{{notReady}}" class="card not-ready-box">
+    <text class="subtitle">在线服务准备中</text>
+    <view class="muted gap-top">{{notReadyMsg}}</view>
+    <view class="muted gap-top">你仍然可以先看下面的入住须知；到店时间、特殊要求也可直接联系前台。</view>
+    <button class="btn btn-ghost" bindtap="goContact">联系酒店</button>
+  </view>
+
+  <!-- 关联订单 -->
+  <view wx:if="{{!loading && booking}}" class="card">
+    <view class="row">
+      <text class="subtitle">{{booking.bookingNo}}</text>
+      <text class="chip chip-green">{{booking.statusLabel}}</text>
+    </view>
+    <view class="divider"></view>
+    <view class="row">
+      <text class="muted">{{booking.roomTypeName}} · {{booking.roomCount}} 间 · {{booking.nights}} 晚</text>
+    </view>
+    <view class="row gap-top">
+      <text class="muted">入住日期</text>
+      <text class="subtitle">{{booking.checkInText}}</text>
+    </view>
+    <view wx:if="{{booking.guestName}}" class="row gap-top">
+      <text class="muted">入住人</text>
+      <text class="subtitle">{{booking.guestName}}</text>
+    </view>
+  </view>
+
+  <view wx:if="{{!loading && !booking && !notReady && !error}}" class="card empty">
+    没有关联的订单
+    <view class="muted gap-top">从「我的订单」点开一笔订单后再进入，可以提前填写到店时间</view>
+    <button class="btn btn-ghost" bindtap="goOrders">去我的订单</button>
+  </view>
+
+  <!-- 到店时间 -->
+  <block wx:if="{{!loading && booking && !notReady}}">
+    <view class="card">
+      <text class="subtitle">到店时间</text>
+      <view class="chip-row gap-top">
+        <view
+          wx:for="{{arrivalTypes}}"
+          wx:key="value"
+          class="chip {{arrivalType === item.value ? 'chip-on' : 'chip-gray'}} chip-tap"
+          data-value="{{item.value}}"
+          bindtap="onArrivalTypeTap"
+        >
+          {{item.label}}
+        </view>
+      </view>
+
+      <view class="field">
+        <text class="field-label">预计到店</text>
+        <picker mode="time" value="{{arrivalClock}}" bindchange="onArrivalClockChange">
+          <view class="picker-value">{{arrivalClock}}</view>
+        </picker>
+      </view>
+
+      <view class="muted gap-top">
+        延迟到店请尽量在 20:00 前告知；未告知且超时未到，酒店可能释放房间。
+      </view>
+    </view>
+
+    <!-- 入住人 + 证件预录入 -->
+    <view class="card">
+      <text class="subtitle">入住人信息</text>
+      <view class="field">
+        <text class="field-label">姓名</text>
+        <input
+          class="field-input"
+          data-field="guestName"
+          value="{{guestName}}"
+          placeholder="{{booking.guestName ? '留空表示不修改' : '请填写实际入住人姓名'}}"
+          placeholder-class="field-input-placeholder"
+          maxlength="30"
+          bindinput="onFieldInput"
+        />
+      </view>
+      <view class="field">
+        <text class="field-label">证件类型</text>
+        <picker mode="selector" range="{{idTypes}}" value="{{idTypeIndex}}" bindchange="onIdTypeChange">
+          <view class="picker-value">{{idTypes[idTypeIndex]}}</view>
+        </picker>
+      </view>
+      <view class="field">
+        <text class="field-label">证件号码</text>
+        <input
+          class="field-input"
+          data-field="idNo"
+          value="{{idNo}}"
+          placeholder="选填，仅用于提前登记"
+          placeholder-class="field-input-placeholder"
+          maxlength="20"
+          bindinput="onFieldInput"
+        />
+      </view>
+      <view wx:if="{{idNoMasked}}" class="muted gap-top">已登记：{{idNoMasked}}（脱敏展示）</view>
+      <view class="muted gap-top">
+        证件号码仅用于提前登记，提交后不在本机保存、页面只显示脱敏结果。
+        <text class="warn-text">到店仍需本人持证件做人证核验，小程序不能代替核验。</text>
+      </view>
+    </view>
+
+    <!-- 特殊要求 -->
+    <view class="card">
+      <text class="subtitle">特殊要求</text>
+      <textarea
+        class="textarea gap-top"
+        data-field="specialRequests"
+        value="{{specialRequests}}"
+        placeholder="如无烟房、加床、婴儿床、安静楼层；酒店会尽量安排，但不保证"
+        placeholder-class="field-input-placeholder"
+        maxlength="200"
+        bindinput="onFieldInput"
+      ></textarea>
+      <view class="muted gap-top">特殊要求需前台确认，确认前订单状态不变。</view>
+      <button class="btn" bindtap="onSubmit" disabled="{{submitting}}">
+        {{submitting ? '提交中…' : '提交到店信息'}}
+      </button>
+    </view>
+
+    <!-- 早餐预购 -->
+    <view class="card">
+      <view class="row">
+        <text class="subtitle">早餐预购</text>
+        <text class="muted">费用并入房间账单</text>
+      </view>
+      <view class="row gap-top">
+        <text class="muted">份数</text>
+        <view class="stepper">
+          <view class="step-btn" bindtap="onBreakfastMinus">−</view>
+          <text class="step-value">{{breakfastCount}}</text>
+          <view class="step-btn" bindtap="onBreakfastPlus">＋</view>
+        </view>
+      </view>
+      <textarea
+        class="textarea gap-top"
+        data-field="breakfastRemark"
+        value="{{breakfastRemark}}"
+        placeholder="选填：用餐日期、忌口、送房时间"
+        placeholder-class="field-input-placeholder"
+        maxlength="100"
+        bindinput="onFieldInput"
+      ></textarea>
+      <button class="btn btn-ghost" bindtap="onSubmitBreakfast" disabled="{{breakfastSubmitting || breakfastCount === 0}}">
+        {{breakfastSubmitting ? '提交中…' : '提交早餐预购'}}
+      </button>
+    </view>
+  </block>
+
+  <!-- 酒店须知（来自服务端，没配置就不编） -->
+  <view class="card">
+    <text class="subtitle">入住须知</text>
+    <block wx:if="{{hotel}}">
+      <view class="row gap-top">
+        <text class="muted">入住 / 离店时间</text>
+        <text class="subtitle">{{hotel.checkInTime || '—'}} / {{hotel.checkOutTime || '—'}}</text>
+      </view>
+      <view wx:if="{{hotel.notice}}" class="policy gap-top">{{hotel.notice}}</view>
+      <view wx:if="{{hotel.parking}}" class="policy gap-top">停车：{{hotel.parking}}</view>
+      <view wx:if="{{hotel.facilities}}" class="policy gap-top">设施：{{hotel.facilities}}</view>
+      <view wx:if="{{!hotel.notice && !hotel.parking && !hotel.facilities}}" class="muted gap-top">
+        酒店还没有配置入住须知，具体请咨询前台。
+      </view>
+    </block>
+    <view wx:else class="muted gap-top">酒店信息暂未配置，请咨询前台。</view>
+  </view>
+
+  <!-- 酒店位置 -->
+  <view wx:if="{{hotel && (hotel.address || hotel.phone)}}" class="card">
+    <text class="subtitle">到店导航</text>
+    <view wx:if="{{hotel.address}}" class="policy gap-top">{{hotel.address}}</view>
+    <view class="btn-row gap-top">
+      <button class="btn btn-ghost btn-half" bindtap="onOpenMap" disabled="{{!hotel.latitude}}">打开地图</button>
+      <button class="btn btn-ghost btn-half" bindtap="onCallHotel">联系酒店</button>
+    </view>
+  </view>
+</view>

@@ -1,0 +1,93 @@
+<!--*
+ * 延迟退房申请
+ *
+ * 数据来源：GET /api/mini/stays/current + GET /api/mini/hotel（标准退房时间）
+ * 提交：POST /api/mini/stays/:id/late-checkout
+ * 费用以前台确认为准，页面不显示本机计算的金额。
+ -->
+<view class="container">
+  <view wx:if="{{loading}}" class="loading-box">正在加载在住信息…</view>
+
+  <view wx:if="{{!loading && notReady}}" class="card empty">
+    <text class="subtitle">{{notReadyMsg}}</text>
+    <view class="muted gap-top">延迟退房正在对接酒店系统，请直接联系前台申请。</view>
+    <button class="btn btn-ghost" bindtap="goContact">联系酒店</button>
+    <button class="btn btn-ghost" bindtap="onRetry" data-key="main">重新加载</button>
+  </view>
+
+  <view wx:if="{{!loading && error && !notReady}}" class="error-box">
+    {{error}}
+    <view class="retry-link" bindtap="onRetry" data-key="main">点击重试</view>
+  </view>
+
+  <view wx:if="{{!loading && !notReady && !error && !stay}}" class="card empty">
+    当前没有在住订单
+    <view class="muted gap-top">办理入住后才能申请延迟退房</view>
+    <button class="btn btn-ghost" bindtap="goInStay">去看在住服务</button>
+  </view>
+
+  <block wx:if="{{!loading && stay}}">
+    <view class="card">
+      <view class="row">
+        <view>
+          <text class="title">{{stay.roomNo}}</text>
+          <view class="muted gap-top">{{stay.roomTypeName}}{{stay.guestName ? ' · ' + stay.guestName : ''}}</view>
+        </view>
+        <text class="chip chip-green">在住</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row">
+        <text class="muted">离店日期</text>
+        <text class="subtitle">{{stay.checkOutText}}</text>
+      </view>
+      <view class="row gap-top">
+        <text class="muted">标准退房时间</text>
+        <text class="subtitle">{{standardCheckOut || '以酒店规定为准'}}</text>
+      </view>
+    </view>
+
+    <view class="card">
+      <view class="row">
+        <text class="subtitle">希望几点退房</text>
+        <text class="muted">需前台确认房态</text>
+      </view>
+      <view class="chip-row gap-top">
+        <view
+          wx:for="{{timeOptions}}"
+          wx:key="*this"
+          class="chip chip-tap {{targetTime === item ? 'chip-on' : 'chip-gray'}}"
+          data-time="{{item}}"
+          bindtap="onTimeTap"
+        >
+          {{item}}
+        </view>
+      </view>
+
+      <textarea
+        class="textarea gap-top"
+        value="{{note}}"
+        placeholder="选填：说明原因，如航班较晚、需要午休"
+        placeholder-class="field-input-placeholder"
+        maxlength="100"
+        bindinput="onNoteInput"
+      ></textarea>
+
+      <view class="muted gap-top">
+        延迟退房可能收取额外费用（部分酒店有免费时段），具体金额与是否批准以前台确认为准。
+        房态紧张时前台可能无法批准，请留意通知中心的处理结果。
+      </view>
+    </view>
+
+    <view wx:if="{{hint}}" class="error-box">{{hint}}</view>
+    <view wx:if="{{error && !notReady}}" class="error-box">{{error}}</view>
+
+    <button class="btn" bindtap="onSubmit" disabled="{{submitting}}">
+      {{submitting ? '提交中…' : '提交延迟退房申请'}}
+    </button>
+    <button class="btn btn-ghost" bindtap="onCallHotel">打电话给前台</button>
+
+    <view class="muted footer-tip">
+      前台确认后会更新你的离店时间，并在通知中心告知结果。
+    </view>
+  </block>
+</view>

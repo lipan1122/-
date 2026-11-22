@@ -7,7 +7,15 @@ import { bizToday } from "@/lib/biz-date";
 import { requirePermission, requireUser } from "@/lib/session";
 import { changeRoomStatus } from "@/lib/room-status";
 import { fmtMoney, nowIso, todayStr } from "@/lib/utils";
-import { NON_REVENUE_ITEM, depositHeld, recalcFolioBalance } from "@/lib/folio";
+import {
+  NON_REVENUE_ITEM,
+  depositHeld,
+  ensurePaymentKindSchema,
+  findDepositPayment,
+  isDepositPayment,
+  recalcFolioBalance,
+  refundKindOf,
+} from "@/lib/folio";
 import { getCompanyOutstanding, postArCharge } from "@/lib/ar";
 import { issueInvoice } from "@/lib/invoice";
 /* 第 4 轮 P1-9：收银台支持会员储值卡支付（扣余额） */
@@ -123,6 +131,8 @@ function loadFolioContext(folioId: number, hotelId: number) {
 export async function splitFolioAction(formData: FormData): Promise<ActionState> {
   // 权限边界（上线前加固）：拆账单只对 admin / 收银开放，原来只校验登录
   const user = await requirePermission("cashier.split");
+  /* 拆账会复制收款流水的 kind（第九轮 P1-2），老库先兜底补列 */
+  ensurePaymentKindSchema();
   const folioId = numOf(formData, "folio_id");
   const itemIds = formData
     .getAll("item_id")
@@ -204,8 +214,8 @@ export async function splitFolioAction(formData: FormData): Promise<ActionState>
 
     /* 收款流水也跟着拆：把对应比例的 payments 挪到新单，账面可追溯 */
     if (movePaid > 0) {
-      const pays = all<{ id: number; amount: number }>(
-        `SELECT id, amount FROM payments WHERE hotel_id = ? AND folio_id = ? AND amount > 0 ORDER BY id`,
+      const pays = all<{ id: number; amount: number; kind: string | null }>(
+        `SELECT id, amount, kind FROM payments WHERE hotel_id = ? AND folio_id = ? AND amount > 0 ORDER BY id`,
         [user.hotelId, folioId]
       );
       let remaining = movePaid;
@@ -224,8 +234,8 @@ export async function splitFolioAction(formData: FormData): Promise<ActionState>
             user.hotelId,
           ]);
           run(
-            `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, operator)
-             VALUES (?,?,?,?,?,?,?,?,?,?)`,
+            `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, operator, kind)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
             [
               user.hotelId,
               newId,
@@ -237,6 +247,8 @@ export async function splitFolioAction(formData: FormData): Promise<ActionState>
               `从原单 ${folio.folio_no} 按比例分摊`,
               nowIso(),
               user.realName ?? user.username,
+              /* 拆账只是挪账，性质跟随原收款（押金仍然是押金） */
+              p.kind ?? null,
             ]
           );
           remaining = 0;
@@ -322,6 +334,8 @@ export async function addChargeAction(formData: FormData): Promise<ActionState> 
  */
 export async function addPaymentAction(formData: FormData): Promise<ActionState> {
   const user = await requirePermission("cashier.receive");
+  /* 第九轮 P1-2：收款要写结构化性质 kind，老库先兜底补列 */
+  ensurePaymentKindSchema();
   const folioId = numOf(formData, "folio_id");
   const method = str(formData, "method") || "现金";
   const amount = round2(numOf(formData, "amount"));
@@ -398,8 +412,8 @@ export async function addPaymentAction(formData: FormData): Promise<ActionState>
       }
 
       run(
-        `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, request_id, operator)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, request_id, operator, kind)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
         [
           user.hotelId,
           folioId,
@@ -412,6 +426,8 @@ export async function addPaymentAction(formData: FormData): Promise<ActionState>
           nowIso(),
           requestId,
           user.realName ?? user.username,
+          /* 第九轮 P1-2：收银台普通收款 = 房费收款（押金走 addDepositAction，kind=DEPOSIT） */
+          "ROOM_PAYMENT",
         ]
       );
       /*
@@ -452,6 +468,8 @@ export async function addPaymentAction(formData: FormData): Promise<ActionState>
  */
 export async function refundPaymentAction(formData: FormData): Promise<ActionState> {
   const user = await requirePermission("cashier.refund");
+  /* 第九轮 P1-2：退款流水要写结构化性质 kind，老库先兜底补列 */
+  ensurePaymentKindSchema();
   const paymentId = numOf(formData, "payment_id");
   const amount = round2(numOf(formData, "amount"));
   const reason = str(formData, "reason");
@@ -460,8 +478,8 @@ export async function refundPaymentAction(formData: FormData): Promise<ActionSta
   if (amount <= 0) return { error: "退款金额必须大于 0" };
   if (!reason) return { error: "请填写退款原因" };
 
-  const pay = get<{ id: number; hotel_id: number; folio_id: number | null; stay_id: number | null; method: string; amount: number; refund_of: number | null; remark: string | null }>(
-    `SELECT id, hotel_id, folio_id, stay_id, method, amount, refund_of, remark FROM payments
+  const pay = get<{ id: number; hotel_id: number; folio_id: number | null; stay_id: number | null; method: string; amount: number; refund_of: number | null; remark: string | null; kind: string | null }>(
+    `SELECT id, hotel_id, folio_id, stay_id, method, amount, refund_of, remark, kind FROM payments
       WHERE id = ? AND hotel_id = ?`,
     [paymentId, user.hotelId]
   );
@@ -548,9 +566,14 @@ export async function refundPaymentAction(formData: FormData): Promise<ActionSta
       const moneyBeforeRefund = recalcFolioBalance(user.hotelId, refundFolioId);
       const depositHeldBefore = depositHeld(user.hotelId, refundFolioId);
       const payRemark = String(pay.remark ?? "");
-      const isDepositPayment = /押金|预收/.test(payRemark);
+      /*
+       * 第九轮 P1-2：判定「这笔退款动到了押金」不再看备注正则，改走统一口径
+       * isDepositPayment（kind='DEPOSIT' 优先，旧数据才看备注）。
+       * 这样原押金收款备注被写成「订金」也能认出，与 checkoutAction 完全同一口径。
+       */
+      const depositSource = isDepositPayment({ kind: pay.kind, remark: payRemark });
       const nonDepositPaid = round2(moneyBeforeRefund.paid - depositHeldBefore);
-      const depositPortion = isDepositPayment
+      const depositPortion = depositSource
         ? amount
         : round2(Math.max(0, amount - Math.max(0, nonDepositPaid)));
 
@@ -586,8 +609,8 @@ export async function refundPaymentAction(formData: FormData): Promise<ActionSta
       );
 
       run(
-        `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, refund_of, operator)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, refund_of, operator, kind)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
         [
           user.hotelId,
           refundFolioId,
@@ -596,10 +619,23 @@ export async function refundPaymentAction(formData: FormData): Promise<ActionSta
           pay.method,
           -Math.abs(amount), // 负数记账
           todayStr(),
-          `退款：${reason}`,
+          /*
+           * 押金退款的摘要明确写「押金退款」（房费退款仍写「退款」）
+           *
+           * 结构化识别已由下面的 kind 承担；这里保留「押金」二字是给**旧报表口径**兜底：
+           * reports/page.tsx 的「押金退款流水」仍按 remark LIKE '%押金%' 取数（该文件不在本轮
+           * 改动范围）。摘要带锚点，报表就不会漏记手动退的押金；等报表改读 kind 后这行可简化为
+           * `退款：${reason}`，不影响任何判定。
+           */
+          depositSource ? `押金退款：${reason}` : `退款：${reason}`,
           nowIso(),
           pay.id,
           user.realName ?? user.username,
+          /*
+           * 第九轮 P1-2：退款性质由**原收款**决定（押金退款 / 房费退款），
+           * 与 checkoutAction 的退房退款共用 refundKindOf，两条退款路径口径唯一。
+           */
+          refundKindOf({ kind: pay.kind, remark: payRemark }),
         ]
       );
 
@@ -680,6 +716,8 @@ export async function refundPaymentAction(formData: FormData): Promise<ActionSta
  */
 export async function addDepositAction(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  /* 第九轮 P1-2：押金收款写 kind=DEPOSIT（不再靠备注识别），老库先兜底补列 */
+  ensurePaymentKindSchema();
   const folioId = numOf(formData, "folio_id");
   const stayId = numOf(formData, "stay_id");
   const amount = round2(numOf(formData, "amount"));
@@ -703,9 +741,26 @@ export async function addDepositAction(formData: FormData): Promise<ActionState>
       [user.hotelId, folioId, "DEPOSIT", desc, 1, amount, amount, bizDate, nowIso(), user.id]
     );
     run(
-      `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?)`,
-      [user.hotelId, folioId, stayId || folio.stay_id, nextPayNo(), method, amount, bizDate, remark || "预收款", nowIso()]
+      `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, operator, kind)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        user.hotelId,
+        folioId,
+        stayId || folio.stay_id,
+        nextPayNo(),
+        method,
+        amount,
+        bizDate,
+        remark || "预收款",
+        nowIso(),
+        user.realName ?? user.username,
+        /*
+         * 第九轮 P1-2：kind 是押金的唯一结构标记。
+         * 备注是自由文本（客人/前台可能写「订金」「保证金」「刷卡预授权」），
+         * 一律不再参与押金识别；退房与手动退款都按这个字段找原押金收款。
+         */
+        "DEPOSIT",
+      ]
     );
     run(`UPDATE folios SET paid_amount = paid_amount + ? WHERE id = ? AND hotel_id = ?`, [
       amount,
@@ -737,6 +792,8 @@ export async function addDepositAction(formData: FormData): Promise<ActionState>
  */
 export async function partialSettleAction(formData: FormData): Promise<ActionState> {
   const user = await requireUser();
+  /* 第九轮 P1-2：部分结账收款写 kind=ROOM_PAYMENT，老库先兜底补列 */
+  ensurePaymentKindSchema();
   const folioId = numOf(formData, "folio_id");
   const amount = round2(numOf(formData, "amount"));
   const method = str(formData, "method") || "现金";
@@ -755,8 +812,8 @@ export async function partialSettleAction(formData: FormData): Promise<ActionSta
 
   tx(() => {
     run(
-      `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, operator, kind)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
       [
         user.hotelId,
         folioId,
@@ -767,6 +824,9 @@ export async function partialSettleAction(formData: FormData): Promise<ActionSta
         todayStr(),
         remark || "部分结账",
         nowIso(),
+        user.realName ?? user.username,
+        /* 部分结账收到的是消费款（押金已单列），性质为房费收款 */
+        "ROOM_PAYMENT",
       ]
     );
     run(
@@ -1296,13 +1356,18 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
   if (!room) return { error: "房间不存在" };
 
   let result: { error: string } | { ok: string };
+  /*
+   * 第九轮 P1-2：退房会写两类收款流水（补收 / 退押金），都要带结构化的 kind。
+   * 老库可能还没有 kind 列，先兜底补上再进事务。
+   */
+  ensurePaymentKindSchema();
   try {
     result = tx((): { error: string } | { ok: string } => {
     // 1. 补收（第 4 轮 P0-1：只加 paid_amount，余额交给 recalcFolioBalance 统一算）
     if (payAmount > 0) {
       run(
-        `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, operator)
-         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, operator, kind)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
         [
           user.hotelId,
           folioId,
@@ -1314,6 +1379,8 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
           "退房补收",
           nowIso(),
           user.realName ?? user.username,
+          /* 补收的是消费欠款，不是押金 */
+          "ROOM_PAYMENT",
         ]
       );
       run(`UPDATE folios SET paid_amount = COALESCE(paid_amount,0) + ? WHERE id = ? AND hotel_id = ?`, [
@@ -1359,17 +1426,18 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
     const refundCash = round2(Math.min(refundDue, Math.max(0, depositOnFolio)));
 
     if (refundCash > 0) {
-      /* ① 找押金那笔原始收款（refund_of 要指向它，便于对账） */
-      const depositPay = get<{ id: number; method: string }>(
-        `SELECT id, method FROM payments
-          WHERE folio_id = ? AND hotel_id = ? AND amount > 0 AND remark LIKE '%押金%'
-          ORDER BY id LIMIT 1`,
-        [folioId, user.hotelId]
-      );
+      /*
+       * ① 找押金那笔原始收款（refund_of 要指向它，便于对账）
+       *
+       * 第九轮 P1-2：原来用 `remark LIKE '%押金%'` 找 —— 押金备注写成「订金」就找不到，
+       * refund_of 为空、押金退不回去，还可能被当成房费退款重复退。
+       * 现在走唯一口径 findDepositPayment：kind = 'DEPOSIT' 优先，旧数据（kind 为空）才按备注兜底。
+       */
+      const depositPay = findDepositPayment(user.hotelId, folioId);
       run(
         `INSERT INTO payments
-           (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, refund_of, operator)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+           (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, refund_of, operator, kind)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
         [
           user.hotelId,
           folioId,
@@ -1382,6 +1450,8 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
           nowIso(),
           depositPay?.id ?? null,
           user.realName ?? user.username,
+          /* 押金退款的结构化标记（与手动退款 refundKindOf 的口径一致） */
+          "DEPOSIT_REFUND",
         ]
       );
       /*

@@ -1,0 +1,129 @@
+/* 房型详情 / 订单详情共用的卡片内布局（各页独立定义，避免改 app.wxss 影响旧页面） */
+
+.date-cell {
+  display: flex;
+  flex-direction: column;
+  min-width: 200rpx;
+}
+
+.date-value {
+  margin-top: 4rpx;
+  font-size: 30rpx;
+  font-weight: 600;
+  color: #1c1c1e;
+}
+
+.date-arrow {
+  flex: 1;
+  text-align: center;
+  color: #c7c7cc;
+}
+
+/* 状态时间线 */
+.timeline {
+  padding-left: 6rpx;
+}
+
+.tl-item {
+  display: flex;
+  align-items: flex-start;
+  position: relative;
+  padding-bottom: 28rpx;
+}
+
+.tl-item:last-child {
+  padding-bottom: 0;
+}
+
+/* 竖线：用伪元素连着下一个圆点 */
+.tl-item::after {
+  content: '';
+  position: absolute;
+  left: 9rpx;
+  top: 24rpx;
+  bottom: 0;
+  width: 2rpx;
+  background: #e5e5ea;
+}
+
+.tl-item:last-child::after {
+  display: none;
+}
+
+.tl-dot {
+  width: 20rpx;
+  height: 20rpx;
+  border-radius: 50%;
+  background: #e5e5ea;
+  margin-right: 20rpx;
+  margin-top: 8rpx;
+  flex-shrink: 0;
+}
+
+.tl-dot-on {
+  background: #007aff;
+}
+
+.tl-body {
+  display: flex;
+  flex-direction: column;
+}
+
+.tl-label {
+  font-size: 26rpx;
+  color: #8e8e93;
+}
+
+.tl-label-on {
+  font-size: 26rpx;
+  font-weight: 600;
+  color: #1c1c1e;
+}
+
+.picker-value {
+  flex: 1;
+  text-align: right;
+  font-size: 28rpx;
+  color: #1c1c1e;
+}
+
+.action-row {
+  min-height: 88rpx;
+}
+
+/* 底部操作栏（与房型详情同结构） */
+.has-bottom-bar {
+  padding-bottom: 180rpx;
+}
+
+.bottom-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  padding: 16rpx 24rpx calc(16rpx + constant(safe-area-inset-bottom));
+  padding-bottom: calc(16rpx + env(safe-area-inset-bottom));
+  background: #ffffff;
+  box-shadow: 0 -2rpx 16rpx rgba(0, 0, 0, 0.06);
+}
+
+.bottom-btn {
+  flex: 1;
+  margin: 0 8rpx;
+}
+
+.retry-link {
+  display: inline-block;
+  margin-left: 12rpx;
+  color: #007aff;
+  font-weight: 600;
+}
+
+/*
+ * 底部固定栏会盖住最后一屏内容：给容器留出等高的安全距离。
+ * （不用 :has() —— WXSS 不支持该选择器，写了也不生效，只会让人以为已经处理过。）
+ */
+.container {
+  padding-bottom: 200rpx;
+}

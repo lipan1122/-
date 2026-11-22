@@ -120,6 +120,15 @@ export async function GET(req: Request) {
     balance: round2(balance),
     rechargeTotal: round2(wallet.recharge),
     consumeTotal: round2(wallet.consume),
+    /*
+     * 退款 / 调整两项在第九轮补齐（清单第十节要求「充值记录 / 消费记录 / 退款记录」）：
+     * 与 rechargeTotal / consumeTotal 同一份 getWalletSummary 结果，不另算一套。
+     * 明细见 /api/mini/member/ledger（同一张 member_wallet_ledger 表）。
+     */
+    refundTotal: round2(wallet.refund),
+    adjustTotal: round2(wallet.adjust),
+    /** 余额真相来源标注：旧表 member_wallet.balance 只是缓存，不允许作为口径 */
+    walletSource: "member_wallet_ledger",
     /** 当前可用积分 / 累计获得积分 */
     points: Math.trunc(points),
     pointsEarned: Math.trunc(pointsEarned),

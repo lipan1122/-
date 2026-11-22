@@ -1,0 +1,120 @@
+<!--*
+ * 联系酒店
+ *
+ * 数据来源：GET /api/mini/hotel
+ * 电话 / 地址 / 坐标全部来自服务端；没配置时按钮 disabled 并提示，
+ * 绝不写死一个假号码（清单第 81 行）。
+ -->
+<view class="container">
+  <view wx:if="{{loading}}" class="loading-box">正在加载酒店信息…</view>
+
+  <!-- 未就绪 / 未配置 -->
+  <view wx:if="{{!loading && notReady}}" class="card empty">
+    <text class="subtitle">{{notReadyMsg}}</text>
+    <view class="muted gap-top">
+      酒店联系方式正在对接中。你也可以在订单详情里查看前台电话（若已配置）。
+    </view>
+    <button class="btn btn-ghost" bindtap="onRetry" data-key="main">重新加载</button>
+    <button class="btn btn-ghost" bindtap="goOrders">去我的订单</button>
+  </view>
+
+  <view wx:if="{{!loading && error && !notReady}}" class="error-box">
+    {{error}}
+    <view class="retry-link" bindtap="onRetry" data-key="main">点击重试</view>
+  </view>
+
+  <block wx:if="{{!loading && !notReady && !error}}">
+    <!-- 酒店名片 -->
+    <view class="card">
+      <text class="title">{{hotel.name || '酒店信息暂未配置'}}</text>
+      <view wx:if="{{hotel.description}}" class="muted gap-top">{{hotel.description}}</view>
+
+      <view class="divider"></view>
+
+      <!-- 电话 -->
+      <view class="row">
+        <text class="muted">前台电话</text>
+        <text class="subtitle">{{hotel.phone || '暂未配置'}}</text>
+      </view>
+      <view class="btn-row gap-top">
+        <button class="btn btn-ghost btn-half" bindtap="onCall" disabled="{{!hasPhone}}">拨打电话</button>
+        <button class="btn btn-ghost btn-half" bindtap="onCopyPhone" disabled="{{!hasPhone}}">复制号码</button>
+      </view>
+
+      <view class="divider"></view>
+
+      <!-- 地址 -->
+      <view class="row row-start">
+        <text class="muted">酒店地址</text>
+        <text class="addr">{{hotel.address || '暂未配置'}}</text>
+      </view>
+      <view class="btn-row gap-top">
+        <button class="btn btn-ghost btn-half" bindtap="onOpenLocation" disabled="{{!hasLocation}}">打开地图</button>
+        <button class="btn btn-ghost btn-half" bindtap="onCopyAddress" disabled="{{!hasAddress}}">复制地址</button>
+      </view>
+    </view>
+
+    <!-- 营业 / 入离时间 -->
+    <view class="card">
+      <text class="subtitle">营业与时间</text>
+      <view class="row gap-top">
+        <text class="muted">营业时间</text>
+        <text class="subtitle">{{hotel.businessHours || '请咨询前台'}}</text>
+      </view>
+      <view class="row gap-top">
+        <text class="muted">入住 / 离店</text>
+        <text class="subtitle">
+          {{hotel.checkInTime || '—'}} / {{hotel.checkOutTime || '—'}}
+        </text>
+      </view>
+    </view>
+
+    <!-- 停车 / 设施 -->
+    <view wx:if="{{hotel.parking || hotel.facilities || hotel.notice}}" class="card">
+      <text class="subtitle">入住提示</text>
+      <view wx:if="{{hotel.parking}}" class="policy gap-top">停车：{{hotel.parking}}</view>
+      <view wx:if="{{hotel.facilities}}" class="policy gap-top">设施：{{hotel.facilities}}</view>
+      <view wx:if="{{hotel.notice}}" class="policy gap-top">{{hotel.notice}}</view>
+    </view>
+
+    <!-- 常用入口 -->
+    <view class="card">
+      <view class="row action-row" bindtap="goIndex">
+        <text class="subtitle">查房下单</text>
+        <text class="muted">看实时房量 ›</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row action-row" bindtap="goOrders">
+        <text class="subtitle">我的订单</text>
+        <text class="muted">订单状态 / 取消 / 修改 ›</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row action-row" bindtap="goInStay">
+        <text class="subtitle">在住服务</text>
+        <text class="muted">账单 / 续住 / 换房 ›</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row action-row" bindtap="goMember">
+        <text class="subtitle">会员中心</text>
+        <text class="muted">等级 / 余额 / 积分 ›</text>
+      </view>
+    </view>
+
+    <!-- 协议 -->
+    <view class="card">
+      <view class="row action-row" data-kind="privacy" bindtap="onShowPolicy">
+        <text class="subtitle">隐私说明</text>
+        <text class="muted">查看 ›</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row action-row" data-kind="terms" bindtap="onShowPolicy">
+        <text class="subtitle">服务条款</text>
+        <text class="muted">查看 ›</text>
+      </view>
+    </view>
+
+    <view class="muted footer-tip">
+      小程序只提供查询与申请入口，房态、价格、账单以酒店前台系统为准。
+    </view>
+  </block>
+</view>

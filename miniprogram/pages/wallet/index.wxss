@@ -1,0 +1,117 @@
+/* 储值和积分专有样式 */
+
+.member-card {
+  background: linear-gradient(135deg, #ffffff 0%, #f7fbff 100%);
+}
+
+.stat-grid {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.stat {
+  width: 50%;
+  padding: 12rpx 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.stat-value {
+  font-size: 36rpx;
+  font-weight: 600;
+  color: #1c1c1e;
+  margin-bottom: 4rpx;
+}
+
+/* tab */
+.tab-row {
+  display: flex;
+  background: #f2f2f7;
+  border-radius: 12rpx;
+  padding: 6rpx;
+}
+
+.tab {
+  flex: 1;
+  text-align: center;
+  padding: 14rpx 0;
+  font-size: 26rpx;
+  color: #8e8e93;
+  border-radius: 10rpx;
+}
+
+.tab-on {
+  background: #ffffff;
+  color: #007aff;
+  font-weight: 600;
+}
+
+/* 流水 */
+.rec-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 22rpx 0;
+  border-bottom: 1rpx solid #f0f0f2;
+}
+
+.rec-item:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.rec-main {
+  flex: 1;
+  min-width: 0;
+  padding-right: 20rpx;
+}
+
+.rec-title {
+  display: block;
+  font-size: 28rpx;
+  color: #1c1c1e;
+  margin-bottom: 4rpx;
+}
+
+.rec-right {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.rec-amount {
+  font-size: 28rpx;
+  font-weight: 600;
+}
+
+.rec-in {
+  color: #1c9e4a;
+}
+
+.rec-out {
+  color: #ff3b30;
+}
+
+.empty-sub {
+  padding: 40rpx 0 20rpx;
+  text-align: center;
+  color: #8e8e93;
+  font-size: 26rpx;
+}
+
+.action-row {
+  min-height: 88rpx;
+}
+
+.footer-tip {
+  padding: 16rpx 8rpx 32rpx;
+  line-height: 1.6;
+}
+
+.retry-link {
+  display: inline-block;
+  margin-left: 12rpx;
+  color: #007aff;
+  font-weight: 600;
+}

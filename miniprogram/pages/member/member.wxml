@@ -64,6 +64,26 @@
         <text class="muted">查看 ›</text>
       </view>
       <view class="divider"></view>
+      <view class="row" bindtap="goInStay">
+        <text class="subtitle">在住服务</text>
+        <text class="muted">账单 / 续住 / 换房 / 客房服务 ›</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row" bindtap="goWallet">
+        <text class="subtitle">储值和积分</text>
+        <text class="muted">余额 / 流水明细 ›</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row" bindtap="goInvoices">
+        <text class="subtitle">发票</text>
+        <text class="muted">查看 / 申请开票 ›</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row" bindtap="goNotifications">
+        <text class="subtitle">通知中心</text>
+        <text class="muted">预订 / 续住 / 服务进度 ›</text>
+      </view>
+      <view class="divider"></view>
       <view class="row" bindtap="goBind">
         <text class="subtitle">更换绑定手机号</text>
         <text class="muted">去修改 ›</text>
@@ -72,6 +92,13 @@
       <view class="row" bindtap="onLogout">
         <text class="subtitle" style="color: #e0453c;">退出登录</text>
         <text class="muted">清除本机登录状态 ›</text>
+      </view>
+    </view>
+
+    <view class="card">
+      <view class="row" bindtap="goContact">
+        <text class="subtitle">联系酒店</text>
+        <text class="muted">电话 / 地址 / 地图 ›</text>
       </view>
     </view>
 

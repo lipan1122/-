@@ -1,0 +1,78 @@
+<!--*
+ * 通知中心
+ *
+ * 数据来源：GET /api/mini/notifications（服务端只按 mini_user_id 下发）
+ * 已读上报：POST /api/mini/notifications/read（单条 ids / 全部 all）
+ * 点一条通知会展开正文并跳到对应页面（订单详情 / 在住服务 / 服务列表 / 发票）。
+ -->
+<view class="container">
+  <view wx:if="{{loading}}" class="loading-box">正在加载通知…</view>
+
+  <view wx:if="{{!loading && notReady}}" class="card empty">
+    <text class="subtitle">{{notReadyMsg}}</text>
+    <view class="muted gap-top">通知中心正在对接酒店系统，重要进度请留意短信或联系前台。</view>
+    <button class="btn btn-ghost" bindtap="goContact">联系酒店</button>
+    <button class="btn btn-ghost" bindtap="onRetry" data-key="main">重新加载</button>
+  </view>
+
+  <view wx:if="{{!loading && error && !notReady}}" class="error-box">
+    {{error}}
+    <view class="retry-link" bindtap="onRetry" data-key="main">点击重试</view>
+  </view>
+
+  <block wx:if="{{!loading && !notReady && !error}}">
+    <view class="card">
+      <view class="row">
+        <view>
+          <text class="title">通知</text>
+          <view class="muted gap-top">
+            {{notifications.length}} 条{{unreadCount > 0 ? '，其中 ' + unreadCount + ' 条未读' : '，全部已读'}}
+          </view>
+        </view>
+        <button class="btn-small mark-btn" bindtap="onMarkAll" disabled="{{unreadCount === 0 || marking}}">
+          {{marking ? '处理中…' : '全部已读'}}
+        </button>
+      </view>
+    </view>
+
+    <view wx:if="{{notifications.length === 0}}" class="card empty">
+      暂无通知
+      <view class="muted gap-top">预订确认、续住结果、服务受理等消息会推送到这里</view>
+      <button class="btn btn-ghost" bindtap="goMember">去会员中心</button>
+    </view>
+
+    <block wx:else>
+      <view
+        class="card note {{item.read ? '' : 'note-unread'}}"
+        wx:for="{{notifications}}"
+        wx:key="notificationId"
+        data-index="{{index}}"
+        bindtap="onTapNote"
+      >
+        <view class="row">
+          <view class="note-head">
+            <view wx:if="{{!item.read}}" class="dot"></view>
+            <text class="note-title">{{item.title}}</text>
+          </view>
+          <text class="chip {{item.read ? 'chip-gray' : 'chip'}}">{{item.typeLabel || (item.read ? '已读' : '未读')}}</text>
+        </view>
+
+        <view class="note-content {{item.expanded ? 'note-content-full' : ''}}">{{item.content}}</view>
+
+        <view class="row gap-top">
+          <text class="muted">{{item.createdAtText}}</text>
+          <view
+            wx:if="{{item.url}}"
+            class="go-link"
+            data-url="{{item.url}}"
+            catchtap="onGo"
+          >
+            去处理 ›
+          </view>
+        </view>
+      </view>
+
+      <view class="muted footer-tip">只显示当前微信账号的通知，换账号或解绑后不会互相串消息。</view>
+    </block>
+  </block>
+</view>

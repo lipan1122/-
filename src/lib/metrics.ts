@@ -287,6 +287,15 @@ export type StayNightSlice = {
   roomType: string | null;
   channelId: number | null;
   channel: string | null;
+  /**
+   * 房间 id / 房号（第九轮：综合营业日报-房间要按「房间 × 营业日」出间夜）。
+   *
+   * 房间号只用于显示与「房间 × 日」聚合的键；占用口径仍与 occupancyMetrics 一致
+   * （同一批 stays、同一套晚数表达式），只是把维度补出来，不改任何数值。
+   * 房间已被删除 / 未排房的单为 null，调用方归入「未关联房」。
+   */
+  roomId: number | null;
+  roomNo: string | null;
   /** 区间内占用的第一晚（含，YYYY-MM-DD） */
   firstNight: string;
   /** 区间内占用的最后一晚（含，YYYY-MM-DD） */
@@ -316,6 +325,8 @@ const STAY_NIGHT_SLICE_SQL = `
          rt.name AS room_type,
          c.id AS channel_id,
          c.name AS channel,
+         r.id AS room_id,
+         r.room_no AS room_no,
          MAX(substr(s.check_in_time, 1, 10), ?) AS first_night,
          CASE WHEN s.status = 'INHOUSE' THEN date(?, '+1 day')
               ELSE MIN(COALESCE(NULLIF(substr(s.actual_check_out, 1, 10), ''), s.expect_check_out),
@@ -380,6 +391,8 @@ export function stayNightSlices(hotelId: number, from: string, to: string): Stay
     room_type: string | null;
     channel_id: number | null;
     channel: string | null;
+    room_id: number | null;
+    room_no: string | null;
     first_night: string;
     last_night_exclusive: string | null;
     nights: number | null;
@@ -400,6 +413,8 @@ export function stayNightSlices(hotelId: number, from: string, to: string): Stay
       roomType: r.room_type == null ? null : String(r.room_type),
       channelId: r.channel_id == null ? null : Number(r.channel_id),
       channel: r.channel == null ? null : String(r.channel),
+      roomId: r.room_id == null ? null : Number(r.room_id),
+      roomNo: r.room_no == null ? null : String(r.room_no),
       firstNight: first,
       lastNight: lastInclusive || shiftDay(first, nights - 1),
       nights,

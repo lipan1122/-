@@ -1,0 +1,78 @@
+/* 通知中心专有样式 */
+
+.mark-btn {
+  height: 56rpx;
+  line-height: 56rpx;
+  font-size: 24rpx;
+  padding: 0 22rpx;
+}
+
+.mark-btn[disabled] {
+  background: #f2f2f7;
+  color: #b0b0b6;
+}
+
+.note {
+  position: relative;
+}
+
+/* 未读通知：左侧蓝色竖条 + 更白的底，扫一眼就能分辨 */
+.note-unread {
+  border-left: 6rpx solid #007aff;
+}
+
+.note-head {
+  display: flex;
+  align-items: center;
+}
+
+.dot {
+  width: 14rpx;
+  height: 14rpx;
+  border-radius: 50%;
+  background: #ff3b30;
+  margin-right: 10rpx;
+  flex-shrink: 0;
+}
+
+.note-title {
+  font-size: 30rpx;
+  font-weight: 600;
+  color: #1c1c1e;
+}
+
+/* 正文默认 2 行截断，点击展开 */
+.note-content {
+  margin-top: 10rpx;
+  font-size: 26rpx;
+  color: #3a3a3c;
+  line-height: 1.6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.note-content-full {
+  -webkit-line-clamp: unset;
+  display: block;
+}
+
+.go-link {
+  font-size: 26rpx;
+  color: #007aff;
+  font-weight: 500;
+}
+
+.footer-tip {
+  padding: 8rpx 8rpx 32rpx;
+  line-height: 1.6;
+}
+
+.retry-link {
+  display: inline-block;
+  margin-left: 12rpx;
+  color: #007aff;
+  font-weight: 600;
+}

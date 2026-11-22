@@ -40,6 +40,14 @@
  *   /ar 页面（账户）与报表（协议单位）拆成两个宇宙，财务仍要对两本账。
  *   双写让两边在同一个账户下汇合，才是根因修复。
  *
+ * ── 第九轮修复（P1-3）：收款 / 转账 / 核销也必须双边 ──
+ * 第八轮只把「挂账」做了双写。收款、转账、坏账核销仍然只改账户总账，
+ * ar_ledgers 的未结余额减不下去 → /ar 账户页与协议单位台账两个数、客户对账必错。
+ * 本轮补齐（同一个 SAVEPOINT 内）：
+ *   · 账户入账 → 台账 CHARGE；收款 → 台账 FIFO 冲减；核销 → 台账 FIFO 冲减 + ar_write_offs 记明细；
+ *   · 转账 → 源单位 FIFO 冲减 + TRANSFER_OUT 审计行，目标单位新增 TRANSFER_IN 台账。
+ * 详见下方「账户总账 ↔ 协议单位逐笔台账 双边同步」段。
+ *
  * ── 事务 ──
  * 与 member-wallet.ts 一致用 SAVEPOINT：本文件会在收银台已有的 tx() 内被调用，
  * BEGIN 嵌套会抛错，SAVEPOINT 在有/无外层事务两种场景下都安全。
@@ -130,11 +138,28 @@ export function ensureArLedgerSchema(): void {
       settled_amount REAL DEFAULT 0,
       due_date TEXT,
       status TEXT DEFAULT 'OPEN',
+      kind TEXT DEFAULT 'CHARGE',
       operator TEXT,
       remark TEXT,
       created_at TEXT
     )
   `);
+  /*
+   * 第九轮 P1-3：kind 区分台账行来源（CHARGE / TRANSFER_IN / TRANSFER_OUT）。
+   * 老库 CREATE TABLE IF NOT EXISTS 不会补列，这里 ALTER（幂等，吞掉并发重复补列）。
+   * 默认值 'CHARGE' 让升级前的历史行（当时只有「挂账」一种来源）自动归位。
+   */
+  const cols = db
+    .prepare(`PRAGMA table_info(ar_ledgers)`)
+    .all()
+    .map((c) => String((c as { name?: unknown }).name ?? ""));
+  if (!cols.includes("kind")) {
+    try {
+      db.exec(`ALTER TABLE ar_ledgers ADD COLUMN kind TEXT DEFAULT 'CHARGE'`);
+    } catch (e) {
+      if (!/duplicate column name/i.test(e instanceof Error ? e.message : String(e))) throw e;
+    }
+  }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_ar_ledgers_company ON ar_ledgers(hotel_id, company_id, status)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_ar_ledgers_bizdate ON ar_ledgers(hotel_id, biz_date)`);
   schemaReady = true;
@@ -231,6 +256,30 @@ export function ensureArAccountSchema(): void {
   if (!columnsOf("ar_transactions").includes("request_id")) {
     addColumn("ar_transactions", `ALTER TABLE ar_transactions ADD COLUMN request_id TEXT`);
   }
+  /*
+   * 第九轮 P1-3：核销记录要能反查被冲减的逐笔台账行（一次核销可能 FIFO 跨多条）。
+   * 旧库补列；表本身由 ar/actions.ts 的 ensureArSchema 建，这里也兜底建一次。
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ar_write_offs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      hotel_id INTEGER NOT NULL,
+      ar_account_id INTEGER NOT NULL,
+      transaction_id INTEGER,
+      ar_ledger_id INTEGER,
+      amount REAL NOT NULL,
+      note TEXT,
+      operator TEXT,
+      created_at TEXT NOT NULL
+    )
+  `);
+  if (!columnsOf("ar_write_offs").includes("ar_ledger_id")) {
+    addColumn("ar_write_offs", `ALTER TABLE ar_write_offs ADD COLUMN ar_ledger_id INTEGER`);
+  }
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_ar_wo_ledger
+       ON ar_write_offs (hotel_id, ar_ledger_id) WHERE ar_ledger_id IS NOT NULL`
+  );
   db.exec(
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_ar_tx_request
        ON ar_transactions (hotel_id, request_id) WHERE request_id IS NOT NULL`
@@ -436,6 +485,277 @@ function normalizeBizDate(value?: string): string {
   return DATE_RE.test(raw) ? raw : todayStr();
 }
 
+/* ------------------------------------------------------------------ *
+ * 第九轮 P1-3：账户总账 ↔ 协议单位逐笔台账 **双边同步**
+ *
+ * ── 缺陷（本轮修的是「单边」）──
+ * 第八轮只把「挂账」做成双写：ar_ledgers 记笔级应收，同时 ar_transactions 记 POST、
+ * ar_accounts.balance 增加。但「收款 / 转账 / 坏账核销」仍然只动账户总账：
+ *   · payArAction      → 账户余额减少，协议单位台账未结余额一动不动；
+ *   · writeOffArAction → 账户核销了坏账，台账仍显示未结；
+ *   · transferArAction → 两个账户余额一增一减，两个协议单位的台账都没动。
+ * 于是同一个协议单位在 /ar 页面（账户）和台账区（ar_ledgers）看到两个不同的欠款数，
+ * 财务和协议客户对账必然失败。
+ *
+ * ── 本段提供的同步原语（调用方都已在 tx() 里，这里再套 SAVEPOINT，嵌套安全）──
+ *   arAccountCompanyId        账户 → 协议单位（只认精确 company_id 绑定，不按名称猜）
+ *   settleCompanyLedgers      按未结台账 FIFO 增加 settled_amount（收款 / 转账 / 核销共用）
+ *   postAccountLedgerCharge   账户「入账」→ 台账补一条 CHARGE（保证入账也是双边）
+ *   syncAccountSettlement     账户「收款 / 核销」减少应收 → 同额冲减台账
+ *   syncAccountTransfer       转账两条腿都留明细：源单位 FIFO 冲减 + TRANSFER_OUT 审计行，
+ *                             目标单位新增 TRANSFER_IN 台账（增加该单位应收）
+ *
+ * ── 账户没绑定协议单位怎么办 ──
+ * 「入账」页允许建纯账户（协议单位、挂账客户之外的往来户），这类账户没有逐笔台账。
+ * 此时台账侧跳过，由调用方把 gap（台账未覆盖金额）写进操作日志，**不静默当作已同步**。
+ * ------------------------------------------------------------------ */
+
+/** 一次台账冲减的分摊结果（写 ar_write_offs 时要逐条落地） */
+export type ArLedgerSettlement = { ledgerId: number; amount: number; status: ArStatus };
+
+/** FIFO 冲减结果：applied 实际冲减额，gap 台账不足部分（= amount − applied） */
+export type ArLedgerSettleResult = { applied: number; gap: number; allocations: ArLedgerSettlement[] };
+
+/**
+ * AR 账户绑定的协议单位
+ *
+ * 只认 ar_accounts.company_id 精确绑定（第八轮双写时固化下来的），
+ * 不再按名称模糊匹配 —— 名称相似的两家单位（「西湖旅行社」/「西湖旅行社（分部）」）
+ * 一旦配错，收款会冲减到别人家的应收上，比不同步更糟。
+ */
+export function arAccountCompanyId(hotelId: number, accountId: number): number | null {
+  ensureArAccountSchema();
+  const row = get<{ company_id: number | null }>(
+    `SELECT company_id FROM ar_accounts WHERE id = ? AND hotel_id = ?`,
+    [accountId, hotelId]
+  );
+  const cid = Math.trunc(Number(row?.company_id ?? 0));
+  return Number.isFinite(cid) && cid > 0 ? cid : null;
+}
+
+/**
+ * 按未结台账 FIFO 冲减某协议单位的应收
+ *
+ * 口径与 /ar 页面一致：只动 OPEN / PARTIAL，按 (biz_date, id) 先到先冲，
+ * 单笔不超过该行未结余额，冲完推进状态 PARTIAL → SETTLED。
+ * `0 ≤ settled_amount ≤ amount` 是 test-member-ar.mjs 断言过的硬约束，这里必须守住。
+ */
+export function settleCompanyLedgers(
+  hotelId: number,
+  companyId: number,
+  amount: number,
+  opts: { operator?: string; bizDate?: string; note?: string } = {}
+): ArLedgerSettleResult {
+  ensureArLedgerSchema();
+  const total = round2(Number(amount));
+  if (!Number.isFinite(total) || total <= EPS) return { applied: 0, gap: Math.max(0, round2(total || 0)), allocations: [] };
+
+  return atomically(() => {
+    const rows = all<{ id: number; amount: number | null; settled_amount: number | null }>(
+      `SELECT id, amount, settled_amount
+         FROM ar_ledgers
+        WHERE hotel_id = ? AND company_id = ? AND status IN ('OPEN', 'PARTIAL')
+        ORDER BY biz_date ASC, id ASC`,
+      [hotelId, companyId]
+    );
+
+    const allocations: ArLedgerSettlement[] = [];
+    let left = total;
+    for (const row of rows) {
+      if (left <= EPS) break;
+      const ledgerAmount = round2(Number(row.amount ?? 0));
+      const settledBefore = round2(Number(row.settled_amount ?? 0));
+      const outstanding = round2(ledgerAmount - settledBefore);
+      if (outstanding <= EPS) continue;
+
+      const take = round2(Math.min(left, outstanding));
+      const settledAfter = round2(settledBefore + take);
+      const status: ArStatus = settledAfter >= ledgerAmount - EPS ? "SETTLED" : "PARTIAL";
+      if (opts.note) {
+        run(
+          `UPDATE ar_ledgers
+              SET settled_amount = ?, status = ?, remark = COALESCE(remark, '') || ?
+            WHERE id = ? AND hotel_id = ?`,
+          [settledAfter, status, `；${opts.note}`, row.id, hotelId]
+        );
+      } else {
+        run(`UPDATE ar_ledgers SET settled_amount = ?, status = ? WHERE id = ? AND hotel_id = ?`, [
+          settledAfter,
+          status,
+          row.id,
+          hotelId,
+        ]);
+      }
+      allocations.push({ ledgerId: Number(row.id), amount: take, status });
+      left = round2(left - take);
+    }
+
+    return { applied: round2(total - left), gap: round2(Math.max(0, left)), allocations };
+  });
+}
+
+/**
+ * 账户「入账」（postArAction）→ 协议单位台账补一条 CHARGE
+ *
+ * 这条路径原来只写 ar_transactions（账户应收增加），台账里没有对应笔迹：
+ * 只要该账户绑定了协议单位，账户余额与单位台账就会当场分叉。
+ *
+ * @returns ledgerId = null 表示账户没绑定协议单位（没有逐笔台账可写）
+ */
+export function postAccountLedgerCharge(
+  hotelId: number,
+  input: { accountId: number; amount: number; bizDate?: string; operator?: string; note?: string }
+): { companyId: number | null; ledgerId: number | null } {
+  const amount = round2(Number(input.amount));
+  const companyId = arAccountCompanyId(hotelId, input.accountId);
+  if (!companyId) return { companyId: null, ledgerId: null };
+  if (!Number.isFinite(amount) || amount <= EPS) return { companyId, ledgerId: null };
+
+  ensureArLedgerSchema();
+  const bizDate = normalizeBizDate(input.bizDate);
+  return atomically(() => {
+    const inserted = run(
+      `INSERT INTO ar_ledgers
+         (hotel_id, company_id, folio_id, folio_no, biz_date, amount, settled_amount,
+          due_date, status, kind, operator, remark, created_at)
+       VALUES (?, ?, NULL, NULL, ?, ?, 0, ?, 'OPEN', 'CHARGE', ?, ?, ?)`,
+      [
+        hotelId,
+        companyId,
+        bizDate,
+        amount,
+        addDaysTo(bizDate, DEFAULT_DUE_DAYS),
+        input.operator ?? "系统",
+        input.note ?? `账户入账（无账单，营业日 ${bizDate}）`,
+        nowIso(),
+      ]
+    );
+    return { companyId, ledgerId: inserted.lastInsertRowid };
+  });
+}
+
+/**
+ * 账户「收款 / 坏账核销」减少应收 → 同额冲减协议单位台账
+ *
+ * 两个入口（payArAction 收款、writeOffArAction 核销）共用，避免各写一套口径。
+ * 台账不足以覆盖时返回 gap：核销场景由调用方把 gap 记成一条「无台账」核销记录，
+ * 收款场景把它写进操作日志（钱已经收了，不能因为台账不全而拒收）。
+ */
+export function syncAccountSettlement(
+  hotelId: number,
+  input: { accountId: number; amount: number; bizDate?: string; operator?: string; note?: string }
+): { companyId: number | null } & ArLedgerSettleResult {
+  const amount = round2(Number(input.amount));
+  const companyId = arAccountCompanyId(hotelId, input.accountId);
+  if (!companyId) {
+    return { companyId: null, applied: 0, gap: Math.max(0, amount), allocations: [] };
+  }
+  const result = settleCompanyLedgers(hotelId, companyId, amount, {
+    operator: input.operator,
+    bizDate: normalizeBizDate(input.bizDate),
+    note: input.note,
+  });
+  return { companyId, ...result };
+}
+
+/**
+ * 转账：源账户与目标账户在台账侧都留明细
+ *
+ * 【ar_ledgers 结构不足的说明】
+ * ar_ledgers 是「协议单位 × 挂账笔」的台账，没有「账户间转账」这个动作，
+ * 也没有源/目标账户字段（主键是 company_id）。所以转账不能用「一笔转账记录」
+ * 直接表达，这里拆成三步、在同一个 SAVEPOINT 里完成：
+ *   ① 源单位：FIFO 冲减其未结台账（settled_amount 增加）——与收款同一原语，
+ *      这样「源单位欠款减少」在台账上是真实成立的；
+ *   ② 源单位：再补一条 kind='TRANSFER_OUT' 的审计行，amount = settled_amount = 转出额，
+ *      未结净额为 0，只用于回答「这笔钱是被调账转走的，不是被收款收走的」；
+ *   ③ 目标单位：新增一条 kind='TRANSFER_IN' 的台账（amount = 转出额，未结），
+ *      表示该单位的应收增加，账龄从转账营业日开始算。
+ * 结果是两边账户余额与各自单位台账未结余额同步变化；源单位台账不足时返回 gap，
+ * 由调用方把「无台账可冲减的金额」写进日志，不静默当成已同步。
+ */
+export function syncAccountTransfer(
+  hotelId: number,
+  input: {
+    fromAccountId: number;
+    toAccountId: number;
+    amount: number;
+    bizDate?: string;
+    operator?: string;
+    note?: string;
+  }
+): {
+  fromCompanyId: number | null;
+  toCompanyId: number | null;
+  applied: number;
+  gap: number;
+  outLedgerId: number | null;
+  inLedgerId: number | null;
+} {
+  const amount = round2(Number(input.amount));
+  const bizDate = normalizeBizDate(input.bizDate);
+  const operator = input.operator ?? "系统";
+  const fromCompanyId = arAccountCompanyId(hotelId, input.fromAccountId);
+  const toCompanyId = arAccountCompanyId(hotelId, input.toAccountId);
+  const tail = input.note ? `；${input.note}` : "";
+
+  ensureArLedgerSchema();
+  return atomically(() => {
+    let applied = 0;
+    let gap = round2(Math.max(0, amount));
+    let outLedgerId: number | null = null;
+    let inLedgerId: number | null = null;
+
+    if (fromCompanyId && amount > EPS) {
+      const settled = settleCompanyLedgers(hotelId, fromCompanyId, amount, {
+        operator,
+        bizDate,
+        note: `调账转出至 AR 账户 #${input.toAccountId}`,
+      });
+      applied = settled.applied;
+      gap = settled.gap;
+      outLedgerId = run(
+        `INSERT INTO ar_ledgers
+           (hotel_id, company_id, folio_id, folio_no, biz_date, amount, settled_amount,
+            due_date, status, kind, operator, remark, created_at)
+         VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, 'SETTLED', 'TRANSFER_OUT', ?, ?, ?)`,
+        [
+          hotelId,
+          fromCompanyId,
+          bizDate,
+          amount,
+          amount,
+          bizDate,
+          operator,
+          `调账转出至 AR 账户 #${input.toAccountId}${tail}`,
+          nowIso(),
+        ]
+      ).lastInsertRowid;
+    }
+
+    if (toCompanyId && amount > EPS) {
+      inLedgerId = run(
+        `INSERT INTO ar_ledgers
+           (hotel_id, company_id, folio_id, folio_no, biz_date, amount, settled_amount,
+            due_date, status, kind, operator, remark, created_at)
+         VALUES (?, ?, NULL, NULL, ?, ?, 0, ?, 'OPEN', 'TRANSFER_IN', ?, ?, ?)`,
+        [
+          hotelId,
+          toCompanyId,
+          bizDate,
+          amount,
+          addDaysTo(bizDate, DEFAULT_DUE_DAYS),
+          operator,
+          `调账转入自 AR 账户 #${input.fromAccountId}${tail}`,
+          nowIso(),
+        ]
+      ).lastInsertRowid;
+    }
+
+    return { fromCompanyId, toCompanyId, applied, gap, outLedgerId, inLedgerId };
+  });
+}
+
 /** 营业日 + N 天，返回 YYYY-MM-DD */
 function addDaysTo(date: string, days: number): string {
   const d = new Date(`${date}T00:00:00`);
@@ -556,8 +876,8 @@ export function postArCharge(hotelId: number, input: ArChargeInput): ArPostResul
     const inserted = run(
       `INSERT INTO ar_ledgers
          (hotel_id, company_id, folio_id, folio_no, biz_date, amount, settled_amount,
-          due_date, status, operator, remark, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'OPEN', ?, ?, ?)`,
+          due_date, status, kind, operator, remark, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'OPEN', 'CHARGE', ?, ?, ?)`,
       [
         hotelId,
         companyId,

@@ -1,0 +1,162 @@
+<!--*
+ * 客房服务
+ *
+ * 提交：叫醒 → /stays/:id/wakeup；早餐 → /breakfast；其他 → /stays/:id/service
+ * 列表：GET /api/mini/service-orders（只回本人的请求）
+ * 每个请求带 request_id 幂等键：重复点提交不会给前台派 5 个一样的工单。
+ -->
+<view class="container">
+  <view wx:if="{{loading}}" class="loading-box">正在加载在住信息…</view>
+
+  <!-- 在住接口未就绪 -->
+  <view wx:if="{{!loading && notReady}}" class="card empty">
+    <text class="subtitle">{{notReadyMsg}}</text>
+    <view class="muted gap-top">客房服务正在对接酒店系统，急需服务请直接联系前台。</view>
+    <button class="btn btn-ghost" bindtap="goContact">联系酒店</button>
+    <button class="btn btn-ghost" bindtap="onRetry" data-key="main">重新加载</button>
+  </view>
+
+  <view wx:if="{{!loading && error && !notReady}}" class="error-box">
+    {{error}}
+    <view class="retry-link" bindtap="onRetry" data-key="main">点击重试</view>
+  </view>
+
+  <view wx:if="{{!loading && !notReady && !error && !stay}}" class="card empty">
+    当前没有在住订单
+    <view class="muted gap-top">办理入住后可以在线提交客房服务请求</view>
+    <button class="btn btn-ghost" bindtap="goInStay">去看在住服务</button>
+  </view>
+
+  <block wx:if="{{!loading && !notReady && stay}}">
+    <!-- 在住 -->
+    <view class="card">
+      <view class="row">
+        <view>
+          <text class="subtitle">{{stay.roomNo}} · {{stay.roomTypeName}}</text>
+          <view class="muted gap-top">离店 {{stay.checkOutText}}</view>
+        </view>
+        <text class="chip chip-green">在住</text>
+      </view>
+    </view>
+
+    <!-- 服务类型 -->
+    <view class="card">
+      <text class="subtitle">需要什么服务</text>
+      <view class="service-grid gap-top">
+        <view
+          wx:for="{{services}}"
+          wx:key="key"
+          class="service-item {{selectedKey === item.key ? 'service-item-on' : ''}}"
+          data-key="{{item.key}}"
+          bindtap="onSelectService"
+        >
+          <text class="service-label">{{item.label}}</text>
+          <text class="service-desc">{{item.desc}}</text>
+        </view>
+      </view>
+    </view>
+
+    <!-- 各类型的专属字段 -->
+    <view class="card">
+      <!-- 早餐：份数 -->
+      <view wx:if="{{selectedChannel === 'breakfast'}}" class="row">
+        <text class="muted">早餐份数</text>
+        <view class="stepper">
+          <view class="step-btn" bindtap="onBreakfastMinus">−</view>
+          <text class="step-value">{{breakfastCount}}</text>
+          <view class="step-btn" bindtap="onBreakfastPlus">＋</view>
+        </view>
+      </view>
+
+      <!-- 叫醒：时间 -->
+      <view wx:if="{{selectedChannel === 'wakeup'}}" class="field">
+        <text class="field-label">叫醒时间</text>
+        <picker mode="time" value="{{wakeupClock}}" bindchange="onWakeupChange">
+          <view class="picker-value">{{wakeupClock}}</view>
+        </picker>
+      </view>
+
+      <!-- 其他：数量 + 期望时间 -->
+      <block wx:if="{{selectedChannel === 'service'}}">
+        <view class="row">
+          <text class="muted">数量</text>
+          <view class="stepper">
+            <view class="step-btn" bindtap="onQtyMinus">−</view>
+            <text class="step-value">{{quantity}}</text>
+            <view class="step-btn" bindtap="onQtyPlus">＋</view>
+          </view>
+        </view>
+        <view class="field">
+          <text class="field-label">期望时间</text>
+          <picker mode="time" value="{{expectClock}}" bindchange="onExpectChange">
+            <view class="picker-value">{{expectClock || '尽快送达'}}</view>
+          </picker>
+        </view>
+      </block>
+
+      <textarea
+        class="textarea gap-top"
+        value="{{note}}"
+        placeholder="{{selectedKey === 'COMPLAINT' ? '请描述你遇到的问题，前台会尽快处理' : '备注：如品牌偏好、送房时间、具体故障位置'}}"
+        placeholder-class="field-input-placeholder"
+        maxlength="200"
+        bindinput="onNoteInput"
+      ></textarea>
+
+      <view wx:if="{{selectedChannel === 'breakfast'}}" class="muted gap-top">
+        早餐费用并入房间账单，具体价格与供餐时间以酒店确认为准。
+      </view>
+
+      <button class="btn" bindtap="onSubmit" disabled="{{serviceSubmitting}}">
+        {{serviceSubmitting ? '提交中…' : '提交' + selectedLabel + '请求'}}
+      </button>
+      <view class="muted gap-top">提交后前台会受理，处理结果可在下方列表或通知中心查看。</view>
+    </view>
+
+    <!-- 我的服务请求 -->
+    <view class="card">
+      <view class="row">
+        <text class="subtitle">我的服务请求</text>
+        <text class="muted" bindtap="goNotifications">通知中心 ›</text>
+      </view>
+
+      <view wx:if="{{ordersLoading}}" class="loading-box">正在加载服务记录…</view>
+
+      <view wx:if="{{!ordersLoading && ordersNotReady}}" class="empty-sub">
+        服务记录暂未开通
+        <view class="muted gap-top">{{ordersNotReadyMsg}}</view>
+        <button class="btn btn-ghost" bindtap="onRetry" data-key="orders">重新加载</button>
+      </view>
+
+      <view wx:if="{{!ordersLoading && ordersError}}" class="error-box">
+        {{ordersError}}
+        <view class="retry-link" bindtap="onRetry" data-key="orders">点击重试</view>
+      </view>
+
+      <view wx:if="{{!ordersLoading && !ordersNotReady && !ordersError && orders.length === 0}}" class="empty-sub">
+        还没有提交过服务请求
+      </view>
+
+      <block wx:if="{{!ordersLoading && orders.length > 0}}">
+        <view class="order-item" wx:for="{{orders}}" wx:key="orderId">
+          <view class="order-main">
+            <text class="order-label">{{item.serviceLabel}}</text>
+            <view class="muted">{{item.createdAtText}}{{item.note ? ' · ' + item.note : ''}}</view>
+          </view>
+          <view class="order-right">
+            <text class="chip {{item.chipClass}}">{{item.statusLabel}}</text>
+            <view
+              wx:if="{{item.canCancel}}"
+              class="cancel-link"
+              data-id="{{item.orderId}}"
+              data-label="{{item.serviceLabel}}"
+              bindtap="onCancelOrder"
+            >
+              取消
+            </view>
+          </view>
+        </view>
+      </block>
+    </view>
+  </block>
+</view>

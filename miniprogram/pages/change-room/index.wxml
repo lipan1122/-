@@ -1,0 +1,111 @@
+<!--*
+ * 换房申请
+ *
+ * 数据来源：GET /api/mini/stays/current + GET /api/mini/rooms（实时可售房型）
+ * 提交：POST /api/mini/stays/:id/change-room
+ * 小程序只提交申请：前台审核通过后才真正换房（清单第 226 行）。
+ -->
+<view class="container">
+  <view wx:if="{{loading}}" class="loading-box">正在加载在住信息…</view>
+
+  <view wx:if="{{!loading && notReady}}" class="card empty">
+    <text class="subtitle">{{notReadyMsg}}</text>
+    <view class="muted gap-top">换房申请正在对接酒店系统，请直接联系前台办理换房。</view>
+    <button class="btn btn-ghost" bindtap="goContact">联系酒店</button>
+    <button class="btn btn-ghost" bindtap="onRetry" data-key="main">重新加载</button>
+  </view>
+
+  <view wx:if="{{!loading && error && !notReady}}" class="error-box">
+    {{error}}
+    <view class="retry-link" bindtap="onRetry" data-key="main">点击重试</view>
+  </view>
+
+  <view wx:if="{{!loading && !notReady && !error && !stay}}" class="card empty">
+    当前没有在住订单
+    <view class="muted gap-top">只有办理入住后才能申请换房</view>
+    <button class="btn btn-ghost" bindtap="goInStay">去看在住服务</button>
+  </view>
+
+  <block wx:if="{{!loading && stay}}">
+    <!-- 当前房间 -->
+    <view class="card">
+      <view class="row">
+        <view>
+          <text class="title">{{stay.roomNo}}</text>
+          <view class="muted gap-top">{{stay.roomTypeName}}{{stay.guestName ? ' · ' + stay.guestName : ''}}</view>
+        </view>
+        <text class="chip chip-green">在住</text>
+      </view>
+      <view class="row gap-top">
+        <text class="muted">离店日</text>
+        <text class="subtitle">{{stay.checkOutText}}</text>
+      </view>
+    </view>
+
+    <!-- 目标房型 -->
+    <view class="card">
+      <view class="row">
+        <text class="subtitle">想换到</text>
+        <text class="muted">{{selectedTypeId ? '已选择' : '不选则由前台安排'}}</text>
+      </view>
+
+      <view wx:if="{{typeReady}}" class="type-list gap-top">
+        <view
+          wx:for="{{roomTypes}}"
+          wx:key="roomTypeId"
+          class="type-item {{selectedTypeId === item.roomTypeId ? 'type-item-on' : ''}}"
+          data-id="{{item.roomTypeId}}"
+          data-name="{{item.name}}"
+          bindtap="onSelectType"
+        >
+          <view class="type-main">
+            <text class="type-name">{{item.name}}</text>
+            <text wx:if="{{item.isCurrent}}" class="chip chip-gray type-chip">当前房型</text>
+            <view class="muted">
+              <text wx:if="{{item.bedType}}">{{item.bedType}} · </text>
+              <text>可住 {{item.maxOccupancy}} 人 · {{item.remainingText}}</text>
+            </view>
+          </view>
+          <text class="type-price">¥{{item.priceText}}<text class="price-unit">/晚</text></text>
+        </view>
+      </view>
+
+      <view wx:else class="muted gap-top">
+        实时房态暂不可用（房量接口准备中），可直接提交申请，由前台为你安排合适的房间。
+      </view>
+    </view>
+
+    <!-- 原因与备注 -->
+    <view class="card">
+      <view class="field">
+        <text class="field-label">换房原因</text>
+        <picker mode="selector" range="{{reasons}}" range-key="label" value="{{reasonIndex}}" bindchange="onReasonChange">
+          <view class="picker-value">{{reasons[reasonIndex].label}}</view>
+        </picker>
+      </view>
+      <textarea
+        class="textarea gap-top"
+        value="{{note}}"
+        placeholder="补充说明，如：需要无烟房、靠电梯太吵、加婴儿床"
+        placeholder-class="field-input-placeholder"
+        maxlength="150"
+        bindinput="onNoteInput"
+      ></textarea>
+      <view class="muted gap-top">
+        换房需前台审核并安排房间，审核通过后才生效；提交后请留在原房间等待通知。
+      </view>
+    </view>
+
+    <view wx:if="{{hint}}" class="error-box">{{hint}}</view>
+    <view wx:if="{{error && !notReady}}" class="error-box">{{error}}</view>
+
+    <button class="btn" bindtap="onSubmit" disabled="{{submitting}}">
+      {{submitting ? '提交中…' : (selectedTypeId ? '提交换房申请' : '提交申请（由前台安排）')}}
+    </button>
+    <button class="btn btn-ghost" bindtap="goContact">联系前台</button>
+
+    <view class="muted footer-tip">
+      前台审核结果会通过「通知中心」推送；如需加急请直接电话联系前台。
+    </view>
+  </block>
+</view>

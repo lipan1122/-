@@ -1,0 +1,141 @@
+<!--*
+ * 发票
+ *
+ * 列表：GET /api/mini/invoices
+ * 申请：POST /api/mini/invoices（金额由服务端按实际消费确定，页面不接受客户端金额）
+ -->
+<view class="container">
+  <view wx:if="{{loading}}" class="loading-box">正在加载发票…</view>
+
+  <view wx:if="{{!loading && notReady}}" class="card empty">
+    <text class="subtitle">{{notReadyMsg}}</text>
+    <view class="muted gap-top">在线开票正在对接酒店系统，需要发票请直接联系前台开具。</view>
+    <button class="btn btn-ghost" bindtap="goContact">联系酒店</button>
+    <button class="btn btn-ghost" bindtap="onRetry" data-key="main">重新加载</button>
+  </view>
+
+  <view wx:if="{{!loading && error && !notReady}}" class="error-box">
+    {{error}}
+    <view class="retry-link" bindtap="onRetry" data-key="main">点击重试</view>
+  </view>
+
+  <block wx:if="{{!loading && !notReady}}">
+    <!-- 列表 -->
+    <view class="card">
+      <view class="row">
+        <text class="subtitle">我的发票</text>
+        <text class="muted">{{invoices.length}} 张</text>
+      </view>
+
+      <view wx:if="{{invoices.length === 0}}" class="empty-sub">
+        还没有发票记录
+        <view class="muted gap-top">退房后可以在这里申请开票，也可到前台开具</view>
+      </view>
+
+      <block wx:else>
+        <view class="inv-item" wx:for="{{invoices}}" wx:key="invoiceId">
+          <view class="inv-main">
+            <view class="row">
+              <text class="inv-title">{{item.title}}</text>
+              <text class="chip {{item.chipClass}}">{{item.statusLabel}}</text>
+            </view>
+            <view class="muted gap-top">
+              {{item.typeLabel}}{{item.invoiceNo ? ' · ' + item.invoiceNo : ''}}
+            </view>
+            <view class="muted">{{item.createdAtText}}</view>
+            <view wx:if="{{item.remark}}" class="muted">{{item.remark}}</view>
+          </view>
+          <view class="inv-right">
+            <text class="inv-amount">¥{{item.amountText}}</text>
+            <view wx:if="{{item.invoiceNo}}" class="copy-link" data-no="{{item.invoiceNo}}" bindtap="onCopyNo">复制号码</view>
+          </view>
+        </view>
+      </block>
+    </view>
+
+    <!-- 申请表单 -->
+    <view wx:if="{{showForm}}" class="card">
+      <text class="subtitle">申请开票</text>
+
+      <view class="field">
+        <text class="field-label">发票类型</text>
+        <picker mode="selector" range="{{types}}" range-key="label" value="{{typeIndex}}" bindchange="onTypeChange">
+          <view class="picker-value">{{types[typeIndex].label}}</view>
+        </picker>
+      </view>
+
+      <view class="field">
+        <text class="field-label">抬头类型</text>
+        <picker mode="selector" range="{{titleTypes}}" range-key="label" value="{{titleTypeIndex}}" bindchange="onTitleTypeChange">
+          <view class="picker-value">{{titleTypes[titleTypeIndex].label}}</view>
+        </picker>
+      </view>
+
+      <view class="field">
+        <text class="field-label">发票抬头</text>
+        <input
+          class="field-input"
+          data-field="title"
+          value="{{title}}"
+          placeholder="{{titleTypes[titleTypeIndex].value === 'COMPANY' ? '单位名称（与营业执照一致）' : '个人姓名'}}"
+          placeholder-class="field-input-placeholder"
+          maxlength="60"
+          bindinput="onInput"
+        />
+      </view>
+
+      <view wx:if="{{titleTypes[titleTypeIndex].value === 'COMPANY'}}" class="field">
+        <text class="field-label">税号</text>
+        <input
+          class="field-input"
+          data-field="taxNo"
+          value="{{taxNo}}"
+          placeholder="纳税人识别号（必填）"
+          placeholder-class="field-input-placeholder"
+          maxlength="30"
+          bindinput="onInput"
+        />
+      </view>
+
+      <view wx:if="{{types[typeIndex].value === 'ELECTRONIC'}}" class="field">
+        <text class="field-label">接收邮箱</text>
+        <input
+          class="field-input"
+          data-field="email"
+          value="{{email}}"
+          placeholder="选填，用于接收电子发票"
+          placeholder-class="field-input-placeholder"
+          maxlength="60"
+          bindinput="onInput"
+        />
+      </view>
+
+      <view wx:if="{{amountText}}" class="row gap-top">
+        <text class="muted">可开票金额</text>
+        <text class="subtitle">¥{{amountText}}</text>
+      </view>
+      <view class="muted gap-top">
+        开票金额由酒店系统按实际消费确定，不能在本页修改；提交后由前台开具。
+      </view>
+
+      <button class="btn" bindtap="onSubmit" disabled="{{submitting}}">
+        {{submitting ? '提交中…' : '提交开票申请'}}
+      </button>
+      <button class="btn btn-ghost" bindtap="onToggleForm" disabled="{{submitting}}">取消</button>
+    </view>
+
+    <button wx:if="{{!showForm}}" class="btn" bindtap="onToggleForm">申请开票</button>
+
+    <view class="card">
+      <view class="row action-row" bindtap="goInStay">
+        <text class="subtitle">在住服务</text>
+        <text class="muted">账单 / 续住 / 换房 ›</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row action-row" bindtap="goContact">
+        <text class="subtitle">联系前台</text>
+        <text class="muted">发票问题咨询 ›</text>
+      </view>
+    </view>
+  </block>
+</view>

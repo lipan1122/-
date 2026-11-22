@@ -1,0 +1,43 @@
+/* 联系酒店专有样式 */
+
+.btn-row {
+  display: flex;
+}
+
+.btn-half {
+  flex: 1;
+  margin: 0 8rpx;
+}
+
+/* 地址可能较长，右对齐 + 允许换行 */
+.addr {
+  flex: 1;
+  margin-left: 24rpx;
+  font-size: 26rpx;
+  color: #1c1c1e;
+  line-height: 1.6;
+  text-align: right;
+}
+
+.policy {
+  font-size: 26rpx;
+  color: #3a3a3c;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+.action-row {
+  min-height: 88rpx;
+}
+
+.footer-tip {
+  padding: 8rpx 8rpx 32rpx;
+  line-height: 1.6;
+}
+
+.retry-link {
+  display: inline-block;
+  margin-left: 12rpx;
+  color: #007aff;
+  font-weight: 600;
+}

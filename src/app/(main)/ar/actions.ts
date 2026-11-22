@@ -6,7 +6,7 @@ import { get, getDb, run, tx } from "@/lib/db";
 import { bizToday } from "@/lib/biz-date";
 import { requireAdmin, requirePermission, requireUser } from "@/lib/session";
 import { fmtMoney, nowIso, todayStr } from "@/lib/utils";
-import { settleAr } from "@/lib/ar";
+import { postAccountLedgerCharge, settleAr, syncAccountSettlement, syncAccountTransfer } from "@/lib/ar";
 
 /**
  * AR 应收管理（去呼呼「AR 管理」）：账号 / 入账付款 / 转账 / 核销 / 历史核销 / 账龄。
@@ -487,14 +487,34 @@ export async function ensureArSchema(hotelId: number): Promise<void> {
         hotel_id INTEGER NOT NULL,
         ar_account_id INTEGER NOT NULL,
         transaction_id INTEGER,
+        ar_ledger_id INTEGER,
         amount REAL NOT NULL,
         note TEXT,
         operator TEXT,
         created_at TEXT NOT NULL
       )
     `);
+    /*
+     * 第九轮 P1-3：核销要同时冲减协议单位逐笔台账（ar_ledgers），
+     * ar_write_offs 记录被冲减的台账行 id。老库 CREATE TABLE IF NOT EXISTS 不补列，这里 ALTER。
+     */
+    const woCols = db
+      .prepare(`PRAGMA table_info(ar_write_offs)`)
+      .all()
+      .map((c) => String((c as { name?: unknown }).name ?? ""));
+    if (!woCols.includes("ar_ledger_id")) {
+      try {
+        db.exec(`ALTER TABLE ar_write_offs ADD COLUMN ar_ledger_id INTEGER`);
+      } catch (e) {
+        if (!/duplicate column name/i.test(errText(e))) throw e;
+      }
+    }
     db.exec(`CREATE INDEX IF NOT EXISTS idx_ar_tx_account ON ar_transactions (hotel_id, ar_account_id, biz_date)`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_ar_wo_account ON ar_write_offs (hotel_id, ar_account_id)`);
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_ar_wo_ledger
+         ON ar_write_offs (hotel_id, ar_ledger_id) WHERE ar_ledger_id IS NOT NULL`
+    );
     schemaReady = true;
   }
 
@@ -550,12 +570,27 @@ export async function postArAction(formData: FormData): Promise<void> {
         requestId,
       });
       setBalance(hotelId, accountId, after);
-      // 余额、流水、操作日志同一个事务：任何一步失败整体回滚
+      /*
+       * 第九轮 P1-3：账户「入账」也要在协议单位台账留笔迹
+       *
+       * 只写 ar_transactions 的话，绑定协议单位的账户余额会当场与单位台账分叉
+       * （账户加了钱、台账没有这一笔）。绑定单位 → 台账补一条 CHARGE；
+       * 纯账户（没有 company_id）没有逐笔台账，如实写进日志，不假装同步过。
+       */
+      const ledger = postAccountLedgerCharge(hotelId, {
+        accountId,
+        amount,
+        bizDate,
+        operator: user.realName,
+        note: note || `账户入账（营业日 ${bizDate}）`,
+      });
+      // 余额、流水、台账、操作日志同一个事务：任何一步失败整体回滚
       logArOp(
         hotelId,
         user.realName,
         "AR 入账",
-        `${account.code} ${account.name} 入账 ${fmtMoney(amount)}，应收余额 ${fmtMoney(after)}（营业日 ${bizDate}）`
+        `${account.code} ${account.name} 入账 ${fmtMoney(amount)}，应收余额 ${fmtMoney(after)}（营业日 ${bizDate}）` +
+          (ledger.ledgerId ? ` · 协议单位台账 #${ledger.ledgerId}` : " · 账户未绑定协议单位，无逐笔台账")
       );
       return `已为「${account.name}」入账 ${fmtMoney(amount)}，当前应收余额 ${fmtMoney(after)}`;
     });
@@ -619,15 +654,35 @@ export async function payArAction(formData: FormData): Promise<void> {
         requestId,
       });
       setBalance(hotelId, accountId, after);
+      /*
+       * 第九轮 P1-3：收款必须同时冲减协议单位逐笔台账
+       *
+       * 旧实现只改账户余额与 ar_transactions，ar_ledgers 的未结余额一动不动：
+       * 财务在台账区看到的仍是「单位欠 1 万」，而账户已显示收完 —— 对账必然失败。
+       * FIFO 冲减：先到先冲，单笔不超过该行未结，冲完推进 PARTIAL → SETTLED。
+       * 台账不足以覆盖时（历史账户没有逐笔台账）照常收款 —— 钱不能拒收 ——
+       * 但把差额写进操作日志「待核对」，不静默当成已同步。
+       */
+      const ledgerSync = syncAccountSettlement(hotelId, {
+        accountId,
+        amount,
+        bizDate,
+        operator: user.realName,
+        note: `收款冲销（账户 ${account.code}）`,
+      });
+      const gapNote =
+        ledgerSync.gap > 0.001 && ledgerSync.companyId
+          ? ` · 协议单位台账仅冲减 ${fmtMoney(ledgerSync.applied)}，差额 ${fmtMoney(ledgerSync.gap)} 待核对`
+          : "";
       logArOp(
         hotelId,
         user.realName,
         "AR 收款",
         `${account.code} ${account.name} 还款 ${fmtMoney(amount)}，应收余额 ${fmtMoney(balance)} → ${fmtMoney(
           after
-        )}（营业日 ${bizDate}）`
+        )}（营业日 ${bizDate}）` + gapNote
       );
-      return `「${account.name}」已付款 ${fmtMoney(amount)}，剩余应收 ${fmtMoney(after)}`;
+      return `「${account.name}」已付款 ${fmtMoney(amount)}，剩余应收 ${fmtMoney(after)}${gapNote}`;
     });
   } catch (e) {
     if (e instanceof ArError) back(accountId, "err", e.message);
@@ -713,6 +768,29 @@ export async function transferArAction(formData: FormData): Promise<void> {
 
       setBalance(hotelId, from.id, fromAfter);
       setBalance(hotelId, to.id, toAfter);
+      /*
+       * 第九轮 P1-3：一次调账两条腿都要落到协议单位台账
+       *
+       * ar_ledgers 没有「账户间转账」这个概念（主键是 company_id，无源/目标字段），
+       * 所以这里按「源单位 FIFO 冲减 + TRANSFER_OUT 审计行 / 目标单位 TRANSFER_IN 台账」表达：
+       *   · 源单位未结减少 —— 与收款用同一原语，账龄与核销口径不分裂；
+       *   · 目标单位未结增加 —— 新台账行从转账营业日开始计账龄；
+       *   · 两边账户余额 = 各自单位台账未结余额，转账前后都成立。
+       * 源单位台账不足以覆盖时，把差额写进日志待核对（不能因为台账不全就阻止调账）。
+       */
+      const ledgerSync = syncAccountTransfer(hotelId, {
+        fromAccountId: from.id,
+        toAccountId: to.id,
+        amount,
+        bizDate,
+        operator: user.realName,
+        note: note || undefined,
+      });
+      const ledgerNote =
+        ledgerSync.fromCompanyId
+          ? ` · 源单位台账冲减 ${fmtMoney(ledgerSync.applied)}${ledgerSync.outLedgerId ? `（转出行 #${ledgerSync.outLedgerId}）` : ""}` +
+            (ledgerSync.gap > 0.001 ? `，差额 ${fmtMoney(ledgerSync.gap)} 待核对` : "")
+          : " · 转出账户未绑定协议单位，台账侧跳过";
       logArOp(
         hotelId,
         user.realName,
@@ -720,7 +798,8 @@ export async function transferArAction(formData: FormData): Promise<void> {
         `${from.code} ${from.name} → ${to.code} ${to.name} 调账 ${fmtMoney(amount)}；` +
           `转出余额 ${fmtMoney(fromBalance)} → ${fmtMoney(fromAfter)}，转入余额 ${fmtMoney(to.balance)} → ${fmtMoney(
             toAfter
-          )}（营业日 ${bizDate}）`
+          )}（营业日 ${bizDate}）` +
+          ledgerNote
       );
       return `已将 ${fmtMoney(amount)} 从「${from.name}」调账至「${to.name}」`;
     });
@@ -803,28 +882,73 @@ export async function writeOffArAction(formData: FormData): Promise<void> {
         bizDate,
         requestId,
       });
-      run(
-        `INSERT INTO ar_write_offs
-           (hotel_id, ar_account_id, transaction_id, amount, note, operator, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [
-          hotelId,
-          accountId,
-          transactionId,
-          round2(amount),
-          note || `核销 ${post.biz_date} 入账流水 #${post.id}`,
-          user.realName,
-          // 核销时间取真实操作时刻，营业日另存于流水 biz_date
-          nowIso(),
-        ]
-      );
+      const writeOffNote = note || `核销 ${post.biz_date} 入账流水 #${post.id}`;
+      /*
+       * 第九轮 P1-3：坏账核销必须同时冲减协议单位逐笔台账（第四条同步规则）
+       *
+       * 旧实现只写账户流水 + ar_write_offs：账户余额减了，ar_ledgers 的未结仍是原值，
+       * 于是「核销后台账仍显示未结」，财务和协议客户对账失败。
+       * 现在按单位未结台账 FIFO 冲减（settled_amount 增加、状态推进），
+       * 并为每条被冲减的台账各写一条 ar_write_offs（ar_ledger_id 指回台账行）：
+       *   · 一次核销跨多条台账时，金额按分摊行相加 = 核销总额，不重复计；
+       *   · 台账不足（纯账户 / 历史账户没有逐笔台账）的部分单列一条 ar_ledger_id=NULL，
+       *     备注「待核对」，不静默归类。
+       */
+      const ledgerSync = syncAccountSettlement(hotelId, {
+        accountId,
+        amount,
+        bizDate,
+        operator: user.realName,
+        note: `坏账核销（入账流水 #${post.id}）`,
+      });
+      for (const alloc of ledgerSync.allocations) {
+        run(
+          `INSERT INTO ar_write_offs
+             (hotel_id, ar_account_id, transaction_id, ar_ledger_id, amount, note, operator, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            hotelId,
+            accountId,
+            transactionId,
+            alloc.ledgerId,
+            round2(alloc.amount),
+            `${writeOffNote}（台账 #${alloc.ledgerId}）`,
+            user.realName,
+            // 核销时间取真实操作时刻，营业日另存于流水 biz_date
+            nowIso(),
+          ]
+        );
+      }
+      if (ledgerSync.gap > 0.001) {
+        run(
+          `INSERT INTO ar_write_offs
+             (hotel_id, ar_account_id, transaction_id, ar_ledger_id, amount, note, operator, created_at)
+           VALUES (?, ?, ?, NULL, ?, ?, ?, ?)`,
+          [
+            hotelId,
+            accountId,
+            transactionId,
+            round2(ledgerSync.gap),
+            ledgerSync.companyId
+              ? `${writeOffNote}（无逐笔台账可对应，待核对）`
+              : `${writeOffNote}（账户未绑定协议单位，无逐笔台账）`,
+            user.realName,
+            nowIso(),
+          ]
+        );
+      }
       setBalance(hotelId, accountId, after);
+      const ledgerNote = ledgerSync.companyId
+        ? ` · 台账冲减 ${fmtMoney(ledgerSync.applied)}${ledgerSync.allocations.length ? `（${ledgerSync.allocations.length} 笔）` : ""}` +
+          (ledgerSync.gap > 0.001 ? `，差额 ${fmtMoney(ledgerSync.gap)} 待核对` : "")
+        : " · 账户未绑定协议单位，台账侧跳过";
       logArOp(
         hotelId,
         user.realName,
         "AR 坏账核销",
         `${account.code} ${account.name} 核销 ${fmtMoney(amount)}（入账流水 #${post.id} ${post.biz_date}），` +
-          `应收余额 ${fmtMoney(balance)} → ${fmtMoney(after)}`
+          `应收余额 ${fmtMoney(balance)} → ${fmtMoney(after)}` +
+          ledgerNote
       );
       return `已核销「${account.name}」${fmtMoney(amount)}，剩余应收 ${fmtMoney(after)}`;
     });

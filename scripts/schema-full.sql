@@ -26,6 +26,11 @@ CREATE TABLE room_types (
   max_occupancy INTEGER DEFAULT 2,
   base_price REAL DEFAULT 0,
   sort INTEGER DEFAULT 0
+  -- 第九轮《微信小程序专项》第二节 / 第 81 行：房型详情展示字段。
+  -- 数据库原来没有这几列，小程序只能写死假图假设施；补列后 NULL = 酒店未配置，
+  -- 接口返回 null 并标注「未配置」，不做任何编造。与 scripts/migrate-all.mjs
+  -- 第 12.3 段的 addColumn 一一对应（老库靠迁移补齐，全新库建表就带）。
+, images TEXT, facilities TEXT, breakfast_note TEXT, cancellation_policy TEXT, check_in_time TEXT, check_out_time TEXT, deposit_note TEXT
 );
 
 CREATE TABLE rooms (
@@ -159,7 +164,11 @@ CREATE TABLE payments (
   folio_id INTEGER, stay_id INTEGER,
   pay_no TEXT, method TEXT, amount REAL,
   biz_date TEXT, remark TEXT, created_at TEXT
-, request_id TEXT, refund_of INTEGER, operator TEXT);
+, request_id TEXT, refund_of INTEGER, operator TEXT
+-- 收款性质（第九轮 P1-2）：押金不能再靠备注识别
+-- ROOM_PAYMENT 房费收款 / DEPOSIT 押金收取 / DEPOSIT_REFUND 押金退款
+-- ROOM_REFUND 房费退款 / OTHER_PAYMENT 其他收款；NULL = 旧数据待核对
+, kind TEXT);
 
 CREATE TABLE room_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -452,6 +461,8 @@ CREATE TABLE ar_write_offs (
         hotel_id INTEGER NOT NULL,
         ar_account_id INTEGER NOT NULL,
         transaction_id INTEGER,
+        -- 第九轮 P1-3：核销同时冲减协议单位逐笔台账，这里记录被冲减的 ar_ledgers.id
+        ar_ledger_id INTEGER,
         amount REAL NOT NULL,
         note TEXT,
         operator TEXT,
@@ -716,6 +727,22 @@ CREATE TABLE room_type_upgrades (
 
 CREATE TABLE shop_sales (id INTEGER PRIMARY KEY AUTOINCREMENT, hotel_id INTEGER NOT NULL, item_name TEXT, qty INTEGER DEFAULT 1, amount REAL DEFAULT 0, method TEXT, room_no TEXT, created_at TEXT, request_id TEXT);
 
+CREATE TABLE shop_stock_flows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hotel_id INTEGER NOT NULL,
+    item_id INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    qty INTEGER NOT NULL,
+    stock_after INTEGER NOT NULL,
+    unit_price REAL NOT NULL DEFAULT 0,
+    amount REAL NOT NULL DEFAULT 0,
+    sale_id INTEGER,
+    request_id TEXT,
+    note TEXT,
+    operator TEXT,
+    created_at TEXT NOT NULL
+  );
+
 CREATE TABLE channel_room_types (id INTEGER PRIMARY KEY AUTOINCREMENT, hotel_id INTEGER NOT NULL, channel_type TEXT, channel_room_name TEXT, room_type_id INTEGER, created_at TEXT);
 
 CREATE TABLE channel_stores (id INTEGER PRIMARY KEY AUTOINCREMENT, hotel_id INTEGER NOT NULL, channel_type TEXT, channel_hotel_id TEXT, channel_hotel_name TEXT, version TEXT DEFAULT '1.0', order_sync INTEGER DEFAULT 1, status_sync INTEGER DEFAULT 1, price_sync INTEGER DEFAULT 0, created_at TEXT);
@@ -834,6 +861,9 @@ CREATE TABLE ar_ledgers (
           settled_amount REAL DEFAULT 0,
           due_date TEXT,
           status TEXT DEFAULT 'OPEN',
+          -- 第九轮 P1-3：明细类型。CHARGE 正常挂账/入账 / TRANSFER_IN 从其他 AR 账户转入
+          -- （增加本单位应收）/ TRANSFER_OUT 调账转出的审计行（amount = settled，净额 0）
+          kind TEXT DEFAULT 'CHARGE',
           operator TEXT,
           remark TEXT,
           created_at TEXT
@@ -935,6 +965,40 @@ CREATE TABLE mini_program_bookings (
           UNIQUE(hotel_id, booking_id)
         );
 
+-- 小程序站内通知（第九轮 第三节 / 第 302 行「通知必须只发给对应 mini_user_id」）。
+-- 收件人唯一键是 mini_user_id（mini_program_users.id，由服务端 token 解析）；
+-- 刻意不存 mobile / guest_id —— 有手机号列就一定有人写出「按手机号群发」的 SQL。
+-- read_at 为时间戳（NULL = 未读），既支持未读角标也保留首次阅读时间。
+CREATE TABLE mini_notifications (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          hotel_id INTEGER NOT NULL,
+          mini_user_id INTEGER NOT NULL,
+          type TEXT NOT NULL,
+          title TEXT NOT NULL,
+          body TEXT,
+          read_at TEXT,
+          created_at TEXT,
+          ref_type TEXT,
+          ref_id INTEGER
+        );
+
+CREATE TABLE mini_service_requests (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          hotel_id INTEGER NOT NULL,
+          mini_user_id INTEGER NOT NULL,
+          guest_id INTEGER,
+          stay_id INTEGER,
+          booking_id INTEGER,
+          service_type TEXT NOT NULL,
+          status TEXT DEFAULT 'PENDING',
+          request_id TEXT,
+          note TEXT,
+          operator TEXT,
+          created_at TEXT,
+          updated_at TEXT,
+          completed_at TEXT
+        );
+
 CREATE TABLE channel_rate_plans (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         hotel_id INTEGER NOT NULL,
@@ -985,6 +1049,12 @@ CREATE INDEX idx_goods_hotel ON goods (hotel_id, status);
 CREATE INDEX idx_goods_flows_hotel ON goods_flows (hotel_id, goods_id, type);
 
 CREATE UNIQUE INDEX idx_payments_request ON payments(hotel_id, request_id) WHERE request_id IS NOT NULL;
+
+-- 押金报表 / 退款识别按 kind 查询（第九轮 P1-2：不再 LIKE 备注）
+CREATE INDEX idx_payments_kind ON payments(hotel_id, kind, biz_date);
+
+-- 核销记录反查被冲减的协议单位台账
+CREATE INDEX idx_ar_wo_ledger ON ar_write_offs(hotel_id, ar_ledger_id) WHERE ar_ledger_id IS NOT NULL;
 
 CREATE UNIQUE INDEX idx_channel_orders_key ON channel_orders(hotel_id, channel_type, channel_order_no);
 
@@ -1042,6 +1112,10 @@ CREATE UNIQUE INDEX idx_folio_items_request ON folio_items(hotel_id, request_id)
 
 CREATE UNIQUE INDEX idx_shop_sales_request ON shop_sales(hotel_id, request_id) WHERE request_id IS NOT NULL;
 
+CREATE INDEX idx_shop_stock_flows_item ON shop_stock_flows (hotel_id, item_id, type);
+
+CREATE UNIQUE INDEX idx_shop_stock_flows_request ON shop_stock_flows(hotel_id, request_id, item_id, type) WHERE request_id IS NOT NULL;
+
 CREATE INDEX idx_sync_logs_request ON channel_sync_logs(hotel_id, request_no);
 
 CREATE INDEX idx_sync_logs_channel_order ON channel_sync_logs(hotel_id, channel_order_no);
@@ -1083,6 +1157,20 @@ CREATE INDEX idx_rate_calendar_key ON rate_calendar(hotel_id, room_type_id, date
 CREATE UNIQUE INDEX idx_login_attempts_key ON login_attempts(login_key);
 
 CREATE INDEX idx_mini_bookings_user ON mini_program_bookings(hotel_id, mini_user_id);
+
+-- 小程序通知列表 / 未读角标固定按 (hotel_id, mini_user_id, read_at) 过滤。
+-- 与 scripts/migrate-all.mjs 的 addIndex("idx_mini_notifications_user", ...) 完全一致。
+CREATE INDEX idx_mini_notifications_user ON mini_notifications(hotel_id, mini_user_id, read_at);
+
+-- 小程序服务请求（第九轮清单第六节）：客房服务 / 送物 / 维修 / 延迟退房 / 换房 / 唤早 / 续住申请
+-- request_id 幂等的唯一约束：同一家店同一 request_id 只能落一行（部分唯一，历史 NULL 不进索引）
+CREATE UNIQUE INDEX idx_mini_service_requests_req ON mini_service_requests(hotel_id, request_id) WHERE request_id IS NOT NULL;
+
+CREATE INDEX idx_mini_service_requests_user ON mini_service_requests(hotel_id, mini_user_id, id);
+
+CREATE INDEX idx_mini_service_requests_stay ON mini_service_requests(hotel_id, stay_id);
+
+CREATE INDEX idx_mini_service_requests_status ON mini_service_requests(hotel_id, status, id);
 
 CREATE INDEX idx_stays_channel_order ON stays(hotel_id, channel_order_no);
 

@@ -331,6 +331,22 @@ const PERMISSION_MODULE_LABELS: Record<string, string> = {
   settings: "设置",
   guest: "客人",
   member: "会员",
+  /*
+   * 第六~八轮新增的权限点带来的分组
+   *
+   * 新增权限点时如果忘了在这里补映射，设置页的权限矩阵会显示英文分组名
+   * （比如「breakfast」而不是「早餐」）。清单第九轮第 10 项专门点了这个。
+   *
+   * 权限**代码**继续用英文（`breakfast.void`），只有**页面展示**走这张表。
+   */
+  breakfast: "早餐",
+  invoice: "发票",
+  goods: "商品",
+  ar: "应收",
+  company: "协议单位",
+  housekeeping: "客房",
+  shop: "商超",
+  quote: "报价",
 };
 
 /** 权限矩阵的角色列（admin 恒通过，界面上勾满且禁用） */

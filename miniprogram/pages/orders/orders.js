@@ -92,4 +92,16 @@ Page({
   goBind() {
     wx.navigateTo({ url: '/pages/bind/bind' });
   },
+
+  /**
+   * 订单详情：状态时间线 / 金额摘要 / 取消 / 修改 / 核验码 / 发票入口
+   *
+   * 只传 bookingId；服务端会自己校验这单是不是当前用户能看的，
+   * 客户端不传 guestId / 手机号之类的「授权条件」。
+   */
+  onOrderDetail(e) {
+    var id = e.currentTarget.dataset.id;
+    if (!id) return;
+    wx.navigateTo({ url: '/pages/order-detail/index?bookingId=' + encodeURIComponent(id) });
+  },
 });

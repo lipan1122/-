@@ -9,3 +9,46 @@
 .field .picker-value {
   flex: 1;
 }
+
+/* ---------- 隐私说明 / 用户协议 ---------- */
+.agree-row {
+  display: flex;
+  align-items: flex-start;
+  margin-top: 24rpx;
+}
+
+.checkbox {
+  width: 36rpx;
+  height: 36rpx;
+  flex-shrink: 0;
+  margin-right: 14rpx;
+  margin-top: 2rpx;
+  border-radius: 8rpx;
+  border: 2rpx solid #c7c7cc;
+  background: #ffffff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.checkbox-on {
+  background: #007aff;
+  border-color: #007aff;
+}
+
+.checkbox-tick {
+  color: #ffffff;
+  font-size: 24rpx;
+  line-height: 1;
+}
+
+.agree-text {
+  flex: 1;
+  font-size: 24rpx;
+  color: #8e8e93;
+  line-height: 1.6;
+}
+
+.agree-link {
+  color: #007aff;
+}

@@ -1,0 +1,121 @@
+<!--*
+ * 当前账单
+ *
+ * 数据来源：GET /api/mini/stays/:id/folio（没带 stayId 时先取 /stays/current）
+ * 金额一律用服务端字段；明细只做展示，页面不自己重算合计（会与余额对不上）。
+ -->
+<view class="container">
+  <view wx:if="{{loading}}" class="loading-box">正在加载账单…</view>
+
+  <view wx:if="{{!loading && notReady}}" class="card empty">
+    <text class="subtitle">{{notReadyMsg}}</text>
+    <view class="muted gap-top">在线账单正在对接酒店系统，需要核对金额请直接联系前台。</view>
+    <button class="btn btn-ghost" bindtap="goContact">联系酒店</button>
+    <button class="btn btn-ghost" bindtap="onRetry" data-key="main">重新加载</button>
+  </view>
+
+  <view wx:if="{{!loading && error && !notReady}}" class="error-box">
+    {{error}}
+    <view class="retry-link" bindtap="onRetry" data-key="main">点击重试</view>
+  </view>
+
+  <block wx:if="{{!loading && !notReady && !error}}">
+    <!-- 在住信息 -->
+    <view wx:if="{{stay}}" class="card">
+      <view class="row">
+        <view>
+          <text class="title">{{stay.roomNo || '当前在住'}}</text>
+          <view class="muted gap-top">{{stay.guestName}}{{stay.checkOutText !== '—' ? ' · 预计离店 ' + stay.checkOutText : ''}}</view>
+        </view>
+        <text class="chip chip-green">{{stay.statusLabel}}</text>
+      </view>
+      <view wx:if="{{stay.checkInText !== '—'}}" class="row gap-top">
+        <text class="muted">入住时间</text>
+        <text class="muted">{{stay.checkInText}}</text>
+      </view>
+    </view>
+
+    <!-- 明细 -->
+    <view class="card">
+      <view class="row">
+        <text class="subtitle">消费明细</text>
+        <text class="muted">{{items.length}} 笔</text>
+      </view>
+
+      <view wx:if="{{items.length === 0}}" class="empty-sub">
+        暂无消费明细
+        <view class="muted gap-top">在住期间的房费、早餐、客房服务等消费会显示在这里</view>
+      </view>
+
+      <block wx:else>
+        <view class="bill-row" wx:for="{{items}}" wx:key="index">
+          <view class="bill-main">
+            <text class="bill-desc">{{item.description}}</text>
+            <view class="muted">
+              {{item.date}} · {{item.typeLabel}}
+              <text wx:if="{{item.quantityText}}"> · {{item.quantityText}}</text>
+              <text wx:if="{{item.unitPriceText}}"> · {{item.unitPriceText}}</text>
+            </view>
+          </view>
+          <text class="bill-amount {{item.isCredit ? 'bill-credit' : ''}}">
+            {{item.isCredit ? '' : '-'}}¥{{item.amountText}}
+          </text>
+        </view>
+      </block>
+    </view>
+
+    <!-- 合计 -->
+    <view wx:if="{{summary}}" class="card summary-card">
+      <view class="row">
+        <text class="muted">消费合计</text>
+        <text class="subtitle">¥{{summary.totalChargeText}}</text>
+      </view>
+      <view class="row gap-top">
+        <text class="muted">已付 / 预收</text>
+        <text class="subtitle">¥{{summary.totalPaidText}}</text>
+      </view>
+      <view wx:if="{{summary.depositText !== '—'}}" class="row gap-top">
+        <text class="muted">押金</text>
+        <text class="subtitle">¥{{summary.depositText}} {{summary.depositStatus}}</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row">
+        <text class="subtitle">当前应付余额</text>
+        <text class="price">¥{{summary.balanceText}}</text>
+      </view>
+      <view class="muted gap-top">
+        {{summary.balanceNegative ? '负数为预付/多收，退房时前台会退回或抵扣。' : '余额为在住期间累计未结金额，退房时统一结算。'}}
+      </view>
+      <view class="muted gap-top" bindtap="onTip">金额有疑问？点这里看说明 ›</view>
+    </view>
+
+    <view wx:if="{{!summary && items.length > 0}}" class="card">
+      <text class="muted">
+        服务端还没有返回账单合计（接口未完全就绪）。明细金额仅供参考，实际以退房结算单为准。
+      </text>
+    </view>
+
+    <!-- 出口 -->
+    <view class="card">
+      <view class="row action-row" bindtap="goServices">
+        <text class="subtitle">客房服务</text>
+        <text class="muted">送物 / 维修 / 叫醒 ›</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row action-row" bindtap="goInvoices">
+        <text class="subtitle">申请发票</text>
+        <text class="muted">按订单 / 账单开票 ›</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row action-row" bindtap="goContact">
+        <text class="subtitle">联系前台</text>
+        <text class="muted">核对账单 ›</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row action-row" bindtap="goInStay">
+        <text class="subtitle">返回在住服务</text>
+        <text class="muted">续住 / 换房 / 延迟退房 ›</text>
+      </view>
+    </view>
+  </block>
+</view>

@@ -8,7 +8,16 @@ import { get, run, tx } from "@/lib/db";
 import { requirePermission } from "@/lib/session";
 import { changeRoomStatus } from "@/lib/room-status";
 import { conflictMessage, findRoomConflicts } from "@/lib/room-availability";
-import { recalcFolioBalance } from "@/lib/folio";
+import { ensurePaymentKindSchema, recalcFolioBalance } from "@/lib/folio";
+/*
+ * 客史匹配唯一口径（第九轮 P0-1：stays.guest_id 大面积为空）
+ *
+ * 入住单的 guest_id 是会员储值、历史入住次数、会员等级、退款对象的唯一纽带。
+ * 缺了它，会员充值/消费只能按姓名回退 —— 同名客人要么被拒、要么充错人。
+ * 这里复用 lib/guest-match 的口径（证件号 → 手机号），**不再自己写 ORDER BY id LIMIT 1**：
+ * 那等于「同名时取最早建立的档案」，正是会把钱记到别人头上的写法。
+ */
+import { findGuestByIdentity, findSameNameGuests } from "@/lib/guest-match";
 /* 第 4 轮 P1-29：钟点房报价（读房型配置，不再硬编码 15%） */
 import { quoteHourly } from "@/lib/hourly-rate";
 /* 第 4 轮 P1-20：渠道订单状态回传（入住成功 → CHECKED_IN） */
@@ -107,6 +116,8 @@ export async function checkInAction(
 ): Promise<CheckInState> {
   const formData = prevStateOrFormData instanceof FormData ? prevStateOrFormData : maybeFormData;
   if (!formData) return { error: "表单数据缺失，请重试" };
+  /* 第九轮 P1-2：入住押金流水要写 kind，老库先兜底补列（幂等，进程内只查一次） */
+  ensurePaymentKindSchema();
   const mode = readStr(formData, "mode") === "hour" ? "hour" : "day";
 
   // 已排房：可多间，去重并过滤非法值
@@ -432,25 +443,64 @@ export async function checkInAction(
     const guestCountValue = Math.max(1, namedGuests.length);
 
     tx(() => {
-      // 1. 客史：有名有证件/手机号的住客自动建档，主住客挂到入住单上
+      /*
+       * 1. 客史：入住单必须挂上 guests.id（第九轮 P0-1）
+       *
+       * ── 缺陷 ──
+       * 旧写法只按 id_no / mobile 查，两者都没有就直接建档；查询还带
+       * `ORDER BY id LIMIT 1` —— 靠「id 最小」当默认客人。唯一索引缺失或历史脏数据时，
+       * 这一行足以把在住单挂到另一个人头上：会员积分、入住次数、退款对象全错。
+       *
+       * ── 现在的匹配口径（与 lib/guest-match 一致，只多一道同名闸门）──
+       *   ① 表单显式指定客史（guest_id_<i>，前台在同名列表里选过）→ 直接用；
+       *   ② 身份证号（guests.id_no，唯一部分索引）→ ③ 手机号（唯一部分索引）；
+       *   ④ 都没有时，**同名客史恰好 1 条**才允许用姓名辅助关联；
+       *   ⑤ 同名多条 → 拒绝办理并列出候选，绝不选「最早 id」；
+       *   ⑥ 一条同名都没有 → 才真正新建客史。
+       *
+       * 逐位住客顺序处理：主住客先落库，同住人再按 id_no/mobile 就能命中刚建的那条，
+       * 不会因为「本次表单里两个人手机号相同」而撞唯一索引。
+       */
       let primaryGuestId: number | null = null;
-      for (const g of namedGuests) {
+      for (let gi = 0; gi < namedGuests.length; gi += 1) {
+        const g = namedGuests[gi];
         let guestId: number | null = null;
-        if (g.idNo) {
-          guestId =
-            get<{ id: number }>(
-              `SELECT id FROM guests WHERE hotel_id = ? AND id_no = ? ORDER BY id LIMIT 1`,
-              [hotelId, g.idNo]
-            )?.id ?? null;
+
+        /* ① 前台显式选择的客史编号（同名歧义时的唯一出路） */
+        const pickedId = Math.trunc(readNum(formData, `guest_id_${gi}`));
+        if (pickedId > 0) {
+          const picked = get<{ id: number; name: string }>(
+            `SELECT id, name FROM guests
+              WHERE id = ? AND hotel_id = ? AND COALESCE(deleted, 0) = 0`,
+            [pickedId, hotelId]
+          );
+          if (!picked) throw new Error(`指定的客史（ID ${pickedId}）不存在或不属于当前酒店，请重新选择`);
+          guestId = picked.id;
         }
-        if (!guestId && g.mobile) {
-          guestId =
-            get<{ id: number }>(
-              `SELECT id FROM guests WHERE hotel_id = ? AND mobile = ? ORDER BY id LIMIT 1`,
-              [hotelId, g.mobile]
-            )?.id ?? null;
+
+        /* ②③ 唯一口径：证件号优先，其次手机号 */
+        if (guestId === null) {
+          const hit = findGuestByIdentity(hotelId, { idNo: g.idNo, mobile: g.mobile });
+          if (hit) guestId = hit.id;
         }
-        if (!guestId) {
+
+        /* ④⑤ 姓名只在「唯一同名」时辅助关联；多条一律拒绝 */
+        if (guestId === null) {
+          const sameName = findSameNameGuests(hotelId, g.name);
+          if (sameName.length > 1) {
+            const candidates = sameName
+              .map((s) => `#${s.id}${s.mobile ? `（手机尾号 ${s.mobile.slice(-4)}）` : "（无手机号）"}`)
+              .join("、");
+            throw new Error(
+              `住客「${g.name}」在本店有 ${sameName.length} 份同名客史（${candidates}），无法确定关联对象：` +
+                `请补填身份证号或手机号区分，或在表单里用 guest_id_${gi} 指定客史编号后重试`
+            );
+          }
+          if (sameName.length === 1) guestId = sameName[0].id;
+        }
+
+        /* ⑥ 确实没有档案：新建（有证件号/手机号时仍受唯一索引保护） */
+        if (guestId === null) {
           guestId = run(
             `INSERT INTO guests
                (hotel_id, name, gender, id_type, id_no, mobile, company, vip_level, blacklist, note, created_at)
@@ -470,8 +520,10 @@ export async function checkInAction(
             ]
           ).lastInsertRowid;
         }
-        if (!primaryGuestId) primaryGuestId = guestId;
+        if (primaryGuestId === null) primaryGuestId = guestId;
       }
+      /* 前面已保证至少一位有名住客，这里只是把 null 收窄，避免带着空 guest_id 开单 */
+      if (primaryGuestId === null) throw new Error("未能确定主住客客史，请检查住客信息后重试");
 
       /*
        * 第 4 轮 P1-17：押金按房间数重复收取
@@ -604,8 +656,8 @@ export async function checkInAction(
           );
           run(
             `INSERT INTO payments
-               (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, operator)
-             VALUES (?,?,?,?,?,?,?,?,?,?)`,
+               (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, operator, kind)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
             [
               hotelId,
               folioId,
@@ -617,6 +669,8 @@ export async function checkInAction(
               "入住押金",
               now,
               user.realName,
+              /* 第九轮 P1-2：入住押金必须带结构化标记 DEPOSIT（备注是自由文本，不能靠它识别） */
+              "DEPOSIT",
             ]
           );
           /* 押金与流水写完，统一重算（应收 0 - 已收押金 = 负余额 = 欠客人押金） */

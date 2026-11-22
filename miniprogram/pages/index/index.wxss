@@ -40,3 +40,33 @@
   flex-shrink: 0;
   text-align: right;
 }
+
+/* 详情 + 立即预订 两个按钮同一行 */
+.room-actions {
+  display: flex;
+  align-items: center;
+}
+
+.btn-detail {
+  margin-right: 12rpx;
+  background: #f2f2f7;
+  color: #007aff;
+}
+
+/* 底部「联系酒店」一行 */
+.footer-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8rpx 8rpx 24rpx;
+}
+
+.btn-contact {
+  height: 56rpx;
+  line-height: 56rpx;
+  font-size: 24rpx;
+  padding: 0 24rpx;
+  background: #ffffff;
+  color: #007aff;
+  border: 1rpx solid #cfe3ff;
+}

@@ -1,0 +1,84 @@
+/* 换房申请专有样式：可选房型列表 + 选中态 */
+
+.type-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.type-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20rpx;
+  margin-bottom: 12rpx;
+  border-radius: 16rpx;
+  background: #f7f7fa;
+  border: 2rpx solid transparent;
+}
+
+/* 选中：蓝边 + 淡蓝底，和未选中的浅灰底区分明显 */
+.type-item-on {
+  background: #eef4ff;
+  border-color: #007aff;
+}
+
+.type-main {
+  flex: 1;
+  min-width: 0;
+  padding-right: 16rpx;
+}
+
+.type-name {
+  display: block;
+  font-size: 30rpx;
+  font-weight: 600;
+  color: #1c1c1e;
+  margin-bottom: 4rpx;
+}
+
+.type-chip {
+  margin-bottom: 6rpx;
+}
+
+.type-price {
+  flex-shrink: 0;
+  font-size: 30rpx;
+  font-weight: 600;
+  color: #ff3b30;
+}
+
+.price-unit {
+  font-size: 22rpx;
+  color: #8e8e93;
+  font-weight: 400;
+}
+
+.picker-value {
+  flex: 1;
+  text-align: right;
+  font-size: 28rpx;
+  color: #1c1c1e;
+}
+
+.textarea {
+  width: 100%;
+  min-height: 140rpx;
+  padding: 16rpx;
+  box-sizing: border-box;
+  background: #f7f7fa;
+  border-radius: 12rpx;
+  font-size: 26rpx;
+  color: #1c1c1e;
+}
+
+.footer-tip {
+  padding: 16rpx 8rpx 32rpx;
+  line-height: 1.6;
+}
+
+.retry-link {
+  display: inline-block;
+  margin-left: 12rpx;
+  color: #007aff;
+  font-weight: 600;
+}

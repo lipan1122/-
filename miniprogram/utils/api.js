@@ -76,6 +76,21 @@ function setUser(info) {
   }
 }
 
+/**
+ * 只清会员信息缓存，**保留 token**
+ *
+ * 注销小程序绑定（POST /api/mini/member/unbind）之后：同一微信的 openid 身份没变，
+ * token 依然有效，只是不再关联客史。所以不能调 clearToken（那会把用户踢回登录流程），
+ * 但必须清掉缓存的 guestName，否则下单页会继续预填已经解绑的姓名。
+ */
+function clearUser() {
+  try {
+    wx.removeStorageSync(USER_KEY);
+  } catch (e) {
+    /* ignore */
+  }
+}
+
 /* -------------------------------- 错误 ---------------------------------- */
 
 /** 构造带 code 的错误对象，页面据此区分业务码 */
@@ -108,11 +123,15 @@ function wxLogin() {
 /**
  * 底层请求
  * @param {string} path   接口路径（以 / 开头），如 '/api/mini/rooms'
- * @param {object} options { method, data, auth, header }
+ * @param {object} options { method, data, auth, header, timeout }
  * @returns {Promise<any>} resolve 服务端 data 字段
+ *
+ * `timeout` 是可选覆盖（毫秒）：默认 15s。在住服务里的续住 / 换房要现算远期库存，
+ * 比查房慢，调用方（utils/api-mini.js）对写操作传 20s，避免弱网下正常请求被误判超时。
  */
 function request(path, options) {
   var opts = options || {};
+  var timeout = Number(opts.timeout) > 0 ? Number(opts.timeout) : TIMEOUT;
   var header = { 'content-type': 'application/json' };
   if (opts.header) {
     for (var k in opts.header) {
@@ -130,7 +149,7 @@ function request(path, options) {
       method: opts.method || 'GET',
       data: opts.data,
       header: header,
-      timeout: TIMEOUT,
+      timeout: timeout,
       success: function (res) {
         var body = res && res.data ? res.data : {};
 
@@ -139,9 +158,18 @@ function request(path, options) {
           return;
         }
         if (res.statusCode < 200 || res.statusCode >= 300) {
+          /*
+           * nonJson 用来区分「路由根本不存在」和「业务失败」：
+           *   · 不存在的 Next 路由 → 404 + HTML 错误页 → body 是字符串
+           *   · 业务失败（订单不存在 / 无权查看）→ 404 + JSON { ok:false, code, error }
+           * 上层（utils/api-mini.js）只把前者降级成「功能准备中」，
+           * 后者必须把服务端的中文错误原样展示，否则「订单不存在」会被说成「对接中」。
+           */
+          var nonJson = !(body && typeof body === 'object');
           reject(
             makeError(body.code || 'HTTP_ERROR', body.error || '服务端返回 HTTP ' + res.statusCode, {
               statusCode: res.statusCode,
+              nonJson: nonJson,
             })
           );
           return;
@@ -154,6 +182,16 @@ function request(path, options) {
       },
       fail: function (err) {
         var detail = err && err.errMsg ? err.errMsg : '未知错误';
+        /*
+         * wx.request 把「超时」和「连不上」都丢进 fail 回调，但两者对用户是两件事：
+         *   request:fail timeout             → 网络慢，重试就好
+         *   request:fail ssl hand shake ...  → 域名白名单 / 证书 / BASE_URL 配错了
+         * 所以超时单独归一成 TIMEOUT，页面据此给「重试」而不是「检查服务器地址」。
+         */
+        if (/timeout/i.test(detail)) {
+          reject(makeError('TIMEOUT', '网络超时，请检查网络后重试'));
+          return;
+        }
         reject(
           makeError(
             'NETWORK',
@@ -238,5 +276,6 @@ module.exports = {
   login: login,
   getToken: getToken,
   clearToken: clearToken,
+  clearUser: clearUser,
   getUser: getUser,
 };

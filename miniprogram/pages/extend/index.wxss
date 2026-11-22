@@ -1,0 +1,38 @@
+/* 续住 / 换房 / 延迟退房三个表单页共用同一套版式 */
+
+.date-pick {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 24rpx;
+  background: #f7f7fa;
+  border-radius: 16rpx;
+}
+
+.date-pick-value {
+  font-size: 34rpx;
+  font-weight: 600;
+  color: #1c1c1e;
+  letter-spacing: 1rpx;
+}
+
+.quote {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16rpx 20rpx;
+  background: #f7fbff;
+  border-radius: 12rpx;
+}
+
+.footer-tip {
+  padding: 16rpx 8rpx 32rpx;
+  line-height: 1.6;
+}
+
+.retry-link {
+  display: inline-block;
+  margin-left: 12rpx;
+  color: #007aff;
+  font-weight: 600;
+}

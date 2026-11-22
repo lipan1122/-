@@ -1,0 +1,131 @@
+<!--*
+ * 储值和积分
+ *
+ * 摘要：GET /api/mini/member（未绑定回 code=NOT_BOUND，页面引导去绑定）
+ * 明细：GET /api/mini/member/ledger?type=wallet|points（接口未就绪只降级明细区）
+ * 注销：POST /api/mini/member/unbind
+ *
+ * 不提供充值按钮：小程序没有微信支付通道，做个「充值」入口只会骗用户（清单第十节）。
+ -->
+<view class="container">
+  <view wx:if="{{loading}}" class="loading-box">正在加载会员信息…</view>
+
+  <view wx:if="{{!loading && notReady}}" class="card empty">
+    <text class="subtitle">{{notReadyMsg}}</text>
+    <view class="muted gap-top">储值与积分正在对接酒店系统，可到前台查询余额。</view>
+    <button class="btn btn-ghost" bindtap="goContact">联系酒店</button>
+    <button class="btn btn-ghost" bindtap="onRetry" data-key="main">重新加载</button>
+  </view>
+
+  <view wx:if="{{!loading && !notReady && error}}" class="error-box">
+    {{error}}
+    <view class="retry-link" bindtap="onRetry" data-key="main">点击重试</view>
+  </view>
+
+  <!-- 未绑定 -->
+  <view wx:if="{{!loading && !notReady && !bound}}" class="card empty">
+    还没有绑定会员信息
+    <view class="muted gap-top">绑定手机号后可以查看储值余额、积分明细与历史消费</view>
+    <button class="btn" bindtap="goBind">去绑定手机号</button>
+  </view>
+
+  <block wx:if="{{!loading && !notReady && bound && member}}">
+    <!-- 会员卡 -->
+    <view class="card member-card">
+      <view class="row">
+        <view>
+          <text class="title">{{member.guestName || '会员'}}</text>
+          <view class="muted gap-top">
+            {{member.cardName || member.levelLabel}}{{member.discountText ? ' · ' + member.discountText + ' 折' : ''}}
+          </view>
+        </view>
+        <text class="chip chip-green">{{member.levelLabel}}</text>
+      </view>
+      <view wx:if="{{member.validUntil}}" class="muted gap-top">会员卡有效期至 {{member.validUntil}}</view>
+      <view wx:if="{{member.mobile}}" class="muted">绑定手机号 {{member.mobile}}</view>
+    </view>
+
+    <!-- 两个数字 -->
+    <view class="card">
+      <view class="stat-grid">
+        <view class="stat">
+          <text class="stat-value">¥{{member.balanceText}}</text>
+          <text class="muted">储值余额</text>
+        </view>
+        <view class="stat">
+          <text class="stat-value">{{member.pointsText}}</text>
+          <text class="muted">可用积分</text>
+        </view>
+        <view class="stat">
+          <text class="stat-value">¥{{member.consumeTotalText}}</text>
+          <text class="muted">储值消费</text>
+        </view>
+        <view class="stat">
+          <text class="stat-value">{{member.stayCount}}</text>
+          <text class="muted">入住次数</text>
+        </view>
+      </view>
+      <view class="muted gap-top">
+        储值余额与积分以酒店前台系统为准；小程序不提供在线充值，充值请到前台办理。
+      </view>
+    </view>
+
+    <!-- tab -->
+    <view class="card">
+      <view class="tab-row">
+        <view class="tab {{tab === 'wallet' ? 'tab-on' : ''}}" data-tab="wallet" bindtap="onTabTap">储值明细</view>
+        <view class="tab {{tab === 'points' ? 'tab-on' : ''}}" data-tab="points" bindtap="onTabTap">积分明细</view>
+      </view>
+
+      <view wx:if="{{recordsLoading}}" class="loading-box">正在加载明细…</view>
+
+      <view wx:if="{{!recordsLoading && recordsNotReady}}" class="empty-sub">
+        明细暂未开通
+        <view class="muted gap-top">{{recordsNotReadyMsg}}</view>
+        <button class="btn btn-ghost" bindtap="onRetry" data-key="records">重新加载</button>
+      </view>
+
+      <view wx:if="{{!recordsLoading && recordsError}}" class="error-box">
+        {{recordsError}}
+        <view class="retry-link" bindtap="onRetry" data-key="records">点击重试</view>
+      </view>
+
+      <view wx:if="{{!recordsLoading && !recordsNotReady && !recordsError && records.length === 0}}" class="empty-sub">
+        {{tab === 'wallet' ? '暂无储值流水' : '暂无积分记录'}}
+        <view class="muted gap-top">入住、消费、退款产生的记录会显示在这里</view>
+      </view>
+
+      <block wx:if="{{!recordsLoading && records.length > 0}}">
+        <view class="rec-item" wx:for="{{records}}" wx:key="recordId">
+          <view class="rec-main">
+            <text class="rec-title">{{item.title}}</text>
+            <view class="muted">{{item.createdAtText}}{{item.dirLabel ? ' · ' + item.dirLabel : ''}}</view>
+          </view>
+          <view class="rec-right">
+            <text class="rec-amount {{item.dirClass === 'in' ? 'rec-in' : 'rec-out'}}">
+              {{item.dirClass === 'in' ? '+' : '-'}}{{item.amountText}}{{item.unitText}}
+            </text>
+            <view wx:if="{{item.balanceText}}" class="muted">余 ¥{{item.balanceText}}</view>
+          </view>
+        </view>
+      </block>
+    </view>
+
+    <!-- 其他 -->
+    <view class="card">
+      <view class="row action-row" bindtap="goMember">
+        <text class="subtitle">会员中心</text>
+        <text class="muted">等级 / 权益 / 退出登录 ›</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row action-row" bindtap="onUnbind">
+        <text class="subtitle" style="color: #e0453c;">注销小程序绑定</text>
+        <text class="muted">解除手机号关联 ›</text>
+      </view>
+    </view>
+
+    <view class="muted footer-tip">
+      注销绑定只解除小程序与会员档案的关联，储值余额与积分不会消失，可到前台重新绑定。
+    </view>
+  </block>
+</view>

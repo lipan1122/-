@@ -150,4 +150,29 @@ Page({
       remaining;
     wx.navigateTo({ url: url });
   },
+
+  /** 房型详情：图片 / 床型 / 面积 / 设施 / 取消政策 / 价格日历 */
+  onRoomDetail(e) {
+    var ds = e.currentTarget.dataset;
+    var url =
+      '/pages/room-detail/index?roomTypeId=' +
+      encodeURIComponent(ds.id) +
+      '&name=' +
+      encodeURIComponent(ds.name || '') +
+      '&checkIn=' +
+      this.data.checkIn +
+      '&checkOut=' +
+      this.data.checkOut;
+    wx.navigateTo({ url: url });
+  },
+
+  /** 联系酒店：电话 / 地址 / 地图（号码由服务端下发，页面不写死） */
+  goContact() {
+    wx.navigateTo({ url: '/pages/contact/index' });
+  },
+
+  /** 在住服务：已办理入住时从首页一步到位 */
+  goInStay() {
+    wx.navigateTo({ url: '/pages/in-stay/index' });
+  },
 });

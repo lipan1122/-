@@ -1,0 +1,142 @@
+<!--*
+ * 房型详情
+ *
+ * 数据来源：GET /api/mini/room-types/:id?checkIn=&checkOut=
+ *   图片 / 设施 / 早餐 / 取消政策 / 押金全部服务端下发；没配就显示「暂无」，
+ *   页面不写死任何承诺性文案（清单第 81 行：不要在页面写死虚假信息）。
+ *
+ * 状态：loading → 骨架文案 / notReady → 功能准备中 / error → 错误 + 重试 / 正常 → 内容
+ -->
+<view class="container has-bottom-bar">
+  <!-- ① 功能未就绪（接口还没上线 / 小程序没配置） -->
+  <view wx:if="{{notReady}}" class="card empty">
+    <text class="subtitle">{{notReadyMsg}}</text>
+    <view class="muted gap-top">房型详情正在对接酒店系统，你也可以直接联系酒店咨询房型与价格。</view>
+    <button class="btn btn-ghost" bindtap="goContact">联系酒店</button>
+    <button class="btn btn-ghost" bindtap="onRetry" data-key="main">重新加载</button>
+  </view>
+
+  <block wx:else>
+    <!-- ② 加载状态 -->
+    <view wx:if="{{loading}}" class="loading-box">正在加载房型详情…</view>
+
+    <!-- ③ 失败状态（可重试） -->
+    <view wx:if="{{!loading && error}}" class="error-box">
+      {{error}}
+      <view class="retry-link" bindtap="onRetry" data-key="main">点击重试</view>
+    </view>
+
+    <block wx:if="{{!loading && !error && detail}}">
+      <!-- 图片：服务端没配就明确写「暂无图片」，不放网图 -->
+      <swiper wx:if="{{hasImages}}" class="gallery" indicator-dots circular indicator-active-color="#ffffff">
+        <swiper-item wx:for="{{images}}" wx:key="*this">
+          <image class="gallery-img" src="{{item}}" mode="aspectFill" lazy-load></image>
+        </swiper-item>
+      </swiper>
+      <view wx:else class="gallery gallery-empty">
+        <text class="gallery-empty-text">暂无图片</text>
+        <text class="muted">酒店还没有上传该房型的照片</text>
+      </view>
+
+      <!-- 标题 + 房量 -->
+      <view class="card">
+        <view class="row">
+          <text class="title">{{detail.name}}</text>
+          <text class="chip {{soldOut ? 'chip-gray' : 'chip-green'}}">{{remainingText}}</text>
+        </view>
+        <view class="muted gap-top">
+          <text wx:if="{{detail.bedType}}">{{detail.bedType}}</text>
+          <text wx:if="{{detail.areaText}}"> · {{detail.areaText}}</text>
+          <text wx:if="{{detail.maxOccupancy}}"> · 可住 {{detail.maxOccupancy}} 人</text>
+          <text wx:if="{{detail.floorText}}"> · {{detail.floorText}}</text>
+        </view>
+        <view wx:if="{{detail.desc}}" class="muted gap-top">{{detail.desc}}</view>
+
+        <view class="divider"></view>
+
+        <!-- 住 / 离时间 -->
+        <view class="row">
+          <text class="muted">入住时间</text>
+          <text class="subtitle">{{detail.checkInTime || '以酒店确认为准'}}</text>
+        </view>
+        <view class="row gap-top">
+          <text class="muted">离店时间</text>
+          <text class="subtitle">{{detail.checkOutTime || '以酒店确认为准'}}</text>
+        </view>
+        <view class="row gap-top">
+          <text class="muted">早餐</text>
+          <text class="subtitle">{{detail.breakfastText || '未注明，以酒店确认为准'}}</text>
+        </view>
+        <view class="row gap-top">
+          <text class="muted">押金</text>
+          <text class="subtitle">
+            {{detail.depositText === '—' ? '未注明' : '¥' + detail.depositText}}
+            <text wx:if="{{detail.depositNote}}" class="muted"> {{detail.depositNote}}</text>
+          </text>
+        </view>
+      </view>
+
+      <!-- 房间设施：没配置就整块不显示，不留空标题 -->
+      <view wx:if="{{facilities.length > 0}}" class="card">
+        <text class="subtitle">房间设施</text>
+        <view class="tag-wrap gap-top">
+          <text class="chip chip-gray tag" wx:for="{{facilities}}" wx:key="*this">{{item}}</text>
+        </view>
+      </view>
+
+      <!-- 取消政策 -->
+      <view class="card">
+        <text class="subtitle">取消政策</text>
+        <view wx:if="{{detail.cancelPolicy}}" class="policy gap-top">{{detail.cancelPolicy}}</view>
+        <view wx:else class="muted gap-top">
+          该房型未单独配置取消政策，请以下单页展示的取消政策与酒店确认为准。
+        </view>
+      </view>
+
+      <!-- 价格日历：横向滚动，没数据时明确说「准备中」 -->
+      <view class="card">
+        <view class="row">
+          <text class="subtitle">每晚价格</text>
+          <text class="muted">{{checkIn}} 至 {{checkOut}} · {{nights}} 晚</text>
+        </view>
+        <scroll-view wx:if="{{calendarReady}}" class="cal-scroll gap-top" scroll-x enable-flex>
+          <view class="cal-item {{item.soldOut ? 'cal-item-off' : ''}}" wx:for="{{calendar}}" wx:key="date">
+            <text class="cal-date">{{item.dayText}}</text>
+            <text class="cal-week">{{item.weekText}}</text>
+            <text class="cal-price">¥{{item.priceText}}</text>
+          </view>
+        </scroll-view>
+        <view wx:else class="muted gap-top">价格日历准备中，以下方价格明细为准。</view>
+      </view>
+
+      <!-- 价格明细 -->
+      <view class="card">
+        <text class="subtitle">价格明细</text>
+        <view class="row gap-top">
+          <text class="muted">门市价</text>
+          <text class="subtitle">¥{{detail.basePriceText === '—' ? '未配置' : detail.basePriceText}} / 晚</text>
+        </view>
+        <view class="row gap-top">
+          <text class="muted">均价（{{nights}} 晚）</text>
+          <text class="subtitle">¥{{detail.avgPriceText}} / 晚</text>
+        </view>
+        <view class="divider"></view>
+        <view class="row">
+          <text class="subtitle">区间总价（1 间）</text>
+          <text class="price">¥{{detail.totalText}}</text>
+        </view>
+        <view class="muted gap-top">
+          价格由酒店系统实时计算，下单时按房价日历重算；不含押金与其他消费。
+        </view>
+      </view>
+    </block>
+  </block>
+
+  <!-- ④ 底部操作栏：未就绪时也保留「联系酒店」，客人不能卡死 -->
+  <view class="bottom-bar">
+    <button class="btn btn-ghost bottom-btn" bindtap="goContact">联系酒店</button>
+    <button class="btn bottom-btn" bindtap="goBooking" disabled="{{soldOut || notReady || loading}}">
+      {{soldOut ? '所选日期已售完' : (notReady ? '功能准备中' : '立即预订')}}
+    </button>
+  </view>
+</view>

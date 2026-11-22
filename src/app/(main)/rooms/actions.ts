@@ -122,6 +122,61 @@ function writeOpLog(hotelId: number, operator: string, action: string, detail: s
   ]);
 }
 
+/**
+ * 幂等请求号（第九轮 §一.4 房间卡资金操作补 request_id）
+ *
+ * ── 缺陷 ──
+ * 房间卡片里的会员充值 / 押金 / 房费 / 其他消费四个表单从来没带过 request_id。
+ * 服务端为此准备的两道闸门（payments / folio_items 上的
+ * `UNIQUE(hotel_id, request_id) WHERE request_id IS NOT NULL` 部分唯一索引，
+ * 以及「同一 request_id 已经入账就直接返回成功」的查重）一直是空转：
+ * 按钮双击、网络超时重试、浏览器重放，每一次都落成一笔新的账。
+ * 前台一次手抖双击 = 押金收两遍 / 房费加两遍 / 消费记两遍，账实对不上。
+ *
+ * ── 修复 ──
+ *   1. 客户端（src/components/RoomBoard.tsx）为每个资金表单生成稳定 request_id
+ *      并作为隐藏字段提交；网络结果未知时保留同一枚，成功后才换新。
+ *   2. 服务端每个写动作先按 (hotel_id, request_id) 查重，命中即按「幂等重放」
+ *      返回成功（不再重复入账）；并发下撞唯一索引同样按重放处理。
+ *   3. 唯一索引是最后一道兜底：查重之后、插入之前被别的请求抢先写入时，
+ *      插入会抛 UNIQUE 约束错，catch 里转换成功提示而不是把天书甩给前台。
+ *
+ * 只承认 `request_id`（CamelCase 变体不接），与 cashier/actions.ts 的字段名一致。
+ */
+function readRequestId(formData: FormData): string | null {
+  const id = str(formData, "request_id");
+  return id ? id : null;
+}
+
+/** 唯一约束冲突判定：查重之后仍被抢写时走幂等分支，其它错误继续抛 */
+function isUniqueViolation(e: unknown): boolean {
+  const text = String(e instanceof Error ? e.message : e);
+  return /UNIQUE constraint failed|SQLITE_CONSTRAINT/i.test(text);
+}
+
+/**
+ * 加收类明细（房费 / 其他消费）的幂等查重
+ * 返回已入账的那条（仅用于提示金额），没有则 undefined。
+ */
+function postedFolioItem(hotelId: number, requestId: string | null) {
+  if (!requestId) return undefined;
+  return get<{ id: number; folio_id: number | null; item_type: string; amount: number }>(
+    `SELECT id, folio_id, item_type, amount FROM folio_items
+      WHERE hotel_id = ? AND request_id = ? LIMIT 1`,
+    [hotelId, requestId]
+  );
+}
+
+/** 收款流水（预收款/押金）的幂等查重 */
+function receivedPayment(hotelId: number, requestId: string | null) {
+  if (!requestId) return undefined;
+  return get<{ id: number; folio_id: number | null; amount: number }>(
+    `SELECT id, folio_id, amount FROM payments
+      WHERE hotel_id = ? AND request_id = ? LIMIT 1`,
+    [hotelId, requestId]
+  );
+}
+
 function loadStay(stayId: number, hotelId: number): StayRow | undefined {
   return get<StayRow>(
     `SELECT s.id, s.stay_no, s.room_id, s.booking_id, s.guest_id, s.guest_name, s.mobile, s.check_in_time,
@@ -884,7 +939,7 @@ export async function adjustRateAction(formData: FormData): Promise<ActionState>
 
 /**
  * 加收房费：按营业日插一条 ROOM 明细并重算账单
- * 入参：stay_id、amount、biz_date、remark
+ * 入参：stay_id、amount、biz_date、remark、request_id（幂等键）
  */
 export async function addRoomFeeAction(formData: FormData): Promise<ActionState> {
   // 权限（P0-5：加收房费 = 往客人账单记应收，属账单过账。）
@@ -899,25 +954,38 @@ export async function addRoomFeeAction(formData: FormData): Promise<ActionState>
   const bizDate = /^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? rawDate : bizToday(user.hotelId);
   const remark = str(formData, "remark");
   const description = remark ? `房费 ${bizDate}（${remark}）` : `房费 ${bizDate}`;
+  const requestId = readRequestId(formData);
+
+  /* 幂等重放：同一 request_id 已经入过账，直接返回成功（双击第二下 / 网络重试） */
+  const replayed = postedFolioItem(user.hotelId, requestId);
+  if (replayed) {
+    return { ok: `该笔加收房费已入账 ${fmtMoney(Number(replayed.amount))}（重复提交已忽略）` };
+  }
 
   const folio = loadFolioByStay(stay.id, user.hotelId);
   if (!folio) return { error: "该入住单还没有账务单，请先在收银台开单" };
   if (folio.status === "SETTLED") return { error: "该账单已结账，不能再加收房费" };
 
-  tx(() => {
-    run(
-      `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at, created_by)
-       VALUES (?,?,?,?,?,?,?,?,?,?)`,
-      [user.hotelId, folio.id, "ROOM", description, 1, amount, amount, bizDate, nowIso(), user.id]
-    );
-    const money = recalcFolioBalance(user.hotelId, folio.id);
-    writeOpLog(
-      user.hotelId,
-      user.realName,
-      "加收消费",
-      `加收房费 · 入住单 ${stay.stay_no} · 房间 ${stay.room_no ?? "-"} · ${fmtMoney(amount)} · 营业日 ${bizDate} · 余额 ${fmtMoney(money.balance)}`
-    );
-  });
+  try {
+    tx(() => {
+      run(
+        `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at, created_by, request_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        [user.hotelId, folio.id, "ROOM", description, 1, amount, amount, bizDate, nowIso(), user.id, requestId]
+      );
+      const money = recalcFolioBalance(user.hotelId, folio.id);
+      writeOpLog(
+        user.hotelId,
+        user.realName,
+        "加收消费",
+        `加收房费 · 入住单 ${stay.stay_no} · 房间 ${stay.room_no ?? "-"} · ${fmtMoney(amount)} · 营业日 ${bizDate} · 余额 ${fmtMoney(money.balance)}`
+      );
+    });
+  } catch (e) {
+    /* 并发兜底：查重之后被另一个请求抢先写入 → 唯一索引抛 UNIQUE，按重放处理 */
+    if (isUniqueViolation(e)) return { ok: "该笔加收房费已入账（并发重复提交已忽略）" };
+    throw e;
+  }
 
   revalidateRooms();
   return { ok: `已加收房费 ${fmtMoney(amount)}` };
@@ -925,7 +993,7 @@ export async function addRoomFeeAction(formData: FormData): Promise<ActionState>
 
 /**
  * 客房消费：插一条 OTHER 明细（如迷你吧、洗衣）并重算账单
- * 入参：stay_id、description、amount
+ * 入参：stay_id、description、amount、request_id（幂等键）
  */
 export async function addOtherChargeAction(formData: FormData): Promise<ActionState> {
   // 权限（P0-5：客房消费 = 往客人账单记应收，属账单过账。）
@@ -938,25 +1006,37 @@ export async function addOtherChargeAction(formData: FormData): Promise<ActionSt
   if (!(amount > 0)) return { error: "消费金额必须大于 0" };
   const description = str(formData, "description") || "客房消费";
   const bizDate = bizToday(user.hotelId);
+  const requestId = readRequestId(formData);
+
+  /* 幂等重放：同一 request_id 的消费已经记过账 */
+  const replayed = postedFolioItem(user.hotelId, requestId);
+  if (replayed) {
+    return { ok: `该笔客房消费已入账 ${fmtMoney(Number(replayed.amount))}（重复提交已忽略）` };
+  }
 
   const folio = loadFolioByStay(stay.id, user.hotelId);
   if (!folio) return { error: "该入住单还没有账务单，请先在收银台开单" };
   if (folio.status === "SETTLED") return { error: "该账单已结账，不能再入账" };
 
-  tx(() => {
-    run(
-      `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at, created_by)
-       VALUES (?,?,?,?,?,?,?,?,?,?)`,
-      [user.hotelId, folio.id, "OTHER", description, 1, amount, amount, bizDate, nowIso(), user.id]
-    );
-    const money = recalcFolioBalance(user.hotelId, folio.id);
-    writeOpLog(
-      user.hotelId,
-      user.realName,
-      "加收消费",
-      `客房消费 · 入住单 ${stay.stay_no} · 房间 ${stay.room_no ?? "-"} · ${description} ${fmtMoney(amount)} · 余额 ${fmtMoney(money.balance)}`
-    );
-  });
+  try {
+    tx(() => {
+      run(
+        `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at, created_by, request_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        [user.hotelId, folio.id, "OTHER", description, 1, amount, amount, bizDate, nowIso(), user.id, requestId]
+      );
+      const money = recalcFolioBalance(user.hotelId, folio.id);
+      writeOpLog(
+        user.hotelId,
+        user.realName,
+        "加收消费",
+        `客房消费 · 入住单 ${stay.stay_no} · 房间 ${stay.room_no ?? "-"} · ${description} ${fmtMoney(amount)} · 余额 ${fmtMoney(money.balance)}`
+      );
+    });
+  } catch (e) {
+    if (isUniqueViolation(e)) return { ok: "该笔客房消费已入账（并发重复提交已忽略）" };
+    throw e;
+  }
 
   revalidateRooms();
   return { ok: `已入账 ${description} ${fmtMoney(amount)}` };
@@ -964,7 +1044,11 @@ export async function addOtherChargeAction(formData: FormData): Promise<ActionSt
 
 /**
  * 预收款（押金）：folio_items 记 DEPOSIT + payments 流水 + folios.paid_amount 累加
- * 入参：stay_id、amount、method（缺省现金）
+ * 入参：stay_id、amount、method（缺省现金）、request_id（幂等键）
+ *
+ * 这个动作同时写两张表（明细 + 收款流水）并累加两个字段（paid_amount / stays.deposit），
+ * 双击一次就是「押金翻倍、账单余额变负、退房退款多退一笔」，所以幂等必须两张表都覆盖：
+ * payments 与 folio_items 各有 (hotel_id, request_id) 部分唯一索引，两处都写同一个键。
  */
 export async function addDepositAction(formData: FormData): Promise<ActionState> {
   // 权限（P0-5：预收押金会写 payments 流水并累加 paid_amount，属收款。）
@@ -977,36 +1061,65 @@ export async function addDepositAction(formData: FormData): Promise<ActionState>
   if (!(amount > 0)) return { error: "预收款金额必须大于 0" };
   const method = str(formData, "method") || "现金";
   const bizDate = bizToday(user.hotelId);
+  const requestId = readRequestId(formData);
+
+  /* 幂等重放：同一 request_id 的押金已经收过（payments 是收款事实的唯一来源） */
+  const replayed = receivedPayment(user.hotelId, requestId);
+  if (replayed) {
+    return { ok: `该笔预收款已入账 ${fmtMoney(Number(replayed.amount))}（重复提交已忽略）` };
+  }
 
   const folio = loadFolioByStay(stay.id, user.hotelId);
   if (!folio) return { error: "该入住单还没有账务单，请先在收银台开单" };
   if (folio.status === "SETTLED") return { error: "该账单已结账，不能再收预收款" };
 
-  tx(() => {
-    run(
-      `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at, created_by)
-       VALUES (?,?,?,?,?,?,?,?,?,?)`,
-      [user.hotelId, folio.id, "DEPOSIT", `预收款（押金·${method}）`, 1, amount, amount, bizDate, nowIso(), user.id]
-    );
-    run(
-      `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?)`,
-      [user.hotelId, folio.id, stay.id, nextPayNo(), method, amount, bizDate, "预收款（押金）", nowIso()]
-    );
-    run(`UPDATE folios SET paid_amount = paid_amount + ? WHERE id = ? AND hotel_id = ?`, [
-      amount,
-      folio.id,
-      user.hotelId,
-    ]);
-    run(`UPDATE stays SET deposit = COALESCE(deposit, 0) + ? WHERE id = ? AND hotel_id = ?`, [amount, stay.id, user.hotelId]);
-    const money = recalcFolioBalance(user.hotelId, folio.id);
-    writeOpLog(
-      user.hotelId,
-      user.realName,
-      "预收款",
-      `入住单 ${stay.stay_no} · 房间 ${stay.room_no ?? "-"} · 方式 ${method} · 金额 ${fmtMoney(amount)} · 余额 ${fmtMoney(money.balance)}`
-    );
-  });
+  try {
+    tx(() => {
+      run(
+        `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at, created_by, request_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        [user.hotelId, folio.id, "DEPOSIT", `预收款（押金·${method}）`, 1, amount, amount, bizDate, nowIso(), user.id, requestId]
+      );
+      run(
+        `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, request_id, operator, kind)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          user.hotelId,
+          folio.id,
+          stay.id,
+          nextPayNo(),
+          method,
+          amount,
+          bizDate,
+          "预收款（押金）",
+          nowIso(),
+          requestId,
+          user.realName,
+          "DEPOSIT",
+        ]
+      );
+      run(`UPDATE folios SET paid_amount = paid_amount + ? WHERE id = ? AND hotel_id = ?`, [
+        amount,
+        folio.id,
+        user.hotelId,
+      ]);
+      run(`UPDATE stays SET deposit = COALESCE(deposit, 0) + ? WHERE id = ? AND hotel_id = ?`, [amount, stay.id, user.hotelId]);
+      const money = recalcFolioBalance(user.hotelId, folio.id);
+      writeOpLog(
+        user.hotelId,
+        user.realName,
+        "预收款",
+        `入住单 ${stay.stay_no} · 房间 ${stay.room_no ?? "-"} · 方式 ${method} · 金额 ${fmtMoney(amount)} · 余额 ${fmtMoney(money.balance)}`
+      );
+    });
+  } catch (e) {
+    /*
+     * 并发兜底：两次请求同时通过查重，后到的撞 payments / folio_items 唯一索引。
+     * 整个事务已回滚（明细与流水都已撤销），按重放返回成功即可，不会多收一笔。
+     */
+    if (isUniqueViolation(e)) return { ok: "该笔预收款已入账（并发重复提交已忽略）" };
+    throw e;
+  }
 
   revalidateRooms();
   return { ok: `已收预收款 ${fmtMoney(amount)}（${method}）` };

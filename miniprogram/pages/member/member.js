@@ -82,6 +82,31 @@ Page({
     wx.switchTab({ url: '/pages/orders/orders' });
   },
 
+  /** 在住服务：当前房间 / 离店日 / 账单 / 续住 / 换房 / 延迟退房 / 客房服务 */
+  goInStay() {
+    wx.navigateTo({ url: '/pages/in-stay/index' });
+  },
+
+  /** 储值和积分：余额、流水明细、注销绑定 */
+  goWallet() {
+    wx.navigateTo({ url: '/pages/wallet/index' });
+  },
+
+  /** 发票列表 + 申请开票 */
+  goInvoices() {
+    wx.navigateTo({ url: '/pages/invoices/index' });
+  },
+
+  /** 通知中心：预订 / 续住 / 换房 / 服务请求 / 发票进度 */
+  goNotifications() {
+    wx.navigateTo({ url: '/pages/notifications/index' });
+  },
+
+  /** 联系酒店：电话 / 地址 / 地图（号码来自服务端，页面不写死） */
+  goContact() {
+    wx.navigateTo({ url: '/pages/contact/index' });
+  },
+
   onLogout() {
     var that = this;
     wx.showModal({

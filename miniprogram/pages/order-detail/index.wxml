@@ -1,0 +1,225 @@
+<!--*
+ * 订单详情
+ *
+ * 数据来源：GET /api/mini/bookings/:id（服务端按 token 判定归属，只回本人可看的单）
+ * 动作：取消 / 修改（入住人 · 到店时间 · 备注）/ 核验码 / 入住前服务 / 发票 / 联系前台
+ *
+ * 状态：loading / error+重试 / notReady / 正常
+ * 取消与修改是 POST：按钮 disabled + request_id 复用（超时重试不会重复提交）
+ -->
+<view class="container">
+  <!-- ① 加载 -->
+  <view wx:if="{{loading}}" class="loading-box">正在加载订单…</view>
+
+  <!-- ② 失败 -->
+  <view wx:if="{{!loading && error}}" class="error-box">
+    {{error}}
+    <view class="retry-link" bindtap="onRetry" data-key="main">点击重试</view>
+  </view>
+
+  <!-- ③ 空（订单不存在 / 无权查看） -->
+  <view wx:if="{{!loading && !error && !order}}" class="card empty">
+    没有找到该订单
+    <view class="muted gap-top">订单只对下单本人或已绑定身份的会员可见</view>
+  </view>
+
+  <block wx:if="{{!loading && order}}">
+    <!-- 状态头 -->
+    <view class="card">
+      <view class="row">
+        <view>
+          <text class="subtitle">{{order.bookingNo}}</text>
+          <view class="muted gap-top">{{order.roomTypeName}} · {{order.roomCount}} 间 · {{order.nights}} 晚</view>
+        </view>
+        <text class="chip {{order.chipClass}}">{{order.statusLabel}}</text>
+      </view>
+
+      <view class="divider"></view>
+
+      <view class="row">
+        <view class="date-cell">
+          <text class="muted">入住</text>
+          <text class="date-value">{{order.checkInText}}</text>
+        </view>
+        <text class="date-arrow">→</text>
+        <view class="date-cell">
+          <text class="muted">离店</text>
+          <text class="date-value">{{order.checkOutText}}</text>
+        </view>
+      </view>
+      <view wx:if="{{order.roomNo}}" class="row gap-top">
+        <text class="muted">房间号</text>
+        <text class="subtitle">{{order.roomNo}}</text>
+      </view>
+      <view wx:if="{{order.verifyCode}}" class="row gap-top">
+        <text class="muted">入住核验码</text>
+        <text class="subtitle">{{order.verifyCode}}</text>
+      </view>
+    </view>
+
+    <!-- 状态时间线 -->
+    <view class="card">
+      <text class="subtitle">订单状态</text>
+      <view class="timeline gap-top">
+        <view class="tl-item" wx:for="{{timeline}}" wx:key="label">
+          <view class="tl-dot {{item.done ? 'tl-dot-on' : ''}}"></view>
+          <view class="tl-body">
+            <text class="{{item.done ? 'tl-label-on' : 'tl-label'}}">{{item.label}}</text>
+            <text wx:if="{{item.at}}" class="muted">{{item.at}}</text>
+          </view>
+        </view>
+      </view>
+      <view wx:if="{{!timelineFromServer}}" class="muted gap-top">
+        时间线按当前订单状态推导；具体流转时间以酒店前台系统为准。
+      </view>
+    </view>
+
+    <!-- 金额摘要 -->
+    <view class="card">
+      <text class="subtitle">金额</text>
+      <view class="row gap-top">
+        <text class="muted">房费合计</text>
+        <text class="price">¥{{order.amountText}}</text>
+      </view>
+      <view class="row gap-top">
+        <text class="muted">已付</text>
+        <text class="subtitle">¥{{order.paidText}}</text>
+      </view>
+      <view wx:if="{{order.dueText !== '—'}}" class="row gap-top">
+        <text class="muted">待付</text>
+        <text class="subtitle">¥{{order.dueText}}</text>
+      </view>
+      <view class="row gap-top">
+        <text class="muted">押金</text>
+        <text class="subtitle">¥{{order.depositText}} {{order.depositStatus}}</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row">
+        <text class="muted">支付方式</text>
+        <text class="subtitle">{{order.payStatusLabel}}</text>
+      </view>
+      <view wx:if="{{order.paymentMethod}}" class="row gap-top">
+        <text class="muted">结算方式</text>
+        <text class="muted">{{order.paymentMethod}}</text>
+      </view>
+      <view class="muted gap-top">
+        订单金额由酒店系统计算，到店付款以前台实际收款为准；押金退房时按实际情况结算。
+      </view>
+    </view>
+
+    <!-- 入住人 -->
+    <view class="card">
+      <text class="subtitle">入住人信息</text>
+      <view class="row gap-top">
+        <text class="muted">姓名</text>
+        <text class="subtitle">{{order.guestName || '—'}}</text>
+      </view>
+      <view class="row gap-top">
+        <text class="muted">手机号</text>
+        <text class="subtitle">{{order.mobile || '—'}}</text>
+      </view>
+      <view wx:if="{{order.arrivalTime && order.arrivalTime !== '—'}}" class="row gap-top">
+        <text class="muted">预计到店</text>
+        <text class="subtitle">{{order.arrivalTime}}</text>
+      </view>
+      <view wx:if="{{order.remark}}" class="row gap-top">
+        <text class="muted">备注</text>
+        <text class="subtitle">{{order.remark}}</text>
+      </view>
+      <view class="muted gap-top">为保护隐私，姓名与手机号已脱敏展示。</view>
+    </view>
+
+    <!-- 修改面板 -->
+    <view wx:if="{{showModify}}" class="card">
+      <text class="subtitle">修改预订</text>
+      <view class="field">
+        <text class="field-label">入住人</text>
+        <input
+          class="field-input"
+          data-field="guestName"
+          value="{{form.guestName}}"
+          placeholder="留空表示不修改"
+          placeholder-class="field-input-placeholder"
+          maxlength="30"
+          bindinput="onFormInput"
+        />
+      </view>
+      <view class="field">
+        <text class="field-label">到店时间</text>
+        <picker mode="time" value="{{form.arrivalClock}}" bindchange="onArrivalChange">
+          <view class="picker-value">{{form.arrivalClock}}</view>
+        </picker>
+      </view>
+      <view class="field">
+        <text class="field-label">备注</text>
+        <input
+          class="field-input"
+          data-field="remark"
+          value="{{form.remark}}"
+          placeholder="如无烟房、加床、延迟到店"
+          placeholder-class="field-input-placeholder"
+          maxlength="100"
+          bindinput="onFormInput"
+        />
+      </view>
+      <button class="btn" bindtap="onSubmitModify" disabled="{{submitting}}">
+        {{submitting ? '提交中…' : '提交修改'}}
+      </button>
+      <button class="btn btn-ghost" bindtap="onToggleModify" disabled="{{submitting}}">取消</button>
+      <view class="muted gap-top">修改需酒店前台确认，确认前订单保持原状态。</view>
+    </view>
+
+    <!-- 操作区 -->
+    <view class="card">
+      <view class="row action-row" bindtap="onShowCode">
+        <text class="subtitle">入住核验码</text>
+        <text class="muted">查看 ›</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row action-row" bindtap="goPreStay">
+        <text class="subtitle">入住前服务</text>
+        <text class="muted">到店时间 / 预录入 ›</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row action-row" bindtap="goInStay">
+        <text class="subtitle">在住服务</text>
+        <text class="muted">账单 / 续住 / 服务 ›</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row action-row" bindtap="goInvoices">
+        <text class="subtitle">发票</text>
+        <text class="muted">{{order.invoiceStatus || '查看 / 申请 ›'}}</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row action-row" bindtap="onShowPolicy">
+        <text class="subtitle">取消政策</text>
+        <text class="muted">查看 ›</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row action-row" bindtap="onCallFrontDesk">
+        <text class="subtitle">联系前台</text>
+        <text class="muted">{{order.hotelPhone || '去联系页'}} ›</text>
+      </view>
+    </view>
+
+    <view class="card">
+      <view class="row">
+        <text class="muted">下单时间</text>
+        <text class="muted">{{order.createdAtText}}</text>
+      </view>
+      <view wx:if="{{order.hotelName}}" class="row gap-top">
+        <text class="muted">酒店</text>
+        <text class="muted">{{order.hotelName}}</text>
+      </view>
+      <view wx:if="{{order.hotelAddress}}" class="muted gap-top">{{order.hotelAddress}}</view>
+    </view>
+
+    <!-- 取消 / 修改按钮：只在允许的状态显示，避免给一个必然失败的按钮 -->
+    <view wx:if="{{canCancel || canModify}}" class="bottom-bar">
+      <button class="btn btn-ghost bottom-btn" bindtap="onCancel" disabled="{{submitting}}">取消预订</button>
+      <button class="btn bottom-btn" bindtap="onToggleModify" disabled="{{submitting}}">
+        {{showModify ? '收起修改' : '修改预订'}}
+      </button>
+    </view>
+  </block>
+</view>

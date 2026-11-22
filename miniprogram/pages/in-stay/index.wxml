@@ -1,0 +1,83 @@
+<!--*
+ * 在住服务
+ *
+ * 数据来源：GET /api/mini/stays/current（无在住时服务端回 null，页面按空状态处理）
+ * 每个服务入口只带 stayId 做定位，真正的归属校验在服务端（不信任客户端 stayId）。
+ -->
+<view class="container">
+  <view wx:if="{{loading}}" class="loading-box">正在加载在住信息…</view>
+
+  <!-- 接口未就绪：整页降级，但保留出口 -->
+  <view wx:if="{{!loading && notReady}}" class="card empty">
+    <text class="subtitle">{{notReadyMsg}}</text>
+    <view class="muted gap-top">在住服务正在对接酒店系统。需要办理业务请直接联系前台。</view>
+    <button class="btn btn-ghost" bindtap="goContact">联系酒店</button>
+    <button class="btn btn-ghost" bindtap="onRetry" data-key="main">重新加载</button>
+  </view>
+
+  <view wx:if="{{!loading && error && !notReady}}" class="error-box">
+    {{error}}
+    <view class="retry-link" bindtap="onRetry" data-key="main">点击重试</view>
+  </view>
+
+  <!-- 没有在住 -->
+  <view wx:if="{{!loading && !hasStay && !notReady && !error}}" class="card empty">
+    当前没有在住订单
+    <view class="muted gap-top">办理入住后，这里会显示房间号、离店日和所有在住服务</view>
+    <button class="btn btn-ghost" bindtap="goOrders">去看我的订单</button>
+  </view>
+
+  <block wx:if="{{!loading && hasStay}}">
+    <!-- 在住信息卡 -->
+    <view class="card stay-card">
+      <view class="row">
+        <view>
+          <text class="room-no">{{stay.roomNo}}</text>
+          <view class="muted gap-top">{{stay.roomTypeName}}{{stay.guestName ? ' · ' + stay.guestName : ''}}</view>
+        </view>
+        <text class="chip chip-green">{{stay.statusLabel}}</text>
+      </view>
+
+      <view class="divider"></view>
+
+      <view class="row">
+        <view class="stay-cell">
+          <text class="muted">入住时间</text>
+          <text class="stay-value">{{stay.checkInText}}</text>
+        </view>
+        <view class="stay-cell">
+          <text class="muted">预计离店</text>
+          <text class="stay-value">{{stay.checkOutText}}</text>
+        </view>
+      </view>
+
+      <view wx:if="{{folioReady}}" class="divider"></view>
+      <view wx:if="{{folioReady}}" class="row">
+        <text class="muted">当前账单余额</text>
+        <text class="price">¥{{stay.balanceText}}</text>
+      </view>
+      <view wx:if="{{folioReady}}" class="muted gap-top">
+        {{stay.balanceNegative ? '余额为负表示有预付/多收，退房时前台会结算。' : '余额为在住期间累计未结金额，以账单页明细为准。'}}
+      </view>
+      <view wx:if="{{stay.depositText !== '—'}}" class="row gap-top">
+        <text class="muted">押金</text>
+        <text class="subtitle">¥{{stay.depositText}} {{stay.depositStatus}}</text>
+      </view>
+    </view>
+
+    <!-- 服务入口 -->
+    <view class="card card-tight">
+      <view class="entry-grid">
+        <view class="entry" wx:for="{{entries}}" wx:key="key" data-url="{{item.url}}" bindtap="onEntryTap">
+          <text class="entry-label">{{item.label}}</text>
+          <text class="entry-desc">{{item.desc}}</text>
+        </view>
+      </view>
+    </view>
+
+    <view class="muted footer-tip">
+      续住、换房、延迟退房都属于申请，需酒店前台审核后才生效；
+      页面显示的账单与押金以酒店系统为准。
+    </view>
+  </block>
+</view>

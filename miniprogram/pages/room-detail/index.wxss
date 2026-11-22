@@ -1,0 +1,115 @@
+/* 房型详情专有样式：图片轮播 / 设施标签 / 价格日历 / 底部操作栏 */
+
+.gallery {
+  width: 100%;
+  height: 400rpx;
+  border-radius: 20rpx;
+  overflow: hidden;
+  margin-bottom: 20rpx;
+  background: #ffffff;
+}
+
+.gallery-img {
+  width: 100%;
+  height: 400rpx;
+  display: block;
+}
+
+/* 没图时的占位：不用网图冒充，明确写「暂无图片」 */
+.gallery-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: repeating-linear-gradient(45deg, #f7f7fa, #f7f7fa 20rpx, #f2f2f7 20rpx, #f2f2f7 40rpx);
+}
+
+.gallery-empty-text {
+  font-size: 28rpx;
+  color: #8e8e93;
+  margin-bottom: 8rpx;
+}
+
+.tag-wrap {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.tag {
+  margin: 0 12rpx 12rpx 0;
+}
+
+.policy {
+  font-size: 26rpx;
+  color: #3a3a3c;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+.cal-scroll {
+  white-space: nowrap;
+  width: 100%;
+}
+
+.cal-item {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 130rpx;
+  padding: 16rpx 0;
+  margin-right: 12rpx;
+  border-radius: 16rpx;
+  background: #f7f7fa;
+}
+
+.cal-item-off {
+  opacity: 0.45;
+}
+
+.cal-date {
+  font-size: 26rpx;
+  font-weight: 600;
+  color: #1c1c1e;
+}
+
+.cal-week {
+  font-size: 22rpx;
+  color: #8e8e93;
+}
+
+.cal-price {
+  margin-top: 4rpx;
+  font-size: 24rpx;
+  color: #ff3b30;
+}
+
+/* ---------- 底部固定操作栏 ---------- */
+.has-bottom-bar {
+  padding-bottom: 180rpx;
+}
+
+.bottom-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  padding: 16rpx 24rpx calc(16rpx + constant(safe-area-inset-bottom));
+  padding-bottom: calc(16rpx + env(safe-area-inset-bottom));
+  background: #ffffff;
+  box-shadow: 0 -2rpx 16rpx rgba(0, 0, 0, 0.06);
+}
+
+.bottom-btn {
+  flex: 1;
+  margin: 0 8rpx;
+}
+
+/* 错误条的「点击重试」 */
+.retry-link {
+  display: inline-block;
+  margin-left: 12rpx;
+  color: #007aff;
+  font-weight: 600;
+}

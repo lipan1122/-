@@ -11,3 +11,8 @@
   font-weight: 600;
   color: #1c1c1e;
 }
+
+/* 整卡可点进详情：给一点按压反馈，否则用户不知道能点 */
+.order-card-hover {
+  background: #f7f7fa;
+}

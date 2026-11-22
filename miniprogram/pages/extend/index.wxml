@@ -1,0 +1,90 @@
+<!--*
+ * 续住申请
+ *
+ * 数据来源：GET /api/mini/stays/current（原离店日）+ GET /api/mini/rooms（参考价）
+ * 提交：POST /api/mini/stays/:id/extend { request_id, newCheckOutDate }
+ * 服务端会现查远期库存 + 重算价格；页面上的参考价不是承诺。
+ -->
+<view class="container">
+  <view wx:if="{{loading}}" class="loading-box">正在加载在住信息…</view>
+
+  <!-- 接口未就绪 -->
+  <view wx:if="{{!loading && notReady}}" class="card empty">
+    <text class="subtitle">{{notReadyMsg}}</text>
+    <view class="muted gap-top">续住服务正在对接酒店系统，请直接联系前台办理续住。</view>
+    <button class="btn btn-ghost" bindtap="goContact">联系酒店</button>
+    <button class="btn btn-ghost" bindtap="onRetry" data-key="main">重新加载</button>
+  </view>
+
+  <view wx:if="{{!loading && error && !notReady}}" class="error-box">
+    {{error}}
+    <view class="retry-link" bindtap="onRetry" data-key="main">点击重试</view>
+  </view>
+
+  <!-- 没有在住 -->
+  <view wx:if="{{!loading && !notReady && !error && !stay}}" class="card empty">
+    当前没有可续住的在住订单
+    <view class="muted gap-top">办理入住后才能申请续住</view>
+    <button class="btn btn-ghost" bindtap="goInStay">去看在住服务</button>
+  </view>
+
+  <block wx:if="{{!loading && stay}}">
+    <!-- 当前住宿 -->
+    <view class="card">
+      <view class="row">
+        <view>
+          <text class="title">{{stay.roomNo}}</text>
+          <view class="muted gap-top">{{stay.roomTypeName}}{{stay.guestName ? ' · ' + stay.guestName : ''}}</view>
+        </view>
+        <text class="chip chip-green">在住</text>
+      </view>
+      <view class="divider"></view>
+      <view class="row">
+        <text class="muted">当前离店日</text>
+        <text class="subtitle">{{stay.checkOutText}}</text>
+      </view>
+    </view>
+
+    <!-- 选择新离店日 -->
+    <view class="card">
+      <view class="row">
+        <text class="subtitle">续住到</text>
+        <text class="muted">最多可选 30 天内</text>
+      </view>
+      <picker mode="date" value="{{newCheckOutDate}}" start="{{minCheckOutDate}}" end="{{maxCheckOutDate}}" bindchange="onDateChange">
+        <view class="date-pick gap-top">
+          <text class="date-pick-value">{{newCheckOutDate}}</text>
+          <text class="muted">点击修改</text>
+        </view>
+      </picker>
+
+      <view wx:if="{{addedNights > 0}}" class="row gap-top">
+        <text class="muted">新增</text>
+        <text class="subtitle">{{addedNights}} 晚</text>
+      </view>
+
+      <view wx:if="{{refReady}}" class="quote gap-top">
+        <text class="muted">参考金额</text>
+        <text class="price">¥{{refPriceText}}</text>
+      </view>
+      <view wx:if="{{hint}}" class="muted gap-top">{{hint}}</view>
+
+      <view class="divider"></view>
+      <view class="muted">
+        续住需要前台确认房态与价格，确认前离店日不变；续住金额并入房间账单。
+        如提示房量不足，可更换房型或联系前台安排。
+      </view>
+    </view>
+
+    <view wx:if="{{error && !notReady}}" class="error-box">{{error}}</view>
+
+    <button class="btn" bindtap="onSubmit" disabled="{{submitting}}">
+      {{submitting ? '提交中…' : '提交续住申请'}}
+    </button>
+    <button class="btn btn-ghost" bindtap="goContact">联系前台</button>
+
+    <view class="muted footer-tip">
+      提交成功后可在「在住服务」看到最新离店日；若前台拒绝，会通过通知中心告知原因。
+    </view>
+  </block>
+</view>

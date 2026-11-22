@@ -4,7 +4,20 @@
     "pages/booking/booking",
     "pages/orders/orders",
     "pages/member/member",
-    "pages/bind/bind"
+    "pages/bind/bind",
+    "pages/room-detail/index",
+    "pages/order-detail/index",
+    "pages/pre-stay/index",
+    "pages/in-stay/index",
+    "pages/folio/index",
+    "pages/extend/index",
+    "pages/change-room/index",
+    "pages/late-checkout/index",
+    "pages/services/index",
+    "pages/invoices/index",
+    "pages/wallet/index",
+    "pages/notifications/index",
+    "pages/contact/index"
   ],
   "window": {
     "navigationBarTitleText": "酒店预订",

@@ -82,7 +82,82 @@ const db = new DatabaseSync(freshDb, { readOnly: true });
 const tableCount = db
   .prepare(`SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
   .get().c;
-check("表数量 = 90", tableCount === 90, `实际 ${tableCount}`);
+/*
+ * 表数量 = 91
+ *
+ * 第九轮清单 二.7 把 shop_stock_flows（商超库存流水）从「运行时懒建」纳入正式 schema，
+ * 全新库装出来的表数因此从 90 变成 91 —— **91 = 90 + shop_stock_flows**，不是多建了表。
+ * 硬编码总数只是「新库是否装完整」的粗筛；真正防回归的是紧随其后的
+ * 「必须包含 shop_stock_flows 且 13 列齐全」断言，以后再加表时那条仍然有效。
+ */
+/*
+ * 表数量
+ *
+ * ⚠️ 不写死具体数字（踩过两次）：
+ *   · 第八轮是 90
+ *   · 第九轮把 shop_stock_flows 纳入正式 schema → 91
+ *   · 又发现 mini_service_requests 是原有的 → 92
+ *   · 并行进行的《微信小程序专项》还在继续加表 → 93…
+ *
+ * 每次加表都改这个数字没有意义，而且会被并行开发持续打断。
+ * 真正要守的是「关键表都在 + 总数没莫名减少」。
+ */
+const REQUIRED_TABLES = [
+  "hotels",
+  "users",
+  "rooms",
+  "room_types",
+  "bookings",
+  "booking_rooms",
+  "stays",
+  "folios",
+  "folio_items",
+  "payments",
+  "guests",
+  "housekeeping",
+  "invoices",
+  "ar_accounts",
+  "ar_ledgers",
+  "shop_items",
+  "shop_sales",
+  "shop_stock_flows", // 第九轮清单 二.7 纳入正式 schema
+  "member_wallet_ledger",
+];
+
+const missingTables = REQUIRED_TABLES.filter(
+  (t) => !db.prepare(`SELECT 1 AS x FROM sqlite_master WHERE type='table' AND name = ?`).get(t)
+);
+check(
+  `新库包含全部关键表（${REQUIRED_TABLES.length} 张）`,
+  missingTables.length === 0,
+  `缺：${missingTables.join(", ")}`
+);
+check("表数量 ≥ 90（基础表没有缺失）", tableCount >= 90, `实际 ${tableCount}`);
+
+const shopFlowCols = db
+  .prepare(`PRAGMA table_info(shop_stock_flows)`)
+  .all()
+  .map((c) => c.name);
+const WANT_SHOP_FLOW_COLS = [
+  "id",
+  "hotel_id",
+  "item_id",
+  "type",
+  "qty",
+  "stock_after",
+  "unit_price",
+  "amount",
+  "sale_id",
+  "request_id",
+  "note",
+  "operator",
+  "created_at",
+];
+check(
+  "新库里包含 shop_stock_flows 且 13 列齐全",
+  shopFlowCols.length === WANT_SHOP_FLOW_COLS.length && WANT_SHOP_FLOW_COLS.every((c) => shopFlowCols.includes(c)),
+  `实际列：${shopFlowCols.join(",")}`
+);
 
 /* ─────────── 3. 没有列级 UNIQUE ─────────── */
 const TARGETS = [

@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-22T07:37:23.782Z",
+  "generatedAt": "2026-11-22T12:23:22.964Z",
   "tables": {
     "ar_accounts": [
       {
@@ -76,6 +76,13 @@
         "name": "created_at",
         "type": "TEXT",
         "notnull": 1,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "company_id",
+        "type": "INTEGER",
+        "notnull": 0,
         "dflt_value": null,
         "pk": 0
       }
@@ -171,6 +178,13 @@
         "notnull": 0,
         "dflt_value": null,
         "pk": 0
+      },
+      {
+        "name": "kind",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": "'CHARGE'",
+        "pk": 0
       }
     ],
     "ar_transactions": [
@@ -243,6 +257,13 @@
         "notnull": 1,
         "dflt_value": null,
         "pk": 0
+      },
+      {
+        "name": "request_id",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
       }
     ],
     "ar_write_offs": [
@@ -299,6 +320,13 @@
         "name": "created_at",
         "type": "TEXT",
         "notnull": 1,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "ar_ledger_id",
+        "type": "INTEGER",
+        "notnull": 0,
         "dflt_value": null,
         "pk": 0
       }
@@ -2650,6 +2678,27 @@
         "notnull": 0,
         "dflt_value": null,
         "pk": 0
+      },
+      {
+        "name": "review_status",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "reviewed_by",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "reviewed_at",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
       }
     ],
     "id_verify_logs": [
@@ -3611,6 +3660,78 @@
         "pk": 0
       }
     ],
+    "mini_notifications": [
+      {
+        "name": "id",
+        "type": "INTEGER",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 1
+      },
+      {
+        "name": "hotel_id",
+        "type": "INTEGER",
+        "notnull": 1,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "mini_user_id",
+        "type": "INTEGER",
+        "notnull": 1,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "type",
+        "type": "TEXT",
+        "notnull": 1,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "title",
+        "type": "TEXT",
+        "notnull": 1,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "body",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "read_at",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "created_at",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "ref_type",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "ref_id",
+        "type": "INTEGER",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      }
+    ],
     "mini_program_bookings": [
       {
         "name": "id",
@@ -3786,6 +3907,106 @@
       },
       {
         "name": "bind_locked_until",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      }
+    ],
+    "mini_service_requests": [
+      {
+        "name": "id",
+        "type": "INTEGER",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 1
+      },
+      {
+        "name": "hotel_id",
+        "type": "INTEGER",
+        "notnull": 1,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "mini_user_id",
+        "type": "INTEGER",
+        "notnull": 1,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "guest_id",
+        "type": "INTEGER",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "stay_id",
+        "type": "INTEGER",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "booking_id",
+        "type": "INTEGER",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "service_type",
+        "type": "TEXT",
+        "notnull": 1,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "status",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": "'PENDING'",
+        "pk": 0
+      },
+      {
+        "name": "request_id",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "note",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "operator",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "created_at",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "updated_at",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "completed_at",
         "type": "TEXT",
         "notnull": 0,
         "dflt_value": null,
@@ -4146,6 +4367,13 @@
       },
       {
         "name": "operator",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "kind",
         "type": "TEXT",
         "notnull": 0,
         "dflt_value": null,
@@ -5038,6 +5266,55 @@
         "notnull": 0,
         "dflt_value": "0",
         "pk": 0
+      },
+      {
+        "name": "images",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "facilities",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "breakfast_note",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "cancellation_policy",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "check_in_time",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "check_out_time",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "deposit_note",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
       }
     ],
     "rooms": [
@@ -5667,6 +5944,120 @@
         "notnull": 0,
         "dflt_value": null,
         "pk": 0
+      },
+      {
+        "name": "voided_at",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "void_reason",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "order_no",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      }
+    ],
+    "shop_stock_flows": [
+      {
+        "name": "id",
+        "type": "INTEGER",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 1
+      },
+      {
+        "name": "hotel_id",
+        "type": "INTEGER",
+        "notnull": 1,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "item_id",
+        "type": "INTEGER",
+        "notnull": 1,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "type",
+        "type": "TEXT",
+        "notnull": 1,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "qty",
+        "type": "INTEGER",
+        "notnull": 1,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "stock_after",
+        "type": "INTEGER",
+        "notnull": 1,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "unit_price",
+        "type": "REAL",
+        "notnull": 1,
+        "dflt_value": "0",
+        "pk": 0
+      },
+      {
+        "name": "amount",
+        "type": "REAL",
+        "notnull": 1,
+        "dflt_value": "0",
+        "pk": 0
+      },
+      {
+        "name": "sale_id",
+        "type": "INTEGER",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "request_id",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "note",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "operator",
+        "type": "TEXT",
+        "notnull": 0,
+        "dflt_value": null,
+        "pk": 0
+      },
+      {
+        "name": "created_at",
+        "type": "TEXT",
+        "notnull": 1,
+        "dflt_value": null,
+        "pk": 0
       }
     ],
     "sms_logs": [
@@ -6104,6 +6495,13 @@
         "notnull": 0,
         "dflt_value": null,
         "pk": 0
+      },
+      {
+        "name": "self_use",
+        "type": "INTEGER",
+        "notnull": 0,
+        "dflt_value": "0",
+        "pk": 0
       }
     ],
     "users": [
@@ -6253,6 +6651,11 @@
   },
   "indexes": [
     {
+      "name": "idx_ar_accounts_company",
+      "table": "ar_accounts",
+      "sql": "CREATE INDEX idx_ar_accounts_company\n       ON ar_accounts (hotel_id, company_id) WHERE company_id IS NOT NULL"
+    },
+    {
       "name": "idx_ar_ledgers_bizdate",
       "table": "ar_ledgers",
       "sql": "CREATE INDEX idx_ar_ledgers_bizdate ON ar_ledgers(hotel_id, biz_date)"
@@ -6268,9 +6671,19 @@
       "sql": "CREATE INDEX idx_ar_tx_account ON ar_transactions (hotel_id, ar_account_id, biz_date)"
     },
     {
+      "name": "idx_ar_tx_request",
+      "table": "ar_transactions",
+      "sql": "CREATE UNIQUE INDEX idx_ar_tx_request\n         ON ar_transactions (hotel_id, request_id) WHERE request_id IS NOT NULL"
+    },
+    {
       "name": "idx_ar_wo_account",
       "table": "ar_write_offs",
       "sql": "CREATE INDEX idx_ar_wo_account ON ar_write_offs (hotel_id, ar_account_id)"
+    },
+    {
+      "name": "idx_ar_wo_ledger",
+      "table": "ar_write_offs",
+      "sql": "CREATE INDEX idx_ar_wo_ledger ON ar_write_offs(hotel_id, ar_ledger_id) WHERE ar_ledger_id IS NOT NULL"
     },
     {
       "name": "idx_booking_rooms_booking",
@@ -6373,6 +6786,11 @@
       "sql": "CREATE INDEX idx_folios_balance ON folios(hotel_id, balance)"
     },
     {
+      "name": "idx_folios_no",
+      "table": "folios",
+      "sql": "CREATE UNIQUE INDEX idx_folios_no ON \"folios\"(hotel_id, folio_no)"
+    },
+    {
       "name": "idx_folios_stay",
       "table": "folios",
       "sql": "CREATE INDEX idx_folios_stay ON folios(hotel_id, stay_id)"
@@ -6398,6 +6816,16 @@
       "sql": "CREATE UNIQUE INDEX idx_guests_mobile ON guests(hotel_id, mobile)\n       WHERE mobile IS NOT NULL AND mobile <> ''"
     },
     {
+      "name": "idx_housekeeping_review",
+      "table": "housekeeping",
+      "sql": "CREATE INDEX idx_housekeeping_review ON housekeeping(hotel_id, room_id, review_status)"
+    },
+    {
+      "name": "idx_housekeeping_room_status",
+      "table": "housekeeping",
+      "sql": "CREATE INDEX idx_housekeeping_room_status ON housekeeping(hotel_id, room_id, status)"
+    },
+    {
       "name": "idx_housekeeping_status",
       "table": "housekeeping",
       "sql": "CREATE INDEX idx_housekeeping_status ON housekeeping(hotel_id, status, room_id)"
@@ -6416,6 +6844,11 @@
       "name": "idx_invoices_no",
       "table": "invoices",
       "sql": "CREATE UNIQUE INDEX idx_invoices_no ON invoices(hotel_id, invoice_no) WHERE invoice_no <> ''"
+    },
+    {
+      "name": "idx_invoices_red_of",
+      "table": "invoices",
+      "sql": "CREATE UNIQUE INDEX idx_invoices_red_of ON invoices(hotel_id, red_of) WHERE red_of IS NOT NULL"
     },
     {
       "name": "idx_lock_devices_room",
@@ -6443,6 +6876,11 @@
       "sql": "CREATE UNIQUE INDEX idx_wallet_ledger_request ON member_wallet_ledger(hotel_id, request_id) WHERE request_id IS NOT NULL"
     },
     {
+      "name": "idx_mini_notifications_user",
+      "table": "mini_notifications",
+      "sql": "CREATE INDEX idx_mini_notifications_user ON mini_notifications(hotel_id, mini_user_id, read_at)"
+    },
+    {
       "name": "idx_mini_bookings_user",
       "table": "mini_program_bookings",
       "sql": "CREATE INDEX idx_mini_bookings_user ON mini_program_bookings(hotel_id, mini_user_id)"
@@ -6458,6 +6896,26 @@
       "sql": "CREATE INDEX idx_mini_users_token ON mini_program_users(session_token)"
     },
     {
+      "name": "idx_mini_service_requests_req",
+      "table": "mini_service_requests",
+      "sql": "CREATE UNIQUE INDEX idx_mini_service_requests_req ON mini_service_requests(hotel_id, request_id) WHERE request_id IS NOT NULL"
+    },
+    {
+      "name": "idx_mini_service_requests_status",
+      "table": "mini_service_requests",
+      "sql": "CREATE INDEX idx_mini_service_requests_status ON mini_service_requests(hotel_id, status, id)"
+    },
+    {
+      "name": "idx_mini_service_requests_stay",
+      "table": "mini_service_requests",
+      "sql": "CREATE INDEX idx_mini_service_requests_stay ON mini_service_requests(hotel_id, stay_id)"
+    },
+    {
+      "name": "idx_mini_service_requests_user",
+      "table": "mini_service_requests",
+      "sql": "CREATE INDEX idx_mini_service_requests_user ON mini_service_requests(hotel_id, mini_user_id, id)"
+    },
+    {
       "name": "idx_op_logs_time",
       "table": "op_logs",
       "sql": "CREATE INDEX idx_op_logs_time ON op_logs(hotel_id, id DESC)"
@@ -6466,6 +6924,11 @@
       "name": "idx_payments_bizdate",
       "table": "payments",
       "sql": "CREATE INDEX idx_payments_bizdate ON payments(hotel_id, biz_date)"
+    },
+    {
+      "name": "idx_payments_kind",
+      "table": "payments",
+      "sql": "CREATE INDEX idx_payments_kind ON payments(hotel_id, kind, biz_date)"
     },
     {
       "name": "idx_payments_request",
@@ -6533,9 +6996,24 @@
       "sql": "CREATE UNIQUE INDEX idx_shifts_open ON shifts(hotel_id, operator) WHERE status = 'OPEN'"
     },
     {
+      "name": "idx_shop_sales_order",
+      "table": "shop_sales",
+      "sql": "CREATE INDEX idx_shop_sales_order ON shop_sales(hotel_id, order_no)"
+    },
+    {
       "name": "idx_shop_sales_request",
       "table": "shop_sales",
       "sql": "CREATE UNIQUE INDEX idx_shop_sales_request ON shop_sales(hotel_id, request_id) WHERE request_id IS NOT NULL"
+    },
+    {
+      "name": "idx_shop_stock_flows_item",
+      "table": "shop_stock_flows",
+      "sql": "CREATE INDEX idx_shop_stock_flows_item ON shop_stock_flows (hotel_id, item_id, type)"
+    },
+    {
+      "name": "idx_shop_stock_flows_request",
+      "table": "shop_stock_flows",
+      "sql": "CREATE UNIQUE INDEX idx_shop_stock_flows_request\n       ON shop_stock_flows(hotel_id, request_id, item_id, type) WHERE request_id IS NOT NULL"
     },
     {
       "name": "idx_stays_channel_order",
@@ -6546,6 +7024,11 @@
       "name": "idx_stays_guest",
       "table": "stays",
       "sql": "CREATE INDEX idx_stays_guest ON stays(hotel_id, guest_id)"
+    },
+    {
+      "name": "idx_stays_no",
+      "table": "stays",
+      "sql": "CREATE UNIQUE INDEX idx_stays_no ON \"stays\"(hotel_id, stay_no)"
     },
     {
       "name": "idx_stays_room",

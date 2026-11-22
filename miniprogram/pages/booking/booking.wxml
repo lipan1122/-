@@ -80,6 +80,19 @@
       <text class="price">¥{{totalText}}</text>
     </view>
     <view class="muted gap-top">到店付款，前台办理入住时收取房费与押金</view>
+
+    <!-- 隐私与用户协议（清单第八节：下单页必须有） -->
+    <view class="agree-row">
+      <view class="checkbox {{agreed ? 'checkbox-on' : ''}}" bindtap="onToggleAgree">
+        <text wx:if="{{agreed}}" class="checkbox-tick">✓</text>
+      </view>
+      <view class="agree-text">
+        <text bindtap="onToggleAgree">我已阅读并同意</text>
+        <text class="agree-link" catchtap="onShowPrivacy">《隐私说明》</text>
+        <text class="agree-link" catchtap="onShowTerms">《用户协议》</text>
+      </view>
+    </view>
+
     <button class="btn" bindtap="onSubmit" disabled="{{submitting}}">
       {{submitting ? '提交中…' : '提交订单'}}
     </button>

@@ -304,6 +304,46 @@ export function runMigrations(db, { checkOnly = false } = {}) {
     changed += 1;
   }
 
+  /**
+   * payments.kind 旧数据回填（第九轮 P1-2）
+   *
+   * 只处理 kind IS NULL 的行，返回本次填了多少、还剩多少待核对。
+   * 「可判定」的两种情形见 1b 段注释；其余保持 NULL —— 清单要求
+   * 「无法判断的旧记录标记待核对，不要静默归类」，NULL 就是那个标记。
+   */
+  function backfillPaymentKind() {
+    const update = (sql) => Number(db.prepare(sql).run().changes ?? 0);
+
+    /* ① 押金 / 预收（非退款行）：备注锚点是旧数据唯一的可靠线索 */
+    const deposit = update(
+      `UPDATE payments
+          SET kind = 'DEPOSIT'
+        WHERE kind IS NULL
+          AND refund_of IS NULL
+          AND (remark LIKE '%押金%' OR remark LIKE '%预收%')`
+    );
+
+    /* ② 退款行：按原收款的 kind 定性。原收款自己也是 NULL → 本行同样留 NULL（待核对） */
+    const refund = update(
+      `UPDATE payments
+          SET kind = CASE
+                       WHEN (SELECT o.kind FROM payments o
+                              WHERE o.id = payments.refund_of AND o.hotel_id = payments.hotel_id) = 'DEPOSIT'
+                         THEN 'DEPOSIT_REFUND'
+                       ELSE 'ROOM_REFUND'
+                     END
+        WHERE kind IS NULL
+          AND refund_of IS NOT NULL
+          AND (SELECT o.kind FROM payments o
+                WHERE o.id = payments.refund_of AND o.hotel_id = payments.hotel_id) IS NOT NULL`
+    );
+
+    const pending = Number(
+      all(`SELECT COUNT(*) AS n FROM payments WHERE kind IS NULL`)[0]?.n ?? 0
+    );
+    return { filled: deposit + refund, deposit, refund, pending };
+  }
+
   /* ---------- 1. 收款：幂等键 / 退款关联 / 操作人 ---------- */
   addColumn("payments", "request_id", "TEXT");
   addColumn("payments", "refund_of", "INTEGER");
@@ -312,6 +352,42 @@ export function runMigrations(db, { checkOnly = false } = {}) {
     "idx_payments_request",
     `CREATE UNIQUE INDEX idx_payments_request ON payments(hotel_id, request_id) WHERE request_id IS NOT NULL`
   );
+
+  /* ---------- 1b. 收款性质 kind（第九轮 P1-2：押金不能再靠备注识别） ----------
+   *
+   * ── 缺陷 ──
+   * payments 只有 remark：押金靠「备注含押金/预收」识别。
+   * 备注写成「订金」→ 退房找不到原押金（refund_of 为空、押金退不回去）；
+   * 手动退款与退房退款各写一套判断 → 口径不一致，同一笔押金可能被退两次；
+   * 押金退款报表按备注 LIKE 匹配 → 漏记。
+   *
+   * ── 修法 ──
+   * 加结构化列 kind：ROOM_PAYMENT / DEPOSIT / DEPOSIT_REFUND / ROOM_REFUND / OTHER_PAYMENT。
+   * 新写入一律带 kind（收银台/入住/退款/退房/核销），备注写什么都无所谓。
+   *
+   * ── 旧数据回填（清单第 72-73 行：尽量回填，无法判断的标记待核对，不要静默归类）──
+   *   ① 备注含「押金」/「预收」且不是退款 → DEPOSIT（可判定）
+   *   ② 退款行（refund_of 非空）→ 按原收款的 kind 决定 DEPOSIT_REFUND / ROOM_REFUND
+   *   ③ 其余一律留 NULL（= 待核对），**不猜**：
+   *      例如「退房结账」既可能是房费收款也可能是别的，归成 ROOM_PAYMENT 属于静默归类，
+   *      会让对账时无法区分「本来就是房费收款」和「我们猜的」。
+   *   回填只碰 kind IS NULL 的行，反复执行结果一致（幂等）。
+   */
+  addColumn("payments", "kind", "TEXT");
+  addIndex("idx_payments_kind", `CREATE INDEX idx_payments_kind ON payments(hotel_id, kind, biz_date)`);
+  if (!checkOnly && hasTable("payments") && hasColumn("payments", "kind")) {
+    const stat = backfillPaymentKind();
+    if (stat.filled > 0) {
+      applied.push(`payments.kind 旧数据回填（${stat.filled} 条可判定）`);
+      changed += 1;
+    }
+    if (stat.filled > 0 || stat.pending > 0) {
+      notes.push(
+        `payments.kind 回填：本次 ${stat.filled} 条（押金 ${stat.deposit} / 退款 ${stat.refund}），` +
+          `仍留空 ${stat.pending} 条（无判定依据 → kind=NULL 标记待核对，按备注兜底识别）`
+      );
+    }
+  }
 
   /* ---------- 2. 夜审：唯一键按酒店隔离 ---------- */
   const naSql = all(`SELECT sql FROM sqlite_master WHERE type='table' AND name='night_audits'`)[0]?.sql ?? "";
@@ -1075,6 +1151,7 @@ export function runMigrations(db, { checkOnly = false } = {}) {
           settled_amount REAL DEFAULT 0,
           due_date TEXT,
           status TEXT DEFAULT 'OPEN',
+          kind TEXT DEFAULT 'CHARGE',
           operator TEXT,
           remark TEXT,
           created_at TEXT
@@ -1091,6 +1168,32 @@ export function runMigrations(db, { checkOnly = false } = {}) {
     `CREATE INDEX idx_ar_ledgers_company ON ar_ledgers(hotel_id, company_id, status)`
   );
   addIndex("idx_ar_ledgers_bizdate", `CREATE INDEX idx_ar_ledgers_bizdate ON ar_ledgers(hotel_id, biz_date)`);
+  /*
+   * 第九轮 P1-3：账户总账与协议单位台账必须同步
+   *
+   * 原来「挂账」双写（ar_ledgers + ar_accounts/ar_transactions），
+   * 但「收款 / 转账 / 坏账核销」只动账户总账，ar_ledgers 不跟：
+   * 核销后协议单位台账仍显示未结，财务和客户对账必然对不上。
+   *
+   * kind 用来区分台账行的来源：
+   *   CHARGE       正常挂账 / 账户入账（增加应收）
+   *   TRANSFER_IN  从其他 AR 账户调账转入（增加本单位应收）
+   *   TRANSFER_OUT 调账转出的审计行（amount = settled_amount，净额 0，只留痕）
+   * 老库补列时默认 CHARGE —— 历史上 ar_ledgers 只有「挂账」一种来源，可判定。
+   */
+  addColumn("ar_ledgers", "kind", "TEXT DEFAULT 'CHARGE'");
+  /*
+   * 核销记录挂到被冲减的台账行：一次核销可能跨多条未结台账（FIFO 分摊），
+   * 因此 ar_write_offs 按分摊行各记一条，ar_ledger_id 指向具体台账。
+   *
+   * 注意：ar_write_offs 和 ar_accounts / ar_transactions 一样属于「页面首次访问时懒建」的表
+   * （由 ar/actions.ts ensureArSchema 与 lib/ar.ts ensureArAccountSchema 兜底建），
+   * 全新部署的库在这里还没有它。所以只补列、不在迁移里建索引 ——
+   * 索引由运行时兜底建（CREATE INDEX IF NOT EXISTS），
+   * 否则 `db:migrate:check` 在全新库上会永远挂一条「待建：表尚未创建」，把目标状态检查搞脏。
+   */
+  addColumn("ar_write_offs", "ar_ledger_id", "INTEGER");
+
 
   /* ---------- 10. 发票台账（整改清单 P2-3：发票建台账 + 开票校验 + 红冲） ----------
    * 现状：收银台「开发票」只在 op_logs 写一段文本，没有台账表 —— 开票记录不可查、
@@ -1291,6 +1394,157 @@ export function runMigrations(db, { checkOnly = false } = {}) {
     `CREATE INDEX idx_mini_bookings_user ON mini_program_bookings(hotel_id, mini_user_id)`
   );
 
+  /* ---------- 12.3 房型详情展示字段（第九轮《微信小程序专项》第二节 / 第 81 行） ----------
+   *
+   * 缺陷：room_types 只有 code / name / bed_type / area / max_occupancy / base_price / sort。
+   * 小程序房型详情页需要「图片 / 设施 / 早餐说明 / 取消政策 / 入离时间 / 押金说明」，
+   * 数据库里一个都没有 —— 前端只能写死假图假设施（虚假宣传），或者什么都不显示。
+   *
+   * 整改清单第 81 行的原话是「如果数据库没有图片和设施字段，增加明确的数据表或配置
+   * 字段，不要在页面写死虚假信息」，所以这里补列（而不是让页面编）：
+   *   images              图片 URL 的 JSON 数组，如 ["https://cdn/x/1.jpg"]
+   *   facilities          设施的 JSON 数组，如 ["免费WiFi","独立卫浴"]
+   *   breakfast_note      早餐说明（「含双早（自助）」/「不含早餐」）
+   *   cancellation_policy 取消政策（「入住前 1 天 18:00 前可免费取消」）
+   *   check_in_time       该房型可入住时间 HH:MM（空 = 用 settings.check_in_time）
+   *   check_out_time      该房型离店时间 HH:MM（空 = 用 settings.check_out_time）
+   *   deposit_note        押金说明（空 = 用 settings.hotel_deposit_note）
+   *
+   * 全部可空、无默认值：**NULL 就是「酒店还没配」**，接口据此返回 null 并标注未配置，
+   * 不给空串默认值（空串和「未配置」在展示层分不开，会让人误以为「配了但为空」）。
+   *
+   * 回滚说明（清单第六节「备份和回滚脚本」）：本段与 12.4 都是**只增不改**——
+   * 加列 / 加表不动任何既有数据与既有列，旧代码读不到新列也照常运行。
+   * 因此回滚只需要「升级前备份的 data/pms.db 覆盖回去」（scripts/build-release.mjs
+   * 生成的部署说明第 5 节就是这套流程），不需要单独的 down 迁移脚本。
+   */
+  addColumn("room_types", "images", "TEXT");
+  addColumn("room_types", "facilities", "TEXT");
+  addColumn("room_types", "breakfast_note", "TEXT");
+  addColumn("room_types", "cancellation_policy", "TEXT");
+  addColumn("room_types", "check_in_time", "TEXT");
+  addColumn("room_types", "check_out_time", "TEXT");
+  addColumn("room_types", "deposit_note", "TEXT");
+
+  /* ---------- 12.4 小程序站内通知 mini_notifications（第九轮 第三节 / 第 302 行） ----------
+   *
+   * 清单第 302 行：「通知必须只发给对应 mini_user_id，不能按手机号群发」。
+   *
+   * 为什么必须是新表而不是复用 notices / sms_logs：
+   *   · notices 是酒店对内的公告（全店可见），没有收件人维度；
+   *   · sms_logs 按手机号记，正是清单禁止的「按手机号群发」的载体 ——
+   *     手机号在绑定流程里是用户自填的、可被冒用的字段（P0-12），不能当收件人主键。
+   *
+   * 收件人唯一键是 mini_user_id（mini_program_users.id，由服务端 token 解析）：
+   * 这张表**刻意不存 mobile / guest_id** —— 一旦存了手机号，将来一定有人写出
+   * 「按手机号发通知」的群发 SQL，而这里连列都没有，写不出来。
+   *
+   * read_at 用时间戳而不是 0/1：客人问「我什么时候看的」能答，
+   * 也便于将来做「未读超过 N 天清理」。NULL = 未读。
+   */
+  if (!hasTable("mini_notifications")) {
+    if (checkOnly) {
+      applied.push("mini_notifications 表（待建）");
+    } else {
+      db.exec(`
+        CREATE TABLE mini_notifications (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          hotel_id INTEGER NOT NULL,
+          mini_user_id INTEGER NOT NULL,
+          type TEXT NOT NULL,
+          title TEXT NOT NULL,
+          body TEXT,
+          read_at TEXT,
+          created_at TEXT,
+          ref_type TEXT,
+          ref_id INTEGER
+        );
+      `);
+      applied.push("mini_notifications 表");
+      changed += 1;
+    }
+  } else {
+    skipped.push("mini_notifications 表");
+  }
+  /*
+   * 列表固定按 (hotel_id, mini_user_id, read_at) 过滤（未读角标 = read_at IS NULL），
+   * 缺索引时每刷一次消息页就全表扫一遍，通知一多就是明显的慢查询。
+   */
+  addIndex(
+    "idx_mini_notifications_user",
+    `CREATE INDEX idx_mini_notifications_user ON mini_notifications(hotel_id, mini_user_id, read_at)`
+  );
+
+  /* ---------- 12.3 小程序服务请求 mini_service_requests（第九轮清单第六节） ----------
+   *
+   * 小程序「在住服务」产生的全部申请都落这一张表，前台按 status 处理：
+   *   客房清洁 / 送物 / 维修 / 延迟退房 / 换房 / 唤早 / 续住申请。
+   *
+   * 为什么要单独一张表而不是塞 housekeeping / cancel_requests：
+   *   · 那些表是 PC 端各业务的内部单据（housekeeping 是打扫任务、cancel_requests 是退房审批），
+   *     语义不同、字段不同，混进去会让 PC 端列表出现「不是自己要处理的东西」；
+   *   · 小程序侧需要一条「客人自己提过什么」的完整台账，且必须只能按 mini_user_id 取数
+   *     （整改要求：不返回其他客人的数据）。独立表天然做到这一点。
+   *
+   * 字段（与清单第 396-411 行逐列一致）：
+   *   hotel_id / mini_user_id / guest_id / stay_id / booking_id —— 全部由服务端推导或校验后写入，
+   *   客户端传来的 id 一律先按「属于当前 mini_user」验过才落库（不信任客户端 id）。
+   *   request_id —— 客户端幂等键；唯一索引 (hotel_id, request_id) 部分唯一（WHERE request_id IS NOT NULL），
+   *   保证「同一个 request_id 重复提交只建一条」。历史行 request_id 为 NULL，不进索引。
+   *   operator / completed_at —— PC 端处理人与处理时间，小程序侧留空。
+   *
+   * ⚠️ 这条 DDL 必须与 scripts/schema-full.sql、scripts/init-db.mjs 以及运行时
+   *    src/app/api/mini/_shared.ts 的 ensureMiniServiceSchema() 逐列一致。
+   */
+  if (!hasTable("mini_service_requests")) {
+    if (checkOnly) {
+      applied.push("mini_service_requests 表（待建）");
+    } else {
+      db.exec(`
+        CREATE TABLE mini_service_requests (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          hotel_id INTEGER NOT NULL,
+          mini_user_id INTEGER NOT NULL,
+          guest_id INTEGER,
+          stay_id INTEGER,
+          booking_id INTEGER,
+          service_type TEXT NOT NULL,
+          status TEXT DEFAULT 'PENDING',
+          request_id TEXT,
+          note TEXT,
+          operator TEXT,
+          created_at TEXT,
+          updated_at TEXT,
+          completed_at TEXT
+        );
+      `);
+      applied.push("mini_service_requests 表");
+      changed += 1;
+    }
+  } else {
+    skipped.push("mini_service_requests 表");
+  }
+  // request_id 幂等：同一家店同一 request_id 只能落一行（部分唯一，NULL 不进索引）
+  addIndex(
+    "idx_mini_service_requests_req",
+    `CREATE UNIQUE INDEX idx_mini_service_requests_req ON mini_service_requests(hotel_id, request_id) WHERE request_id IS NOT NULL`
+  );
+  // 「我的服务请求」按 (hotel_id, mini_user_id) 取数，没有索引就是全表扫描
+  addIndex(
+    "idx_mini_service_requests_user",
+    `CREATE INDEX idx_mini_service_requests_user ON mini_service_requests(hotel_id, mini_user_id, id)`
+  );
+  // 前台按入住单 / 房间查这家客人提过什么
+  addIndex(
+    "idx_mini_service_requests_stay",
+    `CREATE INDEX idx_mini_service_requests_stay ON mini_service_requests(hotel_id, stay_id)`
+  );
+  // 前台处理队列按状态取
+  addIndex(
+    "idx_mini_service_requests_status",
+    `CREATE INDEX idx_mini_service_requests_status ON mini_service_requests(hotel_id, status, id)`
+  );
+
   /* ---------- 13. 幂等键：账务明细 + 商品库存流水（整改 7.1） ----------
    * 资金 / 库存类写操作必须能挡住「网络重试、连点两次、客户端重发」造成的重复入账：
    * 客户端带一个 request_id，唯一索引保证同一家店同一 request_id 只能落一行。
@@ -1332,6 +1586,66 @@ export function runMigrations(db, { checkOnly = false } = {}) {
       `CREATE UNIQUE INDEX idx_shop_sales_request ON shop_sales(hotel_id, request_id) WHERE request_id IS NOT NULL`
     );
   }
+
+  /* ---------- 13.1 商超库存流水 shop_stock_flows（第九轮清单 二.7） ----------
+   *
+   * 这张表原来只在 src/app/(main)/shop/actions.ts 的 ensureShopStockFlowTable
+   * 里「运行时懒建」：老库上访问过一次商超页面就有了，但全新部署跑完
+   * init-db + migrate-all + ensure-schema 仍然缺表 —— 商超库存流水的查询、
+   * 撤销回库、盘点对账都要等「先点一次页面」才成立，交付部署不可接受。
+   *
+   * 现在三条路径都建同一张表、同一套索引：
+   *   1. 新库：scripts/init-db.mjs 直接建（建完由本函数收尾）；
+   *   2. 旧库：本段补齐（幂等，已有表/索引就跳过）；
+   *   3. 运行时：ensureShopStockFlowTable 仍是兜底（IF NOT EXISTS，不覆盖不删除）。
+   *
+   * ⚠️ 列定义必须与 ensureShopStockFlowTable 的 CREATE TABLE 逐列一致
+   *    （scripts/test-shop-schema-fresh-install.mjs 会解析源码逐列比对，漂移即红）。
+   */
+  if (!hasTable("shop_stock_flows")) {
+    if (checkOnly) {
+      applied.push("shop_stock_flows 表（待建）");
+    } else {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS shop_stock_flows (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          hotel_id INTEGER NOT NULL,
+          item_id INTEGER NOT NULL,
+          type TEXT NOT NULL,
+          qty INTEGER NOT NULL,
+          stock_after INTEGER NOT NULL,
+          unit_price REAL NOT NULL DEFAULT 0,
+          amount REAL NOT NULL DEFAULT 0,
+          sale_id INTEGER,
+          request_id TEXT,
+          note TEXT,
+          operator TEXT,
+          created_at TEXT NOT NULL
+        );
+      `);
+      applied.push("shop_stock_flows 表");
+      changed += 1;
+    }
+  } else {
+    skipped.push("shop_stock_flows 表");
+  }
+  // 查询索引：按「酒店 + 商品 + 类型」查某件商品的出入库流水（与运行时同名同列）
+  addIndex(
+    "idx_shop_stock_flows_item",
+    `CREATE INDEX idx_shop_stock_flows_item ON shop_stock_flows (hotel_id, item_id, type)`
+  );
+  /*
+   * 唯一索引（请求幂等的最后一道闸）：
+   * 同一 request_id 下同一个商品只允许一条同类流水 —— 双击 / 网络重试 / 并发提交
+   * 最多留下一条 SELL 或一条 VOID，不会把库存扣两次。
+   * 用部分索引（WHERE request_id IS NOT NULL）：撤销流水与历史老数据的 request_id 为空，
+   * 不参与唯一约束，所以旧库补索引不会因为历史行冲突而失败。
+   */
+  addIndex(
+    "idx_shop_stock_flows_request",
+    `CREATE UNIQUE INDEX idx_shop_stock_flows_request
+       ON shop_stock_flows(hotel_id, request_id, item_id, type) WHERE request_id IS NOT NULL`
+  );
 
   /* ---------- 14. 密码：password_hash 列 + 明文迁移 + 清空旧列（整改 8.1 / 8.3） ----------
    * 跑完之后的目标形态：

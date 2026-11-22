@@ -2695,6 +2695,12 @@ type ReportsSearchParams = {
   from?: string;
   to?: string;
   cmp?: string;
+  /**
+   * 房费归期口径（仅「渠道统计报表」使用）：缺省 / "biz" = 营业日，
+   * "natural" = 自然日。放在 searchParams 而不是 FilterState 里，
+   * 是为了不改动其它报表的 href 生成逻辑。
+   */
+  cal?: string;
 };
 
 type ReportCtx = {
@@ -2704,6 +2710,14 @@ type ReportCtx = {
   cmp: CmpKey;
   cmpFrom: string;
   cmpTo: string;
+  /**
+   * 房费归期口径（第九轮清单 二.5「按营业日和自然日筛选」）
+   *
+   * 只有「渠道统计报表」读它：biz = 营业日（folio_items.biz_date，夜审口径），
+   * natural = 自然日（明细创建日）。间夜两种口径相同（住宿晚=自然日），
+   * 只有凌晨过账的房费归属日不同。
+   */
+  cal: "biz" | "natural";
   days: number;
   todayDate: string;
   sellableRooms: number;
@@ -7955,22 +7969,590 @@ function ReportGoodsStock({ ctx }: ReportProps) {
   );
 }
 
-function ReportChannel({ ctx }: ReportProps) {
-  const rows = all<{ channel_name: string | null; orders: number; amount: number | null }>(
-    `SELECT COALESCE(c.name, '散客') AS channel_name,
-            COUNT(b.id) AS orders,
-            COALESCE(SUM(b.total_amount), 0) AS amount
-     FROM bookings b LEFT JOIN channels c ON c.id = b.channel_id
-     WHERE b.hotel_id = ? AND b.check_in_date BETWEEN ? AND ?
-     GROUP BY c.id ORDER BY orders DESC`,
-    [ctx.hotelId, ctx.from, ctx.to]
+/* ================================================================== *
+ * 八点四、渠道统计报表（第九轮清单 二.5）
+ *
+ * ── 为什么整节都按 channels.id 聚合，绝不按名称 ──
+ *
+ * `channels` 表里真有一条 **id = 6、名字叫「散客」** 的渠道；而「入住单没匹配到
+ * 渠道」（stays.channel_id 为 NULL）在报表里也一直显示成「散客」
+ * （COALESCE(c.name, '散客')）。这两组是**不同**的渠道口径，按名称 GROUP BY 会把
+ * 它们并成一行、间夜加两遍 —— 第八轮真库实测：售价间夜 151，实际只有 142。
+ *
+ * 所以本节的每一处聚合（订单 / 取消 / 未到店 / 已入住 / 已退房 / 间夜 / 房费）
+ * 都以 channel_id 为键（NULL 自成一键，显示「散客（未匹配渠道）」），
+ * 名称只用于显示，并额外给一列「渠道ID」让人一眼看出「两行同名其实是两条渠道」。
+ * 间夜一律取 metrics.ts 的 stayNightSlices（与工作台 / 房态 / 夜审同一口径），
+ * 不数 folio_items.qty。
+ *
+ * ── 营业日 / 自然日 ──
+ * 房费归期口径可切换：
+ *   · 营业日（默认）= folio_items.biz_date（夜审按营业日过账，同夜审记录）；
+ *   · 自然日        = substr(folio_items.created_at,1,10)（明细实际发生的自然日）。
+ * 间夜两种口径相同：一个「住宿晚」本身就是某个自然日的那一晚，营业日切换点
+ * （settings.biz_day_cutoff）只影响凌晨过账的房费归到哪一天，不改变哪一晚被占用。
+ * 这点在页面底部的口径说明里写清楚，避免「切了口径间夜没变」被当成 bug。
+ * ================================================================== */
+
+/** 导出 CSV 的最大行数（data URI 太长浏览器会拒绝下载，Excel 也打不开） */
+const CSV_MAX_ROWS = 3000;
+
+/** CSV 单元格转义：逗号 / 引号 / 换行要包引号并把引号翻倍 */
+function csvCell(v: unknown): string {
+  const s = v === null || v === undefined ? "" : String(v);
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+/**
+ * 报表内 CSV 导出链接（data URI + download 属性）
+ *
+ * 为什么不走 /api/export：那支路由的数据集是固定白名单（guests / bookings /
+ * stays / folio-items / payments / night-audits），而本轮的改动范围只允许动
+ * 报表组件本身 —— 在组件里生成 CSV 是唯一不越界、又能真下载的做法。
+ * 前缀 \uFEFF（BOM）是为了 Excel / WPS 打开中文不乱码。
+ */
+function csvHref(head: string[], rows: string[][]): string {
+  const lines = [head, ...rows.slice(0, CSV_MAX_ROWS)].map((r) => r.map(csvCell).join(","));
+  return `data:text/csv;charset=utf-8,${encodeURIComponent(`\uFEFF${lines.join("\r\n")}`)}`;
+}
+
+/** 房费归期表达式（只可能是这两段固定 SQL，不接受外部拼接） */
+type FeeDateCol = "biz_date" | "created_at";
+function feeDateExpr(col: FeeDateCol): string {
+  return col === "created_at" ? "substr(fi.created_at, 1, 10)" : "fi.biz_date";
+}
+
+/** 渠道 id → 名称（名称只用于显示，聚合永远按 id） */
+function channelNameMap(hotelId: number): Map<number, string> {
+  const map = new Map<number, string>();
+  for (const c of all<{ id: number; name: string | null }>(
+    `SELECT id, name FROM channels WHERE hotel_id = ?`,
+    [hotelId]
+  )) {
+    const name = String(c.name ?? "").trim();
+    if (name) map.set(Number(c.id), name);
+  }
+  return map;
+}
+
+/**
+ * 渠道显示名
+ *
+ * NULL（未匹配渠道）刻意不叫「散客」：库里 id=6 的渠道真的叫「散客」，
+ * 两行同名会让人以为「散客被拆成了两行」，从而怀疑数据本身错了。
+ */
+function channelLabel(id: number | null, names: Map<number, string>): string {
+  if (id == null) return "散客（未匹配渠道）";
+  return names.get(id) ?? `渠道#${id}`;
+}
+
+/** 渠道维度键（Map 的键：number | null 都能用，NULL 与 6 不会撞键） */
+function channelKey(id: number | null): string {
+  return id == null ? "null" : String(id);
+}
+
+type ChannelStatRow = {
+  channelId: number | null;
+  name: string;
+  orders: number;
+  cancelled: number;
+  noshow: number;
+  checkins: number;
+  checkouts: number;
+  nights: number;
+  room: number;
+};
+
+type ChannelStatResult = { rows: ChannelStatRow[]; totalRoom: number; totalNights: number };
+
+/**
+ * 渠道统计主表（订单 / 取消 / 未到店 / 已入住 / 已退房 / 间夜 / 房费）
+ *
+ * 三个 SQL 各管一段事实，全部 `GROUP BY channel_id`：
+ *   · 订单量 / 取消 / 未到店 —— bookings（渠道预订口径）
+ *   · 已入住 / 已退房        —— stays（实际到店口径）
+ *   · 房费                  —— folio_items ROOM 明细（按归期口径切 biz_date / created_at）
+ * 间夜不写 SQL：由调用方把 metrics.stayNightSlices 按 channelId 聚合后传进来，
+ * 保证与房态 / 工作台 / 夜审是同一套住宿占用口径。
+ */
+function channelStatRows(
+  hotelId: number,
+  from: string,
+  to: string,
+  feeDate: FeeDateCol,
+  names: Map<number, string>,
+  nightsByChannel: Map<number | null, number>
+): ChannelStatResult {
+  const map = new Map<number | null, ChannelStatRow>();
+  const ensure = (id: number | null): ChannelStatRow => {
+    let row = map.get(id);
+    if (!row) {
+      row = {
+        channelId: id,
+        name: channelLabel(id, names),
+        orders: 0,
+        cancelled: 0,
+        noshow: 0,
+        checkins: 0,
+        checkouts: 0,
+        nights: 0,
+        room: 0,
+      };
+      map.set(id, row);
+    }
+    return row;
+  };
+
+  const bookings = all<{ channel_id: number | null; orders: number; cancelled: number; noshow: number }>(
+    `SELECT b.channel_id AS channel_id,
+            COUNT(*) AS orders,
+            COALESCE(SUM(CASE WHEN b.status = 'CANCELLED' THEN 1 ELSE 0 END), 0) AS cancelled,
+            COALESCE(SUM(CASE WHEN b.status = 'NOSHOW' THEN 1 ELSE 0 END), 0) AS noshow
+       FROM bookings b
+      WHERE b.hotel_id = ? AND b.check_in_date BETWEEN ? AND ?
+      GROUP BY b.channel_id`,
+    [hotelId, from, to]
   );
-  void rows;
+  for (const r of bookings) {
+    const row = ensure(r.channel_id == null ? null : Number(r.channel_id));
+    row.orders += num(r.orders);
+    row.cancelled += num(r.cancelled);
+    row.noshow += num(r.noshow);
+  }
+
+  const stays = all<{ channel_id: number | null; checkins: number; checkouts: number }>(
+    `SELECT s.channel_id AS channel_id,
+            COUNT(*) AS checkins,
+            COALESCE(SUM(CASE WHEN s.status = 'CHECKED_OUT' THEN 1 ELSE 0 END), 0) AS checkouts
+       FROM stays s
+      WHERE s.hotel_id = ? AND substr(s.check_in_time, 1, 10) BETWEEN ? AND ?
+      GROUP BY s.channel_id`,
+    [hotelId, from, to]
+  );
+  for (const r of stays) {
+    const row = ensure(r.channel_id == null ? null : Number(r.channel_id));
+    row.checkins += num(r.checkins);
+    row.checkouts += num(r.checkouts);
+  }
+
+  const fees = all<{ channel_id: number | null; room: number }>(
+    `SELECT s.channel_id AS channel_id,
+            COALESCE(SUM(fi.amount), 0) AS room
+       FROM folio_items fi
+       JOIN folios f ON f.id = fi.folio_id AND f.hotel_id = fi.hotel_id
+       LEFT JOIN stays s ON s.id = f.stay_id AND s.hotel_id = fi.hotel_id
+      WHERE fi.hotel_id = ? AND fi.item_type = 'ROOM'
+        AND ${feeDateExpr(feeDate)} BETWEEN ? AND ?
+      GROUP BY s.channel_id`,
+    [hotelId, from, to]
+  );
+  for (const r of fees) {
+    ensure(r.channel_id == null ? null : Number(r.channel_id)).room += round2(num(r.room));
+  }
+
+  /* 有间夜、没订单也没房费（今天还没过房费的在住单）的渠道也必须出现 */
+  for (const [id, nights] of nightsByChannel) {
+    if (nights <= 0) continue;
+    ensure(id).nights = nights;
+  }
+
+  const rows = [...map.values()].sort(
+    (a, b) => b.room - a.room || b.nights - a.nights || b.orders - a.orders
+  );
+  return {
+    rows,
+    totalRoom: round2(rows.reduce((s, r) => s + r.room, 0)),
+    totalNights: rows.reduce((s, r) => s + r.nights, 0),
+  };
+}
+
+type ChannelRoomTypeStat = {
+  channelId: number | null;
+  channelName: string;
+  roomTypeId: number | null;
+  roomTypeName: string;
+  nights: number;
+  room: number;
+};
+
+/** 渠道 × 房型（间夜按 `channelId|roomTypeId` 双键聚合，房费按同一双键归集） */
+function channelRoomTypeRows(
+  hotelId: number,
+  from: string,
+  to: string,
+  feeDate: FeeDateCol,
+  names: Map<number, string>,
+  nightsByKey: Map<string, number>
+): ChannelRoomTypeStat[] {
+  const roomTypeNames = new Map<number, string>();
+  for (const rt of all<{ id: number; name: string | null }>(
+    `SELECT id, name FROM room_types WHERE hotel_id = ?`,
+    [hotelId]
+  )) {
+    roomTypeNames.set(Number(rt.id), String(rt.name ?? ""));
+  }
+
+  const map = new Map<string, ChannelRoomTypeStat>();
+  const ensure = (cid: number | null, rtid: number | null): ChannelRoomTypeStat => {
+    const key = `${channelKey(cid)}|${channelKey(rtid)}`;
+    let row = map.get(key);
+    if (!row) {
+      row = {
+        channelId: cid,
+        channelName: channelLabel(cid, names),
+        roomTypeId: rtid,
+        roomTypeName: rtid == null ? "未分房型" : roomTypeNames.get(rtid) ?? `房型#${rtid}`,
+        nights: 0,
+        room: 0,
+      };
+      map.set(key, row);
+    }
+    return row;
+  };
+
+  const fees = all<{ channel_id: number | null; room_type_id: number | null; room: number }>(
+    `SELECT s.channel_id AS channel_id,
+            rt.id AS room_type_id,
+            COALESCE(SUM(fi.amount), 0) AS room
+       FROM folio_items fi
+       JOIN folios f ON f.id = fi.folio_id AND f.hotel_id = fi.hotel_id
+       LEFT JOIN stays s ON s.id = f.stay_id AND s.hotel_id = fi.hotel_id
+       LEFT JOIN rooms r ON r.id = s.room_id AND r.hotel_id = fi.hotel_id
+       LEFT JOIN room_types rt ON rt.id = r.room_type_id AND rt.hotel_id = fi.hotel_id
+      WHERE fi.hotel_id = ? AND fi.item_type = 'ROOM'
+        AND ${feeDateExpr(feeDate)} BETWEEN ? AND ?
+      GROUP BY s.channel_id, rt.id`,
+    [hotelId, from, to]
+  );
+  for (const r of fees) {
+    const row = ensure(
+      r.channel_id == null ? null : Number(r.channel_id),
+      r.room_type_id == null ? null : Number(r.room_type_id)
+    );
+    row.room = round2(row.room + num(r.room));
+  }
+  for (const [key, nights] of nightsByKey) {
+    if (nights <= 0) continue;
+    const [cid, rtid] = key.split("|");
+    const row = ensure(
+      cid === "null" ? null : Number(cid),
+      rtid === "null" || rtid === undefined ? null : Number(rtid)
+    );
+    row.nights = nights;
+  }
+  return [...map.values()].sort(
+    (a, b) => b.room - a.room || b.nights - a.nights || a.channelName.localeCompare(b.channelName, "zh")
+  );
+}
+
+type ChannelDayStat = { channelId: number | null; channelName: string; day: string; nights: number; room: number };
+
+/** 渠道 × 日期（间夜同样按 channelId 展开到每一天，房费按归期日切片） */
+function channelDayRows(
+  hotelId: number,
+  from: string,
+  to: string,
+  feeDate: FeeDateCol,
+  names: Map<number, string>,
+  nightsByKey: Map<string, number>
+): ChannelDayStat[] {
+  const map = new Map<string, ChannelDayStat>();
+  const ensure = (cid: number | null, day: string): ChannelDayStat => {
+    const key = `${channelKey(cid)}|${day}`;
+    let row = map.get(key);
+    if (!row) {
+      row = { channelId: cid, channelName: channelLabel(cid, names), day, nights: 0, room: 0 };
+      map.set(key, row);
+    }
+    return row;
+  };
+
+  const fees = all<{ channel_id: number | null; day: string; room: number }>(
+    `SELECT s.channel_id AS channel_id,
+            ${feeDateExpr(feeDate)} AS day,
+            COALESCE(SUM(fi.amount), 0) AS room
+       FROM folio_items fi
+       JOIN folios f ON f.id = fi.folio_id AND f.hotel_id = fi.hotel_id
+       LEFT JOIN stays s ON s.id = f.stay_id AND s.hotel_id = fi.hotel_id
+      WHERE fi.hotel_id = ? AND fi.item_type = 'ROOM'
+        AND ${feeDateExpr(feeDate)} BETWEEN ? AND ?
+      GROUP BY s.channel_id, day`,
+    [hotelId, from, to]
+  );
+  for (const r of fees) {
+    const row = ensure(r.channel_id == null ? null : Number(r.channel_id), String(r.day ?? ""));
+    row.room = round2(row.room + num(r.room));
+  }
+  for (const [key, nights] of nightsByKey) {
+    if (nights <= 0) continue;
+    const [cid, day] = key.split("|");
+    ensure(cid === "null" ? null : Number(cid), day).nights = nights;
+  }
+  return [...map.values()].sort((a, b) => b.day.localeCompare(a.day) || a.channelName.localeCompare(b.channelName, "zh"));
+}
+
+/** 纯日期 +n 天（报表内已有 parseDay / addDays / todayStr，这里只做壳） */
+function dayShift(day: string, n: number): string {
+  const d = parseDay(day);
+  if (!d) return day;
+  return todayStr(addDays(d, n));
+}
+
+function ReportChannel({ ctx }: ReportProps) {
+  const { hotelId, from, to } = ctx;
+  const natural = ctx.cal === "natural";
+  const feeDate: FeeDateCol = natural ? "created_at" : "biz_date";
+  /* 一次取住宿占用明细：间夜全部由它聚合（与房态 / 工作台 / 夜审同口径） */
+  const slices = stayNightSlices(hotelId, from, to);
+  const names = channelNameMap(hotelId);
+
+  const stat = channelStatRows(
+    hotelId,
+    from,
+    to,
+    feeDate,
+    names,
+    nightsBy(slices, (s) => s.channelId)
+  );
+  const roomTypeRows = channelRoomTypeRows(
+    hotelId,
+    from,
+    to,
+    feeDate,
+    names,
+    nightsBy(slices, (s) => `${channelKey(s.channelId)}|${channelKey(s.roomTypeId)}`)
+  );
+  /* 渠道 × 日期：间夜按每晚展开，键 = `channelId|YYYY-MM-DD` */
+  const dayNights = new Map<string, number>();
+  for (const s of slices) {
+    for (let i = 0; i < s.nights; i += 1) {
+      const key = `${channelKey(s.channelId)}|${dayShift(s.firstNight, i)}`;
+      dayNights.set(key, (dayNights.get(key) ?? 0) + 1);
+    }
+  }
+  const dayRows = channelDayRows(hotelId, from, to, feeDate, names, dayNights);
+
+  const sumOrders = stat.rows.reduce((s, r) => s + r.orders, 0);
+  const sumCancelled = stat.rows.reduce((s, r) => s + r.cancelled, 0);
+  const sumNoshow = stat.rows.reduce((s, r) => s + r.noshow, 0);
+  const sumCheckins = stat.rows.reduce((s, r) => s + r.checkins, 0);
+  const sumCheckouts = stat.rows.reduce((s, r) => s + r.checkouts, 0);
+  const nightsTotal = stat.totalNights;
+  /* 校验：按渠道汇总的间夜必须等于 metrics 的区间出租间夜（同一批明细） */
+  const nightsMatch = nightsTotal === ctx.occupancy.roomNights;
+
+  const switchBase = ctx.href({ r: "channel-report" });
+  const calBtn = (active: boolean) =>
+    active
+      ? "inline-flex h-[24px] items-center rounded-[2px] bg-[#32c141] px-2.5 text-[11.5px] text-white"
+      : "inline-flex h-[24px] items-center rounded-[2px] border border-[#dcdcdc] bg-white px-2.5 text-[11.5px] text-[#5f6b76] hover:border-[#32c141] hover:text-[#32c141]";
+  const exportBtn =
+    "inline-flex h-[24px] items-center rounded-[2px] border border-[#dcdcdc] bg-white px-2.5 text-[11.5px] text-[#5f6b76] hover:border-[#32c141] hover:text-[#32c141]";
+
   return (
-    <div className="card overflow-hidden">
-      <div className="border-b border-[#f0f0f0] px-3 py-2 text-[13px] font-semibold text-[#222]">渠道统计报表</div>
-      <MiniTable head={["渠道", "订单数", "间夜", "营收", "占比"]} rows={[]} />
-    </div>
+    <>
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-4">
+        <StatCard label="渠道订单量" value={fmtInt(sumOrders)} hint="统计区间内入住日期落在区间的预订订单数（按渠道 id 分组）" />
+        <StatCard label="渠道间夜" value={fmtInt(nightsTotal)} hint="住宿占用口径（在住 + 已退房晚数，排除钟点房），与房态 / 工作台 / 夜审同口径" />
+        <StatCard label="渠道房费" value={fmtMoney(stat.totalRoom)} hint={natural ? "按明细创建的自然日归期" : "按夜审过账的营业日（biz_date）归期"} />
+        <StatCard
+          label="间夜对账"
+          value={nightsMatch ? "与指标一致" : `差 ${nightsTotal - ctx.occupancy.roomNights} 间夜`}
+          hint="按渠道汇总的间夜 = metrics.occupancyMetrics().roomNights"
+        />
+      </div>
+
+      <SectionCard
+        title="按渠道统计"
+        right={
+          <span className="flex flex-wrap items-center gap-2">
+            <span className="text-[11px] text-gray-400">房费归期：</span>
+            <Link href={switchBase} className={calBtn(!natural)}>
+              营业日
+            </Link>
+            <Link href={`${switchBase}&cal=natural`} className={calBtn(natural)}>
+              自然日
+            </Link>
+            <span className="mx-1 text-gray-300">|</span>
+            <a
+              className={exportBtn}
+              download={`渠道统计_${from}_${to}.csv`}
+              href={csvHref(
+                ["渠道ID", "渠道", "订单量", "取消量", "未到店量", "已入住量", "已退房量", "间夜", "房费", "收入占比"],
+                stat.rows.map((r) => [
+                  r.channelId == null ? "" : String(r.channelId),
+                  r.name,
+                  String(r.orders),
+                  String(r.cancelled),
+                  String(r.noshow),
+                  String(r.checkins),
+                  String(r.checkouts),
+                  String(r.nights),
+                  r.room.toFixed(2),
+                  stat.totalRoom > 0 ? `${((r.room / stat.totalRoom) * 100).toFixed(2)}%` : "-",
+                ])
+              )}
+            >
+              导出（按渠道）
+            </a>
+            <a
+              className={exportBtn}
+              download={`渠道房型_${from}_${to}.csv`}
+              href={csvHref(
+                ["渠道ID", "渠道", "房型", "间夜", "房费", "ADR"],
+                roomTypeRows.map((r) => [
+                  r.channelId == null ? "" : String(r.channelId),
+                  r.channelName,
+                  r.roomTypeName,
+                  String(r.nights),
+                  r.room.toFixed(2),
+                  r.nights > 0 ? (r.room / r.nights).toFixed(2) : "0.00",
+                ])
+              )}
+            >
+              导出（按房型）
+            </a>
+            <a
+              className={exportBtn}
+              download={`渠道日期_${from}_${to}.csv`}
+              href={csvHref(
+                ["渠道ID", "渠道", "日期", "间夜", "房费"],
+                dayRows.map((r) => [
+                  r.channelId == null ? "" : String(r.channelId),
+                  r.channelName,
+                  r.day,
+                  String(r.nights),
+                  r.room.toFixed(2),
+                ])
+              )}
+            >
+              导出（按日期）
+            </a>
+          </span>
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">渠道</th>
+                <th className="th text-right">渠道ID</th>
+                <th className="th text-right">订单量</th>
+                <th className="th text-right">取消量</th>
+                <th className="th text-right">未到店量</th>
+                <th className="th text-right">已入住量</th>
+                <th className="th text-right">已退房量</th>
+                <th className="th text-right">间夜</th>
+                <th className="th text-right">房费</th>
+                <th className="th w-44">收入占比</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stat.rows.length === 0 && <EmptyRow colSpan={10} />}
+              {stat.rows.map((r, i) => (
+                <tr key={`${channelKey(r.channelId)}-${i}`} className="hover:bg-gray-50">
+                  <td className="td text-gray-700">{r.name}</td>
+                  <td className="td text-right tabular-nums text-gray-400">{r.channelId == null ? "—" : r.channelId}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(r.orders)}</td>
+                  <td className="td text-right tabular-nums text-[#e2483a]">{fmtInt(r.cancelled)}</td>
+                  <td className="td text-right tabular-nums text-[#e2483a]">{fmtInt(r.noshow)}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(r.checkins)}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(r.checkouts)}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(r.nights)}</td>
+                  <td className="td text-right tabular-nums text-gray-800">{fmtMoney(r.room)}</td>
+                  <td className="td">
+                    <ShareBar value={r.room} total={stat.totalRoom} />
+                  </td>
+                </tr>
+              ))}
+              <TotalRow>
+                <td className="td font-medium text-gray-800">合计</td>
+                <td className="td" />
+                <td className={SUM_TD}>{fmtInt(sumOrders)}</td>
+                <td className={SUM_TD}>{fmtInt(sumCancelled)}</td>
+                <td className={SUM_TD}>{fmtInt(sumNoshow)}</td>
+                <td className={SUM_TD}>{fmtInt(sumCheckins)}</td>
+                <td className={SUM_TD}>{fmtInt(sumCheckouts)}</td>
+                <td className={SUM_TD}>{fmtInt(nightsTotal)}</td>
+                <td className={SUM_TD}>{fmtMoney(stat.totalRoom)}</td>
+                <td className="td" />
+              </TotalRow>
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <div className="grid grid-cols-1 gap-2.5 xl:grid-cols-2">
+        <SectionCard title="按渠道 × 房型" right={`${roomTypeRows.length} 行`}>
+          <div className="max-h-[420px] overflow-auto">
+            <table className="w-full">
+              <thead>
+                <tr>
+                  <th className="th">渠道</th>
+                  <th className="th">房型</th>
+                  <th className="th text-right">间夜</th>
+                  <th className="th text-right">房费</th>
+                  <th className="th text-right">ADR</th>
+                </tr>
+              </thead>
+              <tbody>
+                {roomTypeRows.length === 0 && <EmptyRow colSpan={5} />}
+                {roomTypeRows.map((r, i) => (
+                  <tr key={`rt-${i}`} className="hover:bg-gray-50">
+                    <td className="td text-gray-700">{r.channelName}</td>
+                    <td className="td text-gray-600">{r.roomTypeName}</td>
+                    <td className="td text-right tabular-nums">{fmtInt(r.nights)}</td>
+                    <td className="td text-right tabular-nums text-gray-800">{fmtMoney(r.room)}</td>
+                    <td className="td text-right tabular-nums text-gray-500">
+                      {fmtMoney(r.nights > 0 ? r.room / r.nights : 0)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </SectionCard>
+
+        <SectionCard
+          title="按渠道 × 日期"
+          right={natural ? "自然日归期" : "营业日归期"}
+        >
+          <div className="max-h-[420px] overflow-auto">
+            <table className="w-full">
+              <thead>
+                <tr>
+                  <th className="th">日期</th>
+                  <th className="th">渠道</th>
+                  <th className="th text-right">间夜</th>
+                  <th className="th text-right">房费</th>
+                </tr>
+              </thead>
+              <tbody>
+                {dayRows.length === 0 && <EmptyRow colSpan={4} />}
+                {dayRows.map((r, i) => (
+                  <tr key={`day-${i}`} className="hover:bg-gray-50">
+                    <td className="td tabular-nums text-gray-700">{r.day}</td>
+                    <td className="td text-gray-600">{r.channelName}</td>
+                    <td className="td text-right tabular-nums">{fmtInt(r.nights)}</td>
+                    <td className="td text-right tabular-nums text-gray-800">{fmtMoney(r.room)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </SectionCard>
+      </div>
+
+      <NoteCard>
+        口径说明：所有渠道指标一律按 <b>渠道 id</b> 聚合，不按渠道名称 —— channels 表里真有一条
+        id=6 名字叫「散客」的渠道，而「没匹配到渠道」的入住单也显示「散客」，按名称分组会把两组并成
+        一行、间夜重复计算。「渠道ID」列里「—」表示未匹配渠道，它与 id=6 的「散客」是两条不同渠道。
+        间夜取住宿占用口径（在住 + 已退房晚数，排除钟点房），与房态 / 工作台 / 夜审一致；
+        房费归期可切营业日（folio_items.biz_date，夜审口径）或自然日（明细创建日）——
+        间夜两种口径相同，因为一个住宿晚本身就是某个自然日的那一晚，营业日切换点只影响凌晨过账的房费归期。
+        导出为 CSV（UTF-8 BOM，Excel / WPS 直接打开），按渠道 / 房型 / 日期三张表分别导出。
+      </NoteCard>
+    </>
   );
 }
 
@@ -8089,28 +8671,375 @@ function ReportRechargeSalesman({ ctx }: ReportProps) {
   );
 }
 
-function ReportRoomBizDaily({ ctx }: ReportProps) {
-  const rows = all<{ room_no: string; day: string; amount: number | null }>(
-    `SELECT r.room_no, fi.biz_date AS day, COALESCE(SUM(fi.amount), 0) AS amount
-     FROM folio_items fi
-     JOIN folios f ON f.id = fi.folio_id
-     JOIN stays s ON s.id = f.stay_id
-     JOIN rooms r ON r.id = s.room_id
-     WHERE fi.hotel_id = ? AND fi.item_type = 'ROOM' AND fi.biz_date BETWEEN ? AND ?
-     GROUP BY r.room_no, fi.biz_date
-     ORDER BY r.room_no, fi.biz_date`,
-    [ctx.hotelId, ctx.from, ctx.to]
+/* ================================================================== *
+ * 八点五、综合营业日报-房间（第九轮清单 二.6）
+ *
+ * ── 这张报表原来错在哪 ──
+ * 它只有「房间号 / 营业日 / 房费」三列，间夜干脆没有；而族里其它报表
+ * （biz-daily / room-fee-daily）早就改用 metrics.ts 的住宿占用口径了。
+ * 于是同一个「间夜」出现第四套算法：谁看这张表都只能看到房费，
+ * 想知道「今天卖了几间夜」得自己心算 —— 一旦有人拿 folio_items.qty 去数，
+ * 又会得到「房费还没过账时分钟夜恒为 0」的老问题。
+ *
+ * ── 现在的口径（全部复用 metrics.ts，不再数 qty）──
+ *   · 售出间夜 —— stayNightSlices() 的住宿占用明细按「房间 × 营业日」展开
+ *                 （在住算到今天、已退房用 actual_check_out、排除钟点房）
+ *   · 房费 / 餐饮 / 其他 —— folio_items 按 (房间, biz_date) 归集，沿用 dailyAgg 的科目口径
+ *   · 退款 —— payments 负数流水绝对值（与夜审 refund_total 同一条判定）
+ *   · 净收入 = 房费 + 餐饮 + 其他 − 退款
+ *   · 可售房量 —— rooms 当前状态排除 OOO / LOCK（逐日为「当日可售间数」，
+ *                 逐日合计行是「可售房晚」= 可售间数 × 天数，与出租率列分母一致）
+ *   · 出租率 = 间夜 ÷ 可售房量；ADR = 房费 ÷ 间夜
+ *
+ * 恒等式（对账用）：
+ *   明细表间夜求和 = 逐日表间夜求和 = metrics.occupancyMetrics().roomNights
+ *   = 房态间夜 = 工作台间夜 = 夜审 rooms_sold
+ * ================================================================== */
+
+/**
+ * 房间 × 营业日的退款（负数收款绝对值，与夜审 SQL_REFUND_TOTAL 同一判定）
+ *
+ * 退款通过 payments.stay_id 归到房间；没有关联入住单的退款归「未关联房」，
+ * 与间夜明细 / 房费明细的归组方式一致，三张表能对上。
+ */
+function refundRoomDayRows(hotelId: number, from: string, to: string): { roomNo: string; day: string; refund: number }[] {
+  return all<{ room_no: string | null; day: string; refund: number }>(
+    `SELECT r.room_no AS room_no,
+            p.biz_date AS day,
+            COALESCE(SUM(ABS(p.amount)), 0) AS refund
+       FROM payments p
+       LEFT JOIN stays s ON s.id = p.stay_id AND s.hotel_id = p.hotel_id
+       LEFT JOIN rooms r ON r.id = s.room_id AND r.hotel_id = p.hotel_id
+      WHERE p.hotel_id = ? AND p.biz_date BETWEEN ? AND ?
+        AND (p.amount < 0 OR p.refund_of IS NOT NULL)
+      GROUP BY r.room_no, p.biz_date`,
+    [hotelId, from, to]
+  ).map((r) => ({
+    roomNo: r.room_no == null || r.room_no === "" ? "未关联房" : String(r.room_no),
+    day: String(r.day ?? ""),
+    refund: round2(num(r.refund)),
+  }));
+}
+
+type RoomDayFinanceRow = {
+  roomNo: string;
+  day: string;
+  room: number;
+  food: number;
+  other: number;
+};
+
+/**
+ * 房间 × 营业日的收入三分类（房费 / 餐饮 / 其他）
+ *
+ * 房间号取 stays → rooms；账单没挂入住单（补录消费 / 房间已删）时归「未关联房」，
+ * 与间夜明细里 roomNo 为 null 的归组方式一致，两张表能对上。
+ */
+function roomDayFinanceRows(hotelId: number, from: string, to: string): RoomDayFinanceRow[] {
+  const map = new Map<string, RoomDayFinanceRow>();
+  const ensure = (roomNo: string, day: string): RoomDayFinanceRow => {
+    const key = `${roomNo}|${day}`;
+    let row = map.get(key);
+    if (!row) {
+      row = { roomNo, day, room: 0, food: 0, other: 0 };
+      map.set(key, row);
+    }
+    return row;
+  };
+
+  const fees = all<{ room_no: string | null; day: string; room: number; food: number; other: number }>(
+    `SELECT r.room_no AS room_no,
+            fi.biz_date AS day,
+            COALESCE(SUM(CASE WHEN fi.item_type = 'ROOM' THEN fi.amount ELSE 0 END), 0) AS room,
+            COALESCE(SUM(CASE WHEN fi.item_type = 'FOOD' THEN fi.amount ELSE 0 END), 0) AS food,
+            COALESCE(SUM(CASE WHEN fi.item_type = 'OTHER' THEN fi.amount ELSE 0 END), 0) AS other
+       FROM folio_items fi
+       LEFT JOIN folios f ON f.id = fi.folio_id AND f.hotel_id = fi.hotel_id
+       LEFT JOIN stays s ON s.id = f.stay_id AND s.hotel_id = fi.hotel_id
+       LEFT JOIN rooms r ON r.id = s.room_id AND r.hotel_id = fi.hotel_id
+      WHERE fi.hotel_id = ? AND fi.biz_date BETWEEN ? AND ?
+        AND fi.item_type IN ('ROOM', 'FOOD', 'OTHER')
+      GROUP BY r.room_no, fi.biz_date`,
+    [hotelId, from, to]
   );
+  for (const r of fees) {
+    const row = ensure(r.room_no == null || r.room_no === "" ? "未关联房" : String(r.room_no), String(r.day ?? ""));
+    row.room = round2(row.room + num(r.room));
+    row.food = round2(row.food + num(r.food));
+    row.other = round2(row.other + num(r.other));
+  }
+  return [...map.values()];
+}
+
+/** 房间 → 当前是否可售（0 = OOO 维修 / LOCK 锁房） */
+function sellableRoomMap(hotelId: number): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const r of all<{ room_no: string; sellable: number }>(
+    `SELECT room_no, CASE WHEN status IN ('OOO','LOCK') THEN 0 ELSE 1 END AS sellable
+       FROM rooms WHERE hotel_id = ?`,
+    [hotelId]
+  )) {
+    out.set(String(r.room_no), num(r.sellable));
+  }
+  return out;
+}
+
+type RoomBizRow = {
+  roomNo: string;
+  day: string;
+  nights: number;
+  room: number;
+  food: number;
+  other: number;
+  refund: number;
+  sellable: number;
+};
+
+function ReportRoomBizDaily({ ctx }: ReportProps) {
+  const { hotelId, from, to, days, sellableRooms } = ctx;
+  const cur = categoryAgg(hotelId, from, to, ctx.occupancy.roomNights);
+  /* 间夜：住宿占用明细按「房间 × 营业日」展开（不是数房费明细行） */
+  const slices = stayNightSlices(hotelId, from, to);
+  const nightByRoomDay = new Map<string, number>();
+  for (const s of slices) {
+    for (let i = 0; i < s.nights; i += 1) {
+      const day = dayShift(s.firstNight, i);
+      const roomNo = s.roomNo && s.roomNo.length > 0 ? s.roomNo : "未关联房";
+      const key = `${roomNo}|${day}`;
+      nightByRoomDay.set(key, (nightByRoomDay.get(key) ?? 0) + 1);
+    }
+  }
+
+  const finance = roomDayFinanceRows(hotelId, from, to);
+  /* 退款一次查出来，既按「房间 × 日」入明细，也按日汇总到逐日表（含未关联房的退款） */
+  const refundRows = refundRoomDayRows(hotelId, from, to);
+  const refundByRoomDay = new Map<string, number>();
+  const refundByDay = new Map<string, number>();
+  for (const r of refundRows) {
+    refundByRoomDay.set(`${r.roomNo}|${r.day}`, r.refund);
+    refundByDay.set(r.day, round2((refundByDay.get(r.day) ?? 0) + r.refund));
+  }
+
+  const sellableMap = sellableRoomMap(hotelId);
+
+  /* 明细行集合 = 有间夜 或 有金额 的「房间 × 日」；全 0 的组合不铺满表格 */
+  const keys = new Set<string>(nightByRoomDay.keys());
+  for (const r of finance) keys.add(`${r.roomNo}|${r.day}`);
+  const financeMap = new Map<string, RoomDayFinanceRow>();
+  for (const r of finance) financeMap.set(`${r.roomNo}|${r.day}`, r);
+
+  const rows: RoomBizRow[] = [];
+  for (const key of keys) {
+    const [roomNo, day] = key.split("|");
+    if (!day) continue;
+    const fin = financeMap.get(key);
+    const nights = nightByRoomDay.get(key) ?? 0;
+    const room = num(fin?.room);
+    const food = num(fin?.food);
+    const other = num(fin?.other);
+    const refund = refundByRoomDay.get(key) ?? 0;
+    if (nights === 0 && Math.abs(room) + Math.abs(food) + Math.abs(other) + Math.abs(refund) < 0.005) continue;
+    rows.push({
+      roomNo,
+      day,
+      nights,
+      room,
+      food,
+      other,
+      refund,
+      /* 可售房量：该房当天是否可售（rooms 当前状态；没有历史房态表，这点如实标注） */
+      sellable: roomNo === "未关联房" ? 0 : sellableMap.get(roomNo) ?? 1,
+    });
+  }
+  rows.sort((a, b) => a.roomNo.localeCompare(b.roomNo, "zh") || a.day.localeCompare(b.day));
+
+  /* 逐日合计：间夜取 metrics 的 nightSeries（与上面明细同源），金额取 dailyAgg 的四项 */
+  const nightMap = nightSeries(hotelId, from, to);
+  const daily = dailyAgg(hotelId, from, to, nightMap);
+  const dailyMap = new Map<string, DailyRow>();
+  for (const r of daily) dailyMap.set(r.biz_date, r);
+  const dates = dayList(from, to);
+  const refundTotal = round2(
+    [...refundByDay.values()].reduce((s, v) => s + v, 0)
+  );
+  /* 明细求和必须等于区间指标：不等就是口径又分叉了，页面上直接标红 */
+  const detailNights = rows.reduce((s, r) => s + r.nights, 0);
+  const nightsMatch = detailNights === ctx.occupancy.roomNights;
+  const detailRoom = round2(rows.reduce((s, r) => s + r.room, 0));
+  const roomMatch = Math.abs(detailRoom - cur.room) < 0.02;
+  const netIncome = round2(cur.room + cur.food + cur.otherTotal - refundTotal);
+  const hasNights = [...nightMap.values()].some((v) => v > 0);
+  const hasData = rows.length > 0 || hasNights;
+  const sellableNights = sellableRooms * days;
+
   return (
-    <div className="card overflow-hidden">
-      <div className="border-b border-[#f0f0f0] px-3 py-2 text-[13px] font-semibold text-[#222]">
-        综合营业日报-房间 · {ctx.from} ~ {ctx.to}
+    <>
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-4">
+        <StatCard
+          label="售出间夜"
+          value={fmtInt(ctx.occupancy.roomNights)}
+          hint="住宿占用口径（在住 + 已退房晚数，排除钟点房）；= 房态间夜 = 工作台 = 夜审 rooms_sold"
+        />
+        <StatCard label="房费" value={fmtMoney(cur.room)} hint="ROOM 明细按营业日归集" />
+        <StatCard label="净收入" value={fmtMoney(netIncome)} hint={`房费 ${fmtMoney(cur.room)} + 餐饮 ${fmtMoney(cur.food)} + 其他 ${fmtMoney(cur.otherTotal)} − 退款 ${fmtMoney(refundTotal)}`} />
+        <StatCard
+          label="出租率"
+          value={fmtPct(ctx.occupancy.occupancy)}
+          hint={`${fmtInt(ctx.occupancy.roomNights)} 间夜 ÷ 可售房晚 ${fmtInt(sellableNights)}（可售 ${sellableRooms} 间 × ${days} 天）`}
+        />
       </div>
-      <MiniTable
-        head={["房间号", "营业日", "房费"]}
-        rows={rows.map((r) => [r.room_no, r.day, fmtMoney(r.amount)])}
-      />
-    </div>
+
+      <SectionCard
+        title="逐日合计"
+        right={
+          <span className={nightsMatch && roomMatch ? "text-[#2a9d3a]" : "text-[#e2483a]"}>
+            {nightsMatch && roomMatch
+              ? `间夜 / 房费与区间指标一致（${fmtInt(ctx.occupancy.roomNights)} 间夜）`
+              : `对账不平：间夜 ${detailNights} vs ${ctx.occupancy.roomNights}，房费 ${detailRoom} vs ${cur.room}`}
+          </span>
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">营业日</th>
+                <th className="th text-right">售出间夜</th>
+                <th className="th text-right">房费</th>
+                <th className="th text-right">餐饮</th>
+                <th className="th text-right">其他</th>
+                <th className="th text-right">退款</th>
+                <th className="th text-right">净收入</th>
+                <th className="th text-right">可售房量</th>
+                <th className="th text-right">出租率</th>
+                <th className="th text-right">ADR</th>
+              </tr>
+            </thead>
+            <tbody>
+              {!hasData && <EmptyRow colSpan={10} />}
+              {hasData &&
+                dates.map((d) => {
+                  const r = dailyMap.get(d);
+                  const room = num(r?.room);
+                  const food = num(r?.food);
+                  const other = num(r?.other);
+                  const nights = num(nightMap.get(d));
+                  const refund = refundByDay.get(d) ?? 0;
+                  return (
+                    <tr key={d} className="hover:bg-gray-50">
+                      <td className="td tabular-nums text-gray-700">
+                        {d}
+                        {d === ctx.todayDate && (
+                          <span className="ml-1.5 rounded bg-brand-100 px-1 text-[10px] leading-[15px] text-brand-700">
+                            今日
+                          </span>
+                        )}
+                      </td>
+                      <td className="td text-right tabular-nums">{fmtInt(nights)}</td>
+                      <td className="td text-right tabular-nums text-gray-800">{fmtMoney(room)}</td>
+                      <td className="td text-right tabular-nums">{fmtMoney(food)}</td>
+                      <td className="td text-right tabular-nums">{fmtMoney(other)}</td>
+                      <td className="td text-right tabular-nums text-[#e2483a]">{fmtMoney(refund)}</td>
+                      <td className="td text-right font-medium tabular-nums text-gray-900">
+                        {fmtMoney(round2(room + food + other - refund))}
+                      </td>
+                      <td className="td text-right tabular-nums text-gray-500">{fmtInt(sellableRooms)}</td>
+                      <td className="td text-right tabular-nums">
+                        {fmtPct(sellableRooms > 0 ? nights / sellableRooms : 0)}
+                      </td>
+                      <td className="td text-right tabular-nums text-gray-500">
+                        {fmtMoney(nights > 0 ? room / nights : 0)}
+                      </td>
+                    </tr>
+                  );
+                })}
+              <TotalRow>
+                <td className="td font-medium text-gray-800">合计</td>
+                <td className={SUM_TD}>{fmtInt(ctx.occupancy.roomNights)}</td>
+                <td className={SUM_TD}>{fmtMoney(cur.room)}</td>
+                <td className={SUM_TD}>{fmtMoney(cur.food)}</td>
+                <td className={SUM_TD}>{fmtMoney(cur.otherTotal)}</td>
+                <td className={SUM_TD}>{fmtMoney(refundTotal)}</td>
+                <td className={SUM_TD}>{fmtMoney(netIncome)}</td>
+                <td className={SUM_TD}>{fmtInt(sellableNights)}</td>
+                <td className={SUM_TD}>{fmtPct(ctx.occupancy.occupancy)}</td>
+                <td className={SUM_TD}>{fmtMoney(ctx.occupancy.adr)}</td>
+              </TotalRow>
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <SectionCard title="房间 × 营业日明细" right={`${rows.length} 行 · 只列有间夜或有金额的组合`}>
+        <div className="max-h-[460px] overflow-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">房间号</th>
+                <th className="th">营业日</th>
+                <th className="th text-right">售出间夜</th>
+                <th className="th text-right">房费</th>
+                <th className="th text-right">餐饮</th>
+                <th className="th text-right">其他</th>
+                <th className="th text-right">退款</th>
+                <th className="th text-right">净收入</th>
+                <th className="th text-right">可售房量</th>
+                <th className="th text-right">出租率</th>
+                <th className="th text-right">ADR</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 && <EmptyRow colSpan={11} />}
+              {rows.map((r, i) => (
+                <tr key={`${r.roomNo}-${r.day}-${i}`} className="hover:bg-gray-50">
+                  <td className="td text-gray-700">{r.roomNo}</td>
+                  <td className="td tabular-nums text-gray-600">{r.day}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(r.nights)}</td>
+                  <td className="td text-right tabular-nums text-gray-800">{fmtMoney(r.room)}</td>
+                  <td className="td text-right tabular-nums">{fmtMoney(r.food)}</td>
+                  <td className="td text-right tabular-nums">{fmtMoney(r.other)}</td>
+                  <td className="td text-right tabular-nums text-[#e2483a]">{fmtMoney(r.refund)}</td>
+                  <td className="td text-right tabular-nums text-gray-900">
+                    {fmtMoney(round2(r.room + r.food + r.other - r.refund))}
+                  </td>
+                  <td className="td text-right tabular-nums text-gray-500">{r.sellable}</td>
+                  <td className="td text-right tabular-nums">
+                    {fmtPct(r.sellable > 0 ? r.nights / r.sellable : 0)}
+                  </td>
+                  <td className="td text-right tabular-nums text-gray-500">
+                    {fmtMoney(r.nights > 0 ? r.room / r.nights : 0)}
+                  </td>
+                </tr>
+              ))}
+              <TotalRow>
+                <td className="td font-medium text-gray-800">合计</td>
+                <td className="td text-gray-500">{rangeText(ctx)}</td>
+                <td className={SUM_TD}>{fmtInt(ctx.occupancy.roomNights)}</td>
+                <td className={SUM_TD}>{fmtMoney(cur.room)}</td>
+                <td className={SUM_TD}>{fmtMoney(cur.food)}</td>
+                <td className={SUM_TD}>{fmtMoney(cur.otherTotal)}</td>
+                <td className={SUM_TD}>{fmtMoney(refundTotal)}</td>
+                <td className={SUM_TD}>{fmtMoney(netIncome)}</td>
+                <td className="td" />
+                <td className={SUM_TD}>{fmtPct(ctx.occupancy.occupancy)}</td>
+                <td className={SUM_TD}>{fmtMoney(ctx.occupancy.adr)}</td>
+              </TotalRow>
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <NoteCard>
+        口径说明：售出间夜全部来自 metrics.ts 的住宿占用明细（stays 在住 / 已退房的占用晚数，
+        在住算到今天、已退房用实际离店日、排除钟点房），<b>不再用房费明细的行数当间夜</b>
+        —— 明细行数不是住宿晚数，且房费要等夜审补记，没过账时分钟夜会恒为 0。
+        房费 / 餐饮 / 其他按 folio_items 的营业日归集；退款取负数收款（含 refund_of 关联）的绝对值，
+        与夜审的 refund_total 同一判定；净收入 = 房费 + 餐饮 + 其他 − 退款。
+        可售房量取 rooms 当前状态（OOO 维修 / LOCK 锁房不计），逐日行是「当日可售间数」，
+        逐日合计行是「可售房晚 = 可售间数 × 天数」，与出租率列的分母一致。
+        本表合计间夜与房态、工作台、夜审三个页面的间夜是同一口径（四者相等）。
+      </NoteCard>
+    </>
   );
 }
 
@@ -8260,10 +9189,12 @@ const REPORT_VIEWS: Record<string, ReportComponent> = {
   "members-upgrade": (props: ReportProps) => <ReportNotReady {...props} title="会员升级报表" why="SQL 引用了不存在的 total_spend 列" />,
   "goods-stock": ReportGoodsStock,
   /*
-   * "channel-report"（渠道统计报表）尚未实现：SQL 引用了 bookings.total_amount（实际字段是 total_price）
-   * 原来映射到真组件会 500，改指向占位说明。
+   * "channel-report"（渠道统计报表）第九轮已实现（清单 二.5）：
+   * 原来占位的原因是 SQL 引用了不存在的 bookings.total_amount（实际列是 total_price），
+   * 现在按 channel_id 聚合订单 / 取消 / 未到店 / 已入住 / 已退房 / 间夜 / 房费 / 收入占比，
+   * 并支持营业日·自然日筛选与按渠道·房型·日期导出。
    */
-  "channel-report": (props: ReportProps) => <ReportNotReady {...props} title="渠道统计报表" why="SQL 引用了 bookings.total_amount（实际字段是 total_price）" />,
+  "channel-report": ReportChannel,
   /*
    * "channel-report-detail"（渠道统计明细）尚未实现：SQL 引用了 bookings.order_no（实际字段是 booking_no）
    * 原来映射到真组件会 500，改指向占位说明。
@@ -8416,6 +9347,7 @@ export default async function ReportsPage({
     cmp,
     cmpFrom: cmpRange.from,
     cmpTo: cmpRange.to,
+    cal: sp.cal === "natural" ? "natural" : "biz",
     days,
     todayDate,
     sellableRooms,

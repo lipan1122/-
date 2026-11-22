@@ -43,6 +43,8 @@ Page({
     totalText: '0.00',
     submitting: false,
     error: '',
+    /** 隐私说明 + 用户协议是否已勾选（未勾选不允许提交） */
+    agreed: false,
   },
 
   onLoad(options) {
@@ -100,9 +102,54 @@ Page({
     });
   },
 
+  /* ------------------------- 隐私说明 / 用户协议 ------------------------- */
+
+  onToggleAgree() {
+    this.setData({ agreed: !this.data.agreed, error: '' });
+  },
+
+  /** 隐私说明：只写本小程序真实做的事，不抄模板条款 */
+  onShowPrivacy() {
+    wx.showModal({
+      title: '隐私说明',
+      content:
+        '本小程序仅用于查房、预订、在住服务与会员查询。\n' +
+        '· 手机号、姓名在服务端脱敏存储与展示\n' +
+        '· 身份证信息仅做入住前预录入，到店仍需人证核验\n' +
+        '· 订单只对下单本人或已绑定身份的会员可见\n' +
+        '· 不采集通讯录、位置等与住宿无关的信息\n' +
+        '· 同一微信只能绑定一个手机号，可在会员中心解绑',
+      showCancel: false,
+      confirmText: '我知道了',
+    });
+  },
+
+  /** 用户协议：把「到店付款 / 申请类操作需前台确认」讲清楚，避免纠纷 */
+  onShowTerms() {
+    wx.showModal({
+      title: '用户协议',
+      content:
+        '1. 房价与房量由酒店系统实时计算，以提交时服务端结果为准。\n' +
+        '2. 本小程序默认到店付款，不发起在线支付；押金到店按酒店规定收取。\n' +
+        '3. 取消、修改需符合订单的取消政策，是否收费以政策与前台确认为准。\n' +
+        '4. 续住、换房、延迟退房均为申请，需前台审核后生效。\n' +
+        '5. 入住需按公安要求实名登记并人证核验，小程序不能代替现场核验。',
+      showCancel: false,
+      confirmText: '我知道了',
+    });
+  },
+
   /** 提交订单 */
   onSubmit() {
     if (this.data.submitting) return;
+
+    // 协议必须先勾选：下单前用户要看见「到店付款 / 取消政策 / 实名登记」这三件事
+    if (!this.data.agreed) {
+      var tip = '请先阅读并同意《隐私说明》和《用户协议》';
+      this.setData({ error: tip });
+      wx.showToast({ title: tip, icon: 'none' });
+      return;
+    }
 
     var guestName = (this.data.guestName || '').trim();
     var mobile = (this.data.mobile || '').trim();

@@ -60,6 +60,10 @@ CREATE TABLE IF NOT EXISTS users (
   last_login_at TEXT,
   UNIQUE(hotel_id, username)
 );
+-- 第九轮《微信小程序专项》：房型详情展示字段（images / facilities / breakfast_note /
+-- cancellation_policy / check_in_time / check_out_time / deposit_note）。
+-- 全新库在这里就把列建全；老库由 scripts/migrate-all.mjs 第 12.3 段的 addColumn 补齐，
+-- 两处列名/顺序必须一致（scripts/schema-fingerprint.json 里是同一份结构）。
 CREATE TABLE IF NOT EXISTS room_types (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   hotel_id INTEGER NOT NULL,
@@ -68,7 +72,9 @@ CREATE TABLE IF NOT EXISTS room_types (
   bed_type TEXT, area REAL,
   max_occupancy INTEGER DEFAULT 2,
   base_price REAL DEFAULT 0,
-  sort INTEGER DEFAULT 0
+  sort INTEGER DEFAULT 0,
+  images TEXT, facilities TEXT, breakfast_note TEXT, cancellation_policy TEXT,
+  check_in_time TEXT, check_out_time TEXT, deposit_note TEXT
 );
 CREATE TABLE IF NOT EXISTS rooms (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -256,6 +262,89 @@ CREATE TABLE IF NOT EXISTS login_attempts (
   locked_until TEXT,
   updated_at   TEXT
 );
+
+-- 商超库存流水（第九轮清单 二.7「shop_stock_flows 纳入正式 schema」）
+-- 以前这张表只在 src/app/(main)/shop/actions.ts 的 ensureShopStockFlowTable 里懒建：
+-- 老库点过一次商超页面就有了，但全新部署跑完 init-db + migrate-all 仍然缺表，
+-- 依赖「先访问一次页面」才可用，交付部署不可接受。
+-- 列定义与 ensureShopStockFlowTable 的 CREATE TABLE 逐列一致
+-- （scripts/test-shop-schema-fresh-install.mjs 会解析源码逐列比对，漂移即红）。
+CREATE TABLE IF NOT EXISTS shop_stock_flows (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  hotel_id INTEGER NOT NULL,
+  item_id INTEGER NOT NULL,
+  type TEXT NOT NULL,
+  qty INTEGER NOT NULL,
+  stock_after INTEGER NOT NULL,
+  unit_price REAL NOT NULL DEFAULT 0,
+  amount REAL NOT NULL DEFAULT 0,
+  sale_id INTEGER,
+  request_id TEXT,
+  note TEXT,
+  operator TEXT,
+  created_at TEXT NOT NULL
+);
+-- 查询索引：按「酒店 + 商品 + 类型」查某件商品的出入库流水（与运行时同名同列）
+CREATE INDEX IF NOT EXISTS idx_shop_stock_flows_item ON shop_stock_flows (hotel_id, item_id, type);
+-- 唯一索引：同一 request_id 下同一个商品只允许一条同类流水 —— 双击 / 重试不会重复扣库存
+CREATE UNIQUE INDEX IF NOT EXISTS idx_shop_stock_flows_request
+  ON shop_stock_flows(hotel_id, request_id, item_id, type) WHERE request_id IS NOT NULL;
+
+-- 小程序服务请求（第九轮清单第六节 / 微信小程序专项第三节「订单与在住」）
+-- 与 scripts/schema-full.sql、scripts/migrate-all.mjs（第 12.3 段）、
+-- 运行时 src/app/api/mini/_shared.ts 的 ensureMiniServiceSchema() 四处逐列一致。
+-- mini_program_config / mini_program_users / mini_program_bookings 三张表沿用既有约定，
+-- 只由 migrate-all 建（收尾的 runMigrations 会把它们补齐）；本表被显式写进来是因为
+-- 「在住服务」是全新库一装好就要用的主流程，不能等迁移段兜底才有。
+CREATE TABLE IF NOT EXISTS mini_service_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  hotel_id INTEGER NOT NULL,
+  mini_user_id INTEGER NOT NULL,
+  guest_id INTEGER,
+  stay_id INTEGER,
+  booking_id INTEGER,
+  service_type TEXT NOT NULL,
+  status TEXT DEFAULT 'PENDING',
+  request_id TEXT,
+  note TEXT,
+  operator TEXT,
+  created_at TEXT,
+  updated_at TEXT,
+  completed_at TEXT
+);
+-- request_id 幂等：同一家店同一 request_id 只能落一行（部分唯一，NULL 不进索引）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mini_service_requests_req
+  ON mini_service_requests(hotel_id, request_id) WHERE request_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_mini_service_requests_user
+  ON mini_service_requests(hotel_id, mini_user_id, id);
+CREATE INDEX IF NOT EXISTS idx_mini_service_requests_stay
+  ON mini_service_requests(hotel_id, stay_id);
+CREATE INDEX IF NOT EXISTS idx_mini_service_requests_status
+  ON mini_service_requests(hotel_id, status, id);
+
+-- 小程序站内通知（第九轮 第三节 / 第 302 行「通知必须只发给对应 mini_user_id」）
+-- 与 scripts/schema-full.sql、scripts/migrate-all.mjs（第 12.4 段）、
+-- 运行时 src/app/api/mini/notifications/_notify.ts 的 ensureMiniNotificationsSchema() 四处逐列一致。
+-- 收件人唯一键 mini_user_id；刻意不存 mobile / guest_id —— 有手机号列就一定有人写出
+-- 「按手机号群发」的 SQL（清单明文禁止），这里连列都不给。
+-- mini_program_config / mini_program_users / mini_program_bookings 三张表沿用既有约定，
+-- 只由 migrate-all 建（收尾的 runMigrations 会补齐）；通知被显式写进来是因为
+-- 「订单/服务/发票」三条业务链路都要在动作成功后落通知，全新库装好就该有表。
+CREATE TABLE IF NOT EXISTS mini_notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  hotel_id INTEGER NOT NULL,
+  mini_user_id INTEGER NOT NULL,
+  type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT,
+  read_at TEXT,
+  created_at TEXT,
+  ref_type TEXT,
+  ref_id INTEGER
+);
+-- 消息列表 / 未读角标固定按 (hotel_id, mini_user_id, read_at) 过滤
+CREATE INDEX IF NOT EXISTS idx_mini_notifications_user
+  ON mini_notifications(hotel_id, mini_user_id, read_at);
 `;
 
 db.exec(schema);

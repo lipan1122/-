@@ -47,9 +47,9 @@ export async function settleArAction(formData: FormData) {
 
   const after = tx(() => {
     run(
-      `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?)`,
-      [user.hotelId, id, folio.stay_id, nextPayNo(), method, amount, todayStr(), "AR 应收结清", nowIso()]
+      `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, kind)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      [user.hotelId, id, folio.stay_id, nextPayNo(), method, amount, todayStr(), "AR 应收结清", nowIso(), "ROOM_PAYMENT"]
     );
 
     const paid = round2(Number(folio.paid_amount ?? 0) + amount);
