@@ -267,13 +267,45 @@ export function todayRoomTypeStock(hotelId: number, day: string = todayStr()): R
     const agg = aggs.get(typeId) ?? emptyAgg();
     const allotment = allotments.has(typeId) ? (allotments.get(typeId) as number) : null;
 
-    /* 物理可卖上限：物理房量扣掉维修 / 锁房 */
+    /*
+     * 物理可售 = 总房量 − 维修 − 锁房 − 在住 − 预订占用
+     *
+     * 这一步**必须**做：它反映的是「物理上真的还能卖几间」。
+     * 客人占着房间、房间在维修、房间被锁，都不能卖。
+     */
     const physicalCap = Math.max(0, agg.physical - agg.ooo - agg.lock);
-    /* 手工房量只收紧不放量：配得比物理上限大时按物理上限（放量属于渠道超售策略） */
-    const cap = allotment === null ? physicalCap : Math.min(physicalCap, Math.max(0, allotment));
-    const allotmentHold = physicalCap - cap;
+    const physicalSellable = Math.max(0, physicalCap - agg.inhouse - agg.booked);
 
-    const raw = cap - agg.inhouse - agg.booked;
+    /*
+     * rate_calendar.allotment 的语义（2026-11-22 经酒店确认）：
+     *
+     *   **当天剩余可卖数量**
+     *
+     * 不是「渠道总放量上限」，也不是「总房量」。它表达的是「今天这个房型
+     * 还剩几间能卖」—— 已经是在住/维修/锁房/预订之后的结果。
+     *
+     * 所以：
+     *   · 配了 allotment → 可售 = min(物理可售, allotment)
+     *     （取小的原因：运营设的剩余量不可能突破物理事实，防止手工把
+     *       已经住满的房型设成还能卖 5 间）
+     *   · 没配 → 可售 = 物理可售
+     *
+     * ⚠️ 旧实现错在这里（第八~九轮）：
+     *     可售 = min(物理上限, allotment) − 在住 − 预订
+     *   把 allotment 当「总上限」用了，于是「在住 + 预订」被扣了两次：
+     *     总房 10 / 在住 3 / 预订 2 / allotment 5
+     *       旧：min(10,5) − 3 − 2 = 0   ← 明明还能卖 5 间却显示 0
+     *       新：min(10−3−2, 5) = 5      ← 正确
+     */
+    const sellable = allotment === null ? physicalSellable : Math.min(physicalSellable, Math.max(0, allotment));
+
+    /*
+     * allotmentHold = allotment 把可售**压低**了多少（只用于页面解释，
+     * 不参与任何扣减）。它不是「超售」——超售看的是物理可售是否 < 0。
+     */
+    const allotmentHold = physicalSellable - sellable;
+
+    const raw = sellable;
     return {
       roomTypeId: typeId,
       name: t.name,
@@ -286,7 +318,11 @@ export function todayRoomTypeStock(hotelId: number, day: string = todayStr()): R
       allotment,
       allotmentHold,
       sellable: Math.max(0, raw),
-      oversold: raw < 0 ? -raw : 0,
+      /*
+       * 超售：物理可售 < 0（卖超了）。
+       * 注意不能用 raw（它被 allotment 夹过，allotment=0 时会误报超售）。
+       */
+      oversold: physicalCap - agg.inhouse - agg.booked < 0 ? -(physicalCap - agg.inhouse - agg.booked) : 0,
     };
   });
 }
