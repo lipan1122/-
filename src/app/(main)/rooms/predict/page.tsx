@@ -134,8 +134,21 @@ export default async function PredictPage({ searchParams }: { searchParams: Prom
   );
   const allotMap = new Map<string, number>();
   for (const a of allotRows) allotMap.set(`${a.room_type_id}|${a.date}`, Number(a.allotment ?? 0));
-  /** 某房型某天的总房量：有手工房量就用它，否则用物理房间数 */
-  const capacityOf = (typeId: number, day: string, physical: number) => allotMap.get(`${typeId}|${day}`) ?? physical;
+  /**
+   * 某房型某天的**今日可售**（与 `src/lib/room-stock.ts` 同一口径）
+   *
+   * `rate_calendar.allotment` 的语义是**当天剩余可卖数量**（2026-11-22 酒店确认），
+   * 不是「总房量」、也不是「放量上限」。
+   *
+   * 所以这里不能再用旧写法 `capacity = allotment ?? physical` 去当分母 ——
+   * 那等于把「还剩 2 间可卖」当成「总共只有 2 间房」，
+   * 再减去占用和维修就会算出负数可售。
+   *
+   * 正确：
+   *   物理可售 = 总房量 − 维修 − 在住/预订占用
+   *   今日可售 = allotment === null ? 物理可售 : min(物理可售, allotment)
+   */
+  const allotmentOf = (typeId: number, day: string) => allotMap.get(`${typeId}|${day}`) ?? null;
 
   type Cell = { day: string; occupied: number; maintenance: number; sellable: number };
   const matrix = rows.map((t) => {
@@ -150,8 +163,12 @@ export default async function PredictPage({ searchParams }: { searchParams: Prom
         if (isBetween(b.check_in_date, b.check_out_date, day)) occupied++;
       }
       const maintenance = showOOO ? Number(t.ooo ?? 0) : 0;
-      const cap = capacityOf(t.id, day, Number(t.total ?? 0));
-      return { day, occupied, maintenance, sellable: cap - occupied - maintenance };
+      /* 物理可售：总房量 − 维修 − 占用（occupied 已含在住与预订） */
+      const physicalSellable = Math.max(0, Number(t.total ?? 0) - maintenance - occupied);
+      /* 手工房量是「剩余可卖」，只做一次 min，不再从里面扣占用 */
+      const allot = allotmentOf(t.id, day);
+      const sellable = allot === null ? physicalSellable : Math.min(physicalSellable, Math.max(0, allot));
+      return { day, occupied, maintenance, sellable };
     });
     return { type: t, cells };
   });
