@@ -1146,6 +1146,23 @@ export function runMigrations(db, { checkOnly = false } = {}) {
     "idx_invoices_no",
     `CREATE UNIQUE INDEX idx_invoices_no ON invoices(hotel_id, invoice_no) WHERE invoice_no <> ''`
   );
+  /*
+   * 红冲幂等约束（第七轮整改清单一.3）
+   *
+   * 同一酒店、同一张原票只允许一张红冲票。应用层（src/lib/invoice.ts）已经查过
+   * 「是否已存在 red_of = 原票」，但并发两请求能同时通过那条 SELECT，各自插入负数票 ——
+   * 数据库唯一约束是唯一能挡住这个窗口的东西，清单要求必须保留。
+   *
+   * DDL 与三处必须完全一致（否则「新库/旧库/兜底」三个形态会分叉）：
+   *   · scripts/schema-full.sql（新库安装）
+   *   · src/lib/invoice.ts ensureInvoiceSchema()（克隆仓库直接 dev 的兜底）
+   * 正常票 red_of 为 NULL，WHERE 让索引只覆盖红冲票（NULL 在唯一索引里本来也不冲突）。
+   * addIndex() 已按索引名判重，可重复执行。
+   */
+  addIndex(
+    "idx_invoices_red_of",
+    `CREATE UNIQUE INDEX idx_invoices_red_of ON invoices(hotel_id, red_of) WHERE red_of IS NOT NULL`
+  );
 
   /* ---------- 11. 会话过期清理索引（整改 P2-4） ----------
    * sessions 表只增不删：每次登录插一行，过期后除了「过期 sid 再次访问」时
@@ -1842,6 +1859,22 @@ export function runMigrations(db, { checkOnly = false } = {}) {
     }
   }
   addIndex("idx_bookings_no", `CREATE UNIQUE INDEX idx_bookings_no ON bookings(hotel_id, booking_no)`);
+
+  /*
+   * 单号「酒店内唯一」——stays / folios 的组合唯一索引
+   *
+   * bookings 一直有 idx_bookings_no，但 stays / folios 没有，
+   * 它们的单号只有建表时的**列级 UNIQUE（全局唯一）**，多店部署会撞号。
+   *
+   * 列级 UNIQUE 已经在两处改成「只做 NOT NULL + 组合唯一索引」：
+   *   · 新库：scripts/init-db.mjs + scripts/schema-full.sql
+   *   · 旧库：scripts/rebuild-unique-constraints.mjs（重建表，SQLite 不支持 DROP CONSTRAINT）
+   *
+   * 这里补索引是「新库/旧库口径统一」的第三道保险：即使某个库的表结构已经重建过、
+   * 但索引因为某种原因没建上，跑一次 migrate-all 就会补齐。幂等。
+   */
+  addIndex("idx_stays_no", `CREATE UNIQUE INDEX idx_stays_no ON stays(hotel_id, stay_no)`);
+  addIndex("idx_folios_no", `CREATE UNIQUE INDEX idx_folios_no ON folios(hotel_id, folio_no)`);
 
   /* ---------- 16. 权限配置落库：role_modules / role_permissions / permission_dict（整改 5.2） ----------
    * 整改指令：「统一使用数据库中的岗位和角色权限。设置页面修改权限后必须即时影响实际接口判断，

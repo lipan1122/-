@@ -97,7 +97,7 @@ CREATE TABLE companies (
 CREATE TABLE bookings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   hotel_id INTEGER NOT NULL,
-  booking_no TEXT UNIQUE NOT NULL,
+  booking_no TEXT NOT NULL,
   guest_id INTEGER, guest_name TEXT, mobile TEXT,
   room_type_id INTEGER, room_id INTEGER,
   channel_id INTEGER, company_id INTEGER,
@@ -118,7 +118,7 @@ CREATE TABLE bookings (
 CREATE TABLE stays (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   hotel_id INTEGER NOT NULL,
-  stay_no TEXT UNIQUE NOT NULL,
+  stay_no TEXT NOT NULL,
   booking_id INTEGER, room_id INTEGER NOT NULL,
   guest_id INTEGER, guest_name TEXT, mobile TEXT,
   check_in_time TEXT, expect_check_out TEXT, actual_check_out TEXT,
@@ -136,7 +136,7 @@ CREATE TABLE stays (
 CREATE TABLE folios (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   hotel_id INTEGER NOT NULL,
-  folio_no TEXT UNIQUE NOT NULL,
+  folio_no TEXT NOT NULL,
   stay_id INTEGER, guest_name TEXT, room_no TEXT,
   total_amount REAL DEFAULT 0, paid_amount REAL DEFAULT 0, balance REAL DEFAULT 0,
   status TEXT DEFAULT 'OPEN',
@@ -1026,6 +1026,12 @@ CREATE INDEX idx_invoices_bizdate ON invoices(hotel_id, biz_date);
 
 CREATE UNIQUE INDEX idx_invoices_no ON invoices(hotel_id, invoice_no) WHERE invoice_no <> '';
 
+-- 红冲幂等约束（第七轮整改清单一.3）：同一酒店、同一张原票只允许一张红冲票。
+-- 与 scripts/migrate-all.mjs 的 addIndex("idx_invoices_red_of", ...) 及
+-- src/lib/invoice.ts 的 ensureInvoiceSchema() 三处 DDL 必须完全一致。
+-- 正常票 red_of 为 NULL，WHERE 让索引只覆盖红冲票（NULL 在唯一索引里本来也不冲突）。
+CREATE UNIQUE INDEX idx_invoices_red_of ON invoices(hotel_id, red_of) WHERE red_of IS NOT NULL;
+
 CREATE INDEX idx_sessions_expires ON sessions(expires_at);
 
 CREATE UNIQUE INDEX idx_mini_users_openid ON mini_program_users(hotel_id, openid);
@@ -1093,6 +1099,19 @@ CREATE INDEX idx_channel_settlements_date ON channel_settlements(hotel_id, biz_d
 CREATE INDEX idx_channel_dead_letter ON channel_sync_dead_letter(hotel_id, created_at);
 
 CREATE UNIQUE INDEX idx_bookings_no ON bookings(hotel_id, booking_no);
+
+/*
+ * 单号「酒店内唯一」的三组索引
+ *
+ * 三张表的单号列原本是列级 UNIQUE（全局唯一），多店部署时 hotel 999 用
+ * hotel 1 的单号会直接 UNIQUE constraint failed。已去掉列级约束，
+ * 改用这三组组合唯一索引表达「同一酒店内不重复、跨店可重复」。
+ *
+ * 旧库升级走 scripts/rebuild-unique-constraints.mjs（需要重建表，
+ * SQLite 不支持 DROP CONSTRAINT）；新库安装时靠这里建好。
+ */
+CREATE UNIQUE INDEX IF NOT EXISTS idx_stays_no ON stays(hotel_id, stay_no);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_folios_no ON folios(hotel_id, folio_no);
 
 CREATE INDEX idx_folio_items_bizdate ON folio_items(hotel_id, biz_date, item_type);
 

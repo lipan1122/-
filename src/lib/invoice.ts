@@ -181,6 +181,19 @@ export function ensureInvoiceSchema(): void {
   db.exec(
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_no ON invoices(hotel_id, invoice_no) WHERE invoice_no <> ''`
   );
+  /*
+   * 红冲唯一性（第七轮整改清单一.3）：同一酒店、同一张原票只允许一张红冲票。
+   *
+   * 应用层在 redFlushInvoice() 里已经查过「是否已存在 red_of = 原票」，但两个并发请求
+   * 可以同时通过那条 SELECT，各自插入一张负数票 —— 应用层检查挡不住这个窗口，
+   * 只有数据库唯一约束能挡：后到的那条 INSERT 直接抛 UNIQUE。
+   *
+   * 本文件是「克隆仓库直接 dev / 验收脚本单跑」的兜底建表路径；正常部署由
+   * scripts/migrate-all.mjs 建（DDL 必须完全一致），新库由 scripts/schema-full.sql 建。
+   */
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_red_of ON invoices(hotel_id, red_of) WHERE red_of IS NOT NULL`
+  );
   schemaReady = true;
 }
 
@@ -438,7 +451,31 @@ export function redFlushInvoice(
   if (!src) return { error: "发票不存在或不属于当前酒店" };
 
   if (src.invoice_type !== "NORMAL") return { error: "红冲发票不能再红冲（仅正常发票可红冲）" };
+
+  /*
+   * 「这张票有没有被红冲过」= 状态机 + 不变量，双条件（第七轮整改清单一.3
+   * 「原票状态不能通过普通更新重新变成可红冲」）。
+   *
+   * status 是可写列：一条 `UPDATE invoices SET status = 'ISSUED'`（数据库工具、脚本、
+   * 或者以后新增的某个「撤销红冲」半成品功能）就能把原票改回「已开票」，
+   * 于是纯状态判断会放行第二次红冲，负数票翻倍、账单净额被少算一遍。
+   *
+   *   条件 1  status 必须是 ISSUED（状态机本身）；RED 直接拒。
+   *   条件 2  同酒店内不存在 red_of = 原票 id 的记录（不变量，改状态改不掉）。
+   * 数据库层再加 idx_invoices_red_of 唯一索引兜住并发窗口，三处一起才算「只能红冲一次」。
+   */
   if (src.status === "RED") return { error: `发票 ${src.invoice_no} 已红冲，不能重复红冲` };
+
+  const existingRed = get<{ id: number; invoice_no: string }>(
+    `SELECT id, invoice_no FROM invoices WHERE hotel_id = ? AND red_of = ? ORDER BY id LIMIT 1`,
+    [hotel, src.id]
+  );
+  if (existingRed) {
+    return {
+      error: `发票 ${src.invoice_no} 已红冲（红冲票号 ${existingRed.invoice_no}），不能重复红冲`,
+    };
+  }
+
   if (src.status !== "ISSUED") {
     const label = STATUS_LABEL[src.status] ?? src.status;
     return { error: `发票 ${src.invoice_no} 当前为「${label}」，不能红冲` };
@@ -451,6 +488,14 @@ export function redFlushInvoice(
   const bizDate = bizToday(hotel);
   const operator = (opts.operator ?? "").trim() || null;
   const remark = (opts.remark ?? "").trim() || `红冲 ${src.invoice_no}`;
+  /*
+   * 红冲原因的服务端校验（第七轮整改清单一.3）
+   *
+   * 「原因必填」在动作层（app/(main)/invoices/actions.ts）已经做了 —— 那是页面路径
+   * 唯一入口，构造 POST 也绕不过；这里再补一道长度上限，因为 service 也可以被脚本、
+   * 小程序端、以后的批量红冲直接调用，不能让一条超长备注进财务台账。
+   */
+  if (remark.length > 200) return { error: "红冲原因过长（最多 200 个字符）" };
 
   const invoiceNo = nextInvoiceNo(hotel, bizDate, "RED");
   if (!invoiceNo) return { error: "自动生成红冲票号失败，请联系管理员" };
@@ -489,7 +534,24 @@ export function redFlushInvoice(
     });
     return { ok: true, id: newId, invoiceNo };
   } catch (e) {
-    if (/UNIQUE/i.test(failText(e))) return { error: `红冲票号 ${invoiceNo} 冲突，请重试` };
+    const msg = failText(e);
+    if (/UNIQUE/i.test(msg)) {
+      /*
+       * 唯一约束冲突翻译成前台看得懂的话（第七轮整改清单一.3）
+       *
+       * 并发红冲同一张原票时，两个请求都能通过应用层的「已存在 red_of？」查询
+       * （它们互相还看不见对方未提交的行），随后后提交的那个会撞上
+       * idx_invoices_red_of —— 这里必须返回「该发票已红冲」，不能把
+       * `UNIQUE constraint failed: invoices.hotel_id, invoices.red_of` 抛到页面上。
+       *
+       * 另一个可能命中的是 idx_invoices_no（红冲票号被抢），文案不同，别混。
+       * SQLite 通常报列名列表，少数版本报索引名，两种形式都认。
+       */
+      if (/red_of|idx_invoices_red_of/i.test(msg)) {
+        return { error: `发票 ${src.invoice_no} 已红冲，不能重复红冲` };
+      }
+      return { error: `红冲票号 ${invoiceNo} 冲突，请重试` };
+    }
     return { error: "红冲失败，请稍后重试" };
   }
 }

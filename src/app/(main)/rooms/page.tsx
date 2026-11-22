@@ -5,37 +5,20 @@ import { occupancyOfDay } from "@/lib/metrics";
 import { ROOM_TAG_KEYS, ROOM_TAG_SQL, ROOM_TAG_FIELD_SQL } from "@/lib/room-tags";
 import { stockTotals, todayRoomTypeStock, type RoomTypeStock, type StockTotals } from "@/lib/room-stock";
 import RoomBoard, { type RoomRow, type ArrivalRow, type TagStats } from "@/components/RoomBoard";
+import { CHANNEL_ORDER_PENDING_STATUSES, CHANNEL_ORDER_PENDING_IN } from "@/lib/channel-orders";
 
 export const dynamic = "force-dynamic";
 
-/**
- * 渠道订单「待处理」状态集合（整改清单 P0-2）
+/*
+ * 渠道订单「待处理」状态集合（整改清单 P0-2 / 第七轮清单一.4）
  *
- * ── 改之前 ──
- * 底部功能条「直连订单」的角标只看 `status = 'PENDING'`，
- * 而渠道订单的待处理状态在库里根本不是 PENDING，于是新订单进来了角标一直是 0，
- * 前台看不到有单要接。角标和它点开的悬浮列表还是两处各写一份 SQL。
+ * 原来这份集合定义在本文件顶部（模块级 const，没有 export），顶部导航想显示数字
+ * 只能另写一份；而另写一份就是下一次分叉的开始。
+ * 第七轮把集合、SQL 占位符、计数语句统一抽到 `@/lib/channel-orders`，本页与
+ * `(main)/layout.tsx` 的顶部数字共用同一份 —— 详细状态分布与口径见该文件顶部注释。
  *
- * ── 实测 channel_orders.status 取值分布（data/pms.db，2026-11-22，hotel_id = 1）──
- *   IMPORTED 964 · CANCELLED 242 · CONFIRMED 10 · NEW 6（合计 1222），**PENDING 一条都没有**。
- * 代码里会写入的全部状态（逐个核对过写入点）：
- *   · NEW        —— 建表默认值；upsertChannelOrder() 拉单落库也写它（真正的新单待处理）
- *   · CONFIRMED  —— 渠道确认后经 order-status.ts 状态回传落库，还没转预订，仍要前台处理
- *   · PENDING    —— 历史/兼容写法，当前代码不再写入，保留在集合里不影响正确性
- *   · IMPORTING  —— 转入预订的中间态（转完即 IMPORTED），不是待办
- *   · IMPORTED   —— 已转入预订，处理完了
- *   · CANCELLED  —— 渠道已取消
- *   · CHECKED_IN / CHECKED_OUT / NOSHOW —— 状态回传成功后的本地推进（已进店/已离店/未到），不是待办
- * 清单里提到的 `REJECTED` 在 channel_orders 没有任何写入点（只有 order-status.ts 的**返回码**叫 REJECTED），
- * 不在待处理集合里。
- *
- * ── 待处理 = 还没被前台处理掉的单 ──
- *   NEW + CONFIRMED + PENDING
- * 角标计数与点开后的悬浮列表共用这一份常量与占位符，两处口径不会再分叉。
+ * 待处理 = NEW + CONFIRMED + PENDING
  */
-const CHANNEL_ORDER_PENDING_STATUSES = ["NEW", "CONFIRMED", "PENDING"] as const;
-/** 拼进 SQL 的占位符（数量与上面的集合一一对应） */
-const CHANNEL_ORDER_PENDING_IN = CHANNEL_ORDER_PENDING_STATUSES.map(() => "?").join(",");
 
 /** 预抵类明细最多列几条（计数走 COUNT(*)，不受这个限制） */
 const ARRIVAL_LIST_LIMIT = 8;

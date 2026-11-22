@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import AppShell from "@/components/AppShell";
 import { canAccess, getSession } from "@/lib/session";
 import { bizToday } from "@/lib/biz-date";
+import { countPendingChannelOrders } from "@/lib/channel-orders";
 
 /**
  * 管理类页面：只有 admin 能进
@@ -74,10 +75,26 @@ export default async function MainLayout({ children }: { children: React.ReactNo
     }
   }
 
+  /*
+   * 顶部导航「渠道预订」的数字（第七轮整改清单一.4）
+   *
+   * 之前这里没传：AppShell 的 pendingChannelOrders 一直是 undefined，
+   * 于是「渠道预订」旁永远只有一个小红点，前台看不出有几张单要接。
+   *
+   * 口径与房态页底部「直连订单」角标**同一个模块**（@/lib/channel-orders）：
+   *   · 状态集合 NEW + CONFIRMED + PENDING；
+   *   · 计数走该模块的 CHANNEL_ORDER_PENDING_COUNT_SQL / countPendingChannelOrders()，
+   *     房态页角标用同一份占位符常量拼 SQL —— 两处各写一份就是上一版分叉的根因。
+   *
+   * hotel_id 必须来自服务端 session（user.hotelId）—— 不能用 searchParams /
+   * header 里的任何值，否则越权用户能改一个数字就看到别家店的待办数量。
+   * 表还没建时 countPendingChannelOrders() 返回 0（只显示红点），不会让布局 500。
+   */
   return (
     <AppShell
       user={{ realName: user.realName, role: user.role, hotelName: user.hotelName }}
       bizDate={bizToday(user.hotelId)}
+      pendingChannelOrders={countPendingChannelOrders(user.hotelId)}
     >
       {children}
     </AppShell>

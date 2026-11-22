@@ -43,8 +43,34 @@ type ShopSaleRow = {
   voided_at: string | null;
 };
 
+/** 幂等查重用的最小流水行（重放时按它的字段回显「原单已成交」） */
+type SoldSaleRow = {
+  id: number;
+  item_name: string;
+  qty: number;
+  amount: number;
+  method: string | null;
+  room_no: string | null;
+};
+
 /** 事务内业务失败：抛出去让 tx() 回滚，外层统一转成页面提示 */
 class ShopTxError extends Error {}
+
+/**
+ * 幂等重放：同一个 request_id 已经成交过，本次不再写任何东西
+ *
+ * 第七轮 一.2 的要求是「第二次提交返回成功（幂等 replay）而不是报错」——
+ * 所以它不能走 ShopTxError（那会跳 ?err= 让收银员以为失败了去重试）。
+ * 抛它只是为了从 tx() 里带着原单信息干净地退出来，catch 里立刻转成 ?msg= 成功横幅。
+ */
+class ShopReplayedError extends Error {
+  /* 不用 constructor 参数属性：Node 原生剥类型（strip-only）不支持，写成普通字段 */
+  readonly sale: SoldSaleRow;
+  constructor(sale: SoldSaleRow) {
+    super("该请求已处理（幂等重放）");
+    this.sale = sale;
+  }
+}
 
 /** 商品种子：10 个常见商超商品 */
 const SHOP_SEED: { name: string; barcode: string; price: number; stock: number; category: string }[] = [
@@ -93,6 +119,60 @@ function resolveRequestId(formData: FormData): string {
   const raw = str(formData.get("request_id"));
   if (raw) return raw.slice(0, 64);
   return `auto-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * 幂等查重：这个 request_id 在本酒店是否已经有销售流水
+ *
+ * 保留第六轮那条判定 SQL 的原文（脚本 scripts/test-shop-permissions.mjs 会静态断言它），
+ * 拿到 id 之后再补齐重放时要用到的字段。
+ */
+function settledSaleOf(hotelId: number, requestId: string): SoldSaleRow | undefined {
+  const hit = get<{ id: number }>(
+    `SELECT id FROM shop_sales WHERE hotel_id = ? AND request_id = ? LIMIT 1`,
+    [hotelId, requestId]
+  );
+  if (!hit) return undefined;
+  return get<SoldSaleRow>(
+    `SELECT id, item_name, qty, amount, method, room_no FROM shop_sales WHERE id = ? AND hotel_id = ?`,
+    [hit.id, hotelId]
+  );
+}
+
+/**
+ * 幂等重放的跳转地址
+ *
+ * 必须走 ?msg=（成功横幅）而不是 ?err=：
+ *   · 页面按它显示绿色成功提示；
+ *   · ShopPOS 据此认为「已成交」，清空购物车并换下一枚 request_id。
+ * 用 err= 的话前端会当成失败保留同一枚 request_id，同一单就再也卖不出去了。
+ */
+function replayUrl(sale: SoldSaleRow): string {
+  const amount = fmtMoney(Number(sale.amount ?? 0));
+  return `/shop?msg=${encodeURIComponent(
+    `该请求已处理（幂等重放），本次未重复销售：${sale.item_name} ×${Number(sale.qty ?? 0)}，${amount}${
+      sale.room_no ? ` → 房 ${sale.room_no}` : sale.method ? ` · ${sale.method}` : ""
+    }`
+  )}`;
+}
+
+/**
+ * 唯一索引冲突识别（并发兜底）
+ *
+ * 两个同 request_id 的请求同时通过事务内查重时，后写的那一个会被
+ * shop_sales(hotel_id, request_id) 的部分唯一索引拒绝（node:sqlite 抛
+ * UNIQUE constraint failed: shop_sales.hotel_id, shop_sales.request_id）。
+ * 那不是业务失败 —— 先手已经成交，按幂等重放返回成功。
+ */
+function isRequestIdConflict(e: unknown): boolean {
+  const message = String((e as Error)?.message ?? e);
+  return /UNIQUE constraint failed: shop_sales\./i.test(message);
+}
+
+/** 幂等兜底：撞唯一索引时重新查一次，查到了就当作重放 */
+function replayIfRaced(hotelId: number, requestId: string, e: unknown): SoldSaleRow | undefined {
+  if (!isRequestIdConflict(e)) return undefined;
+  return settledSaleOf(hotelId, requestId);
 }
 
 /** shop_sales 的补列：旧库可能缺 request_id / 作废字段 */
@@ -226,6 +306,14 @@ export async function sellAction(formData: FormData): Promise<void> {
   const roomNo = str(formData.get("room_no"));
   const requestId = resolveRequestId(formData);
 
+  /*
+   * 幂等第一道闸（第七轮 一.2）：这个 request_id 已经成交过 → 直接按首次结果返回成功。
+   * 放在业务校验之前 —— 重放请求即使商品已下架、客人已退房，也应该得到「已处理」，
+   * 而不是一条会把收银员引去重新下单的错误。
+   */
+  const settledBefore = settledSaleOf(hotelId, requestId);
+  if (settledBefore) redirect(replayUrl(settledBefore));
+
   if (!itemId) redirect(failUrl("请选择要销售的商品"));
   if (!qty) redirect(failUrl("请填写正确的销售数量（1-99）"));
   if (!roomNo) redirect(failUrl("请填写挂账房号"));
@@ -255,12 +343,9 @@ export async function sellAction(formData: FormData): Promise<void> {
 
   try {
     tx(() => {
-      /* 幂等：同一个 request_id 只允许产生一笔交易 */
-      const duplicated = get<{ id: number }>(
-        `SELECT id FROM shop_sales WHERE hotel_id = ? AND request_id = ? LIMIT 1`,
-        [hotelId, requestId]
-      );
-      if (duplicated) throw new ShopTxError("该请求已处理（request_id 重复），本次未重复销售");
+      /* 幂等：同一个 request_id 只允许产生一笔交易（并发时还有唯一索引兜底） */
+      const duplicated = settledSaleOf(hotelId, requestId);
+      if (duplicated) throw new ShopReplayedError(duplicated);
 
       /* 条件扣减：库存不足时 changes === 0，整单回滚 */
       const dec = run(
@@ -297,7 +382,11 @@ export async function sellAction(formData: FormData): Promise<void> {
       );
     });
   } catch (e) {
+    if (e instanceof ShopReplayedError) redirect(replayUrl(e.sale));
     if (e instanceof ShopTxError) redirect(failUrl(e.message));
+    /* 并发兜底：两个同 request_id 的请求同时通过查重时，后写的会撞唯一索引 */
+    const raced = replayIfRaced(hotelId, requestId, e);
+    if (raced) redirect(replayUrl(raced));
     throw e;
   }
 
@@ -363,6 +452,14 @@ export async function sellCartAction(formData: FormData): Promise<void> {
   /* 挂房账是账务授权动作：清单要求额外校验 cashier.charge_company */
   if (roomNo) await requirePermission("cashier.charge_company");
 
+  /*
+   * 幂等第一道闸（第七轮 一.2）：同一个 request_id 已经成交过 → 按首次结果返回成功。
+   * 双击的第二下、网络重试的那一次都会走到这里，得到的是成功横幅而不是错误，
+   * 所以前端不会把它当成失败去反复重试。
+   */
+  const settledBefore = settledSaleOf(hotelId, requestId);
+  if (settledBefore) redirect(replayUrl(settledBefore));
+
   if (ids.length === 0) redirect(failUrl("购物车为空，请先选择商品"));
 
   /*
@@ -377,11 +474,9 @@ export async function sellCartAction(formData: FormData): Promise<void> {
 
   try {
     outcome = tx(() => {
-      const duplicated = get<{ id: number }>(
-        `SELECT id FROM shop_sales WHERE hotel_id = ? AND request_id = ? LIMIT 1`,
-        [hotelId, requestId]
-      );
-      if (duplicated) throw new ShopTxError("该请求已处理（request_id 重复），本次未重复销售");
+      /* 幂等：同一个 request_id 只允许产生一笔交易（并发时还有唯一索引兜底） */
+      const duplicated = settledSaleOf(hotelId, requestId);
+      if (duplicated) throw new ShopReplayedError(duplicated);
 
       const names: string[] = [];
       let total = 0;
@@ -451,7 +546,11 @@ export async function sellCartAction(formData: FormData): Promise<void> {
       return { names, total: round2(total), count };
     });
   } catch (e) {
+    if (e instanceof ShopReplayedError) redirect(replayUrl(e.sale));
     if (e instanceof ShopTxError) redirect(failUrl(e.message));
+    /* 并发兜底：两个同 request_id 的请求同时通过查重时，后写的会撞唯一索引 */
+    const raced = replayIfRaced(hotelId, requestId, e);
+    if (raced) redirect(replayUrl(raced));
     throw e;
   }
 

@@ -141,15 +141,32 @@ const all = (sql, params = []) => conn.prepare(sql).all(...params);
 
 /* ============================================================ 一、从源码解析状态集合与两条 SQL */
 
-console.log("=== 一、源码：状态集合常量 + 角标 SQL / 悬浮列表 SQL（rooms/page.tsx） ===");
+console.log("=== 一、源码：状态集合常量 + 角标 SQL / 悬浮列表 SQL ===");
 
+/*
+ * 常量来源（第七轮整改清单第 90 行「页面角标和顶部导航使用同一状态集合」）
+ *
+ * 待处理状态集合已从 rooms/page.tsx 抽到 src/lib/channel-orders.ts，
+ * 让「房态页角标 / 悬浮列表 / 顶部导航」三处共用一份。本脚本相应改成
+ * **优先从 lib 读，读不到再回退到页面** —— 以后常量再搬家只动这里，
+ * 不会因为「常量搬了家」而假红（行为退化仍然会红）。
+ *
+ * 两条 SQL 模板仍从 rooms/page.tsx 解析：页面才是真正执行这两条 SQL 的地方。
+ */
+const libRel = path.join("src", "lib", "channel-orders.ts");
 const PAGE_REL = path.join("src", "app", "(main)", "rooms", "page.tsx");
 const pageSrc = fs.readFileSync(path.join(ROOT, PAGE_REL), "utf8");
+const libSrc = fs.existsSync(path.join(ROOT, libRel)) ? fs.readFileSync(path.join(ROOT, libRel), "utf8") : "";
+
+const STATUS_CONST_RE = /CHANNEL_ORDER_PENDING_STATUSES\s*=\s*\[([^\]]*)\]\s*as\s+const/;
+const constSrc = STATUS_CONST_RE.test(libSrc) ? libSrc : pageSrc;
+const CONST_SOURCE_LABEL = constSrc === libSrc ? "src/lib/channel-orders.ts" : "src/app/(main)/rooms/page.tsx（回退）";
 
 /** 1.1 解析 CHANNEL_ORDER_PENDING_STATUSES 常量 */
-const constMatch = pageSrc.match(/CHANNEL_ORDER_PENDING_STATUSES\s*=\s*\[([^\]]*)\]\s*as\s+const/);
+const constMatch = constSrc.match(STATUS_CONST_RE);
 const pendingStatuses = constMatch ? [...constMatch[1].matchAll(/"([A-Z_]+)"/g)].map((m) => m[1]) : [];
-console.log(`  rooms/page.tsx 待处理状态集合 = [${pendingStatuses.join(", ")}]`);
+console.log(`  状态集合来源：${CONST_SOURCE_LABEL}`);
+console.log(`  待处理状态集合 = [${pendingStatuses.join(", ")}]`);
 
 check(
   "状态集合恰为 NEW + CONFIRMED + PENDING（清单第 40 行）",
@@ -165,7 +182,9 @@ check(
 );
 check(
   "状态集合常量在源码里只定义一次（口径只有一份）",
-  (pageSrc.match(/CHANNEL_ORDER_PENDING_STATUSES\s*=\s*\[/g) ?? []).length === 1
+  (libSrc.match(/CHANNEL_ORDER_PENDING_STATUSES\s*=\s*\[/g) ?? []).length +
+    (pageSrc.match(/CHANNEL_ORDER_PENDING_STATUSES\s*=\s*\[/g) ?? []).length ===
+    1
 );
 
 /** 1.2 从源码里抠出两条 SQL 模板（都含 ${CHANNEL_ORDER_PENDING_IN} 占位符） */

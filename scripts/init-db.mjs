@@ -141,7 +141,7 @@ CREATE TABLE IF NOT EXISTS companies (
 CREATE TABLE IF NOT EXISTS bookings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   hotel_id INTEGER NOT NULL,
-  booking_no TEXT UNIQUE NOT NULL,
+  booking_no TEXT NOT NULL,
   guest_id INTEGER, guest_name TEXT, mobile TEXT,
   room_type_id INTEGER, room_id INTEGER,
   channel_id INTEGER, company_id INTEGER,
@@ -165,7 +165,7 @@ CREATE TABLE IF NOT EXISTS bookings (
 CREATE TABLE IF NOT EXISTS stays (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   hotel_id INTEGER NOT NULL,
-  stay_no TEXT UNIQUE NOT NULL,
+  stay_no TEXT NOT NULL,
   booking_id INTEGER, room_id INTEGER NOT NULL,
   guest_id INTEGER, guest_name TEXT, mobile TEXT,
   check_in_time TEXT, expect_check_out TEXT, actual_check_out TEXT,
@@ -182,7 +182,7 @@ CREATE TABLE IF NOT EXISTS stays (
 CREATE TABLE IF NOT EXISTS folios (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   hotel_id INTEGER NOT NULL,
-  folio_no TEXT UNIQUE NOT NULL,
+  folio_no TEXT NOT NULL,
   stay_id INTEGER, guest_name TEXT, room_no TEXT,
   total_amount REAL DEFAULT 0, paid_amount REAL DEFAULT 0, balance REAL DEFAULT 0,
   status TEXT DEFAULT 'OPEN',
