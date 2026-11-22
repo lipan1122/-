@@ -116,6 +116,13 @@ sqlite3 data/pms.db "SELECT '房间 ' || COUNT(*) || ' 间' FROM rooms; SELECT '
 
 chown -R "$APP_USER":"$APP_USER" "$APP_DIR"
 
+# 数据目录归属必须回到服务用户
+#
+# 部署过程中会多次 （migrate-all / sync-schema / 客史回填等），
+# 它们会创建归属 root 的 -wal / -shm 文件。服务以 $APP_USER 运行，
+# 结果下一个请求就报 attempt to write a readonly database（第九轮在 VPS 上踩过）。
+chown -R "$APP_USER":"$APP_USER" "$APP_DIR/data"
+
 # ─────────────── 3. systemd ───────────────
 log "安装 systemd 服务"
 NODE_BIN="$(command -v node)"

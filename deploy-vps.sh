@@ -160,6 +160,13 @@ fi
 # 权限：服务以 $APP_USER 运行，data 目录要可写
 chown -R "$APP_USER":"$APP_USER" "$APP_DIR"
 
+# 数据目录归属必须回到服务用户
+#
+# 部署过程中会多次 （migrate-all / sync-schema / 客史回填等），
+# 它们会创建归属 root 的 -wal / -shm 文件。服务以 $APP_USER 运行，
+# 结果下一个请求就报 attempt to write a readonly database（第九轮在 VPS 上踩过）。
+chown -R "$APP_USER":"$APP_USER" "$APP_DIR/data"
+
 # ─────────────────────────── 6. systemd ───────────────────────────
 log "安装 systemd 服务（开机自启 + 崩溃自动重启）"
 NODE_BIN="$(command -v node)"
