@@ -167,15 +167,39 @@ export function buildRateRows(
     /* 老库没有 rate_calendar 或没有 allotment 列：按「没配手工房量」处理 */
   }
 
-  // 已占用：在住（stays）+ 已排具体房间的预订（bookings.room_id 非空）
+  /*
+   * 已占用：在住（stays）+ 已排具体房间的预订（bookings.room_id 非空）
+   *
+   * ⚠️ 在住单的占用区间必须**延伸到现在之后**，不能直接用 expect_check_out
+   *
+   * 用真实数据算：`day < expect_check_out` 对逾期未离店的客人永远不成立
+   * （真库 21 张在住单 expect_check_out 是 11-14~11-18，都早于今天）。
+   * 结果是这 21 间**全部被当成空房推给渠道**：
+   *   房态页今日可售 17 间，渠道侧算成 40 间，实推携程 31 间
+   *   → 携程能卖 31 间，实际只有 12 间可卖，**多推 19 间**
+   *
+   * 这正是用户在远期房态里修掉的同一个坑（forecast/page.tsx 已去掉该过滤），
+   * 渠道侧当时没同步。
+   *
+   * 修法：SQL 里用 `MAX(expect_check_out, 明天)` 作为占用终点 ——
+   * 只要客人还在（status='INHOUSE'），这间房就不能卖。
+   * 用 date('now','localtime','+1 day') 而不是 today 变量，
+   * 保证「今天离店」的单也覆盖到今天（`from <= day < to` 才成立）。
+   */
   const occupied = all<{ room_type_id: number; from_date: string; to_date: string }>(
-    `SELECT r.room_type_id, date(s.check_in_time) AS from_date, s.expect_check_out AS to_date
+    `SELECT r.room_type_id,
+            date(s.check_in_time) AS from_date,
+            CASE
+              WHEN s.expect_check_out IS NULL THEN date('now','localtime','+1 day')
+              WHEN s.expect_check_out > date('now','localtime') THEN s.expect_check_out
+              ELSE date('now','localtime','+1 day')
+            END AS to_date
        FROM stays s JOIN rooms r ON r.id = s.room_id
       WHERE s.hotel_id = ? AND s.status = 'INHOUSE'
      UNION ALL
      SELECT room_type_id, check_in_date, check_out_date
        FROM bookings
-      WHERE hotel_id = ? AND room_id IS NOT NULL AND status IN ('PENDING','CONFIRMED','CHECKED_IN')`,
+      WHERE hotel_id = ? AND room_id IS NOT NULL AND status IN ('PENDING','CONFIRMED')`,
     [hotelId, hotelId]
   );
 

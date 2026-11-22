@@ -288,7 +288,8 @@ export default async function NightAuditPage() {
          (SELECT COALESCE(SUM(amount), 0) FROM folio_items
            WHERE hotel_id = ? AND biz_date = ? AND item_type = 'OTHER') AS other,
          (SELECT COALESCE(SUM(ABS(amount)), 0) FROM payments
-           WHERE hotel_id = ? AND biz_date = ? AND (amount < 0 OR refund_of IS NOT NULL)) AS refund`,
+           WHERE hotel_id = ? AND biz_date = ? AND (amount < 0 OR refund_of IS NOT NULL)
+             AND COALESCE(kind, '') <> 'DEPOSIT_REFUND') AS refund`,
       [hotelId, today, hotelId, today, hotelId, today, hotelId, today]
     ) ?? { room: 0, food: 0, other: 0, refund: 0 };
 

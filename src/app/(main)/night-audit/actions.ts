@@ -80,7 +80,22 @@ const SQL_REVENUE_OTHER = `SELECT COALESCE(SUM(fi.amount), 0) AS v
 const SQL_REFUND_TOTAL = `SELECT COALESCE(SUM(ABS(p.amount)), 0) AS v
   FROM payments p
  WHERE p.hotel_id = ? AND p.biz_date = ?
-   AND (p.amount < 0 OR p.refund_of IS NOT NULL)`;
+   AND (p.amount < 0 OR p.refund_of IS NOT NULL)
+   /*
+    * 押金退款**不是营业收入的冲减项**
+    *
+    * 口径必须对称：押金收款明确不计收入（见 folio.ts 的 NON_REVENUE_ITEM，
+    * 押金是负债），那押金退款自然也不该从收入里减 —— 它只是把负债还掉。
+    *
+    * 不排除的后果（真库实测）：
+    *   11-21 房费 1,568、退款 134（孙强 44 + 许丹 64 + 张三丰 26 三笔押金退款）
+    *   → room-biz-daily 净收入 1,434，而 biz-daily 营业收入 1,568 → **两张日报差 134**
+    *   净收入被低估 8.5%，毛利率/RevPAR 相关派生指标一并偏低。
+    *
+    * 历史数据里有 174 条 kind IS NULL（第九轮按「不静默归类」刻意留空），
+    * 所以用 COALESCE(p.kind,'') 而不是 p.kind <> ...。
+    */
+   AND COALESCE(p.kind, '') <> 'DEPOSIT_REFUND'`;
 
 /**
  * 执行夜审：把今日房费过账到每间在住房间。

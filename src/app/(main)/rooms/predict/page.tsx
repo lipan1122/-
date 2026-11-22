@@ -9,7 +9,7 @@ import { addDays, todayStr } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
 
-type TypeRow = { id: number; name: string; code: string; total: number; ooo: number };
+type TypeRow = { id: number; name: string; code: string; total: number; ooo: number; lock: number };
 type StayRow = { room_type_id: number; check_in_date: string | null; out_date: string | null };
 type BookingRow = { room_type_id: number; check_in_date: string; check_out_date: string };
 type RevenueRow = { type_id: number; biz_date: string; revenue: number | null };
@@ -85,7 +85,8 @@ export default async function PredictPage({ searchParams }: { searchParams: Prom
   const types = all<TypeRow>(
     `SELECT rt.id, rt.name, rt.code,
             COUNT(r.id) AS total,
-            SUM(CASE WHEN r.status = 'OOO' THEN 1 ELSE 0 END) AS ooo
+            SUM(CASE WHEN r.status = 'OOO' THEN 1 ELSE 0 END) AS ooo,
+            SUM(CASE WHEN r.status = 'LOCK' THEN 1 ELSE 0 END) AS "lock"
      FROM room_types rt
      LEFT JOIN rooms r ON r.room_type_id = rt.id AND r.hotel_id = rt.hotel_id
      WHERE rt.hotel_id = ?
@@ -154,16 +155,35 @@ export default async function PredictPage({ searchParams }: { searchParams: Prom
   const matrix = rows.map((t) => {
     const cells: Cell[] = columns.map((day) => {
       let occupied = 0;
+      /*
+       * 在住占用：`isBetween(check_in_date, out_date, day)` 会把**逾期未离店**的客人漏掉
+       *
+       * 真库 21 张在住单 expect_check_out 是 11-14~11-18（都早于今天），
+       * `isBetween` 对今天及之后全不成立 → 占用只剩 6 间 → 可卖 40 间，
+       * 而房态页今日可售是 17 间（**多算 23 间、126%**）。
+       * 与 room-stock.ts / forecast 同一口径：只要 status='INHOUSE'，客人就还在，房间就占着。
+       */
       for (const s of stays) {
         if (s.room_type_id !== t.id) continue;
-        if (isBetween(s.check_in_date, s.out_date, day)) occupied++;
+        /* stays 查询本身就限定了 status='INHOUSE'，所以：从入住那天起一直占着（逾期也占） */
+        if (s.check_in_date && s.check_in_date <= day) occupied++;
       }
       for (const b of bookings) {
         if (b.room_type_id !== t.id) continue;
         if (isBetween(b.check_in_date, b.check_out_date, day)) occupied++;
       }
-      const maintenance = showOOO ? Number(t.ooo ?? 0) : 0;
-      /* 物理可售：总房量 − 维修 − 占用（occupied 已含在住与预订） */
+      /*
+       * 维修 / 锁房：两个都必须扣
+       *
+       * 原来只 SUM(status='OOO')，**完全不扣 LOCK** ——
+       * 实测（chk-stock）：设 1 间 OOO + 1 间 LOCK，房态页可售 3，本页显示 5。
+       *
+       * 另外原来 `showOOO ? ooo : 0` 让「可卖」随一个**显示复选框**变化 →
+       * 首屏把维修房算成可卖。维修房不能被卖，这个开关只该影响「显不显示」，
+       * 不该影响「算不算可卖」。
+       */
+      const maintenance = Number(t.ooo ?? 0) + Number(t.lock ?? 0);
+      /* 物理可售：总房量 − 维修 − 锁房 − 占用（occupied 已含在住与预订） */
       const physicalSellable = Math.max(0, Number(t.total ?? 0) - maintenance - occupied);
       /* 手工房量是「剩余可卖」，只做一次 min，不再从里面扣占用 */
       const allot = allotmentOf(t.id, day);

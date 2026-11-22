@@ -8832,6 +8832,15 @@ function refundRoomDayRows(hotelId: number, from: string, to: string): { roomNo:
        LEFT JOIN rooms r ON r.id = s.room_id AND r.hotel_id = p.hotel_id
       WHERE p.hotel_id = ? AND p.biz_date BETWEEN ? AND ?
         AND (p.amount < 0 OR p.refund_of IS NOT NULL)
+        /*
+         * 押金退款不是营收冲减项（与夜审 SQL_REFUND_TOTAL 同一口径）
+         *
+         * 押金收款不计收入（lib/folio.ts 的 NON_REVENUE_ITEM），那押金退款
+         * 也不该从收入里减 —— 它只是把负债还掉。
+         * 不排除会导致 room-biz-daily 净收入比 biz-daily 营业收入少一个押金退款额。
+         * 历史数据有 174 条 kind IS NULL，所以用 COALESCE。
+         */
+        AND COALESCE(p.kind, '') <> 'DEPOSIT_REFUND'
       GROUP BY r.room_no, p.biz_date`,
     [hotelId, from, to]
   ).map((r) => ({

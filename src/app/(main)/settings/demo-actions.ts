@@ -33,7 +33,7 @@ import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { revalidatePath } from "next/cache";
 import { get, run } from "@/lib/db";
-import { requireAdmin, requirePermission, requireUser } from "@/lib/session";
+import { requireAdmin, requirePermissionOrRedirect, requireUser } from "@/lib/session";
 import { seedUniformDemo } from "@/lib/seed-uniform";
 
 export type DemoLoadResult =
@@ -240,7 +240,21 @@ export async function loadDemoDataAction(): Promise<DemoLoadResult> {
  */
 export async function fillUniformDemoAction(): Promise<{ ok?: string; error?: string }> {
   const user = await requireUser();
-  requirePermission("settings.manage");
+  /*
+   * ⚠️ 这个 await 不能少
+   *
+   * `requirePermission` 是 async 函数，它靠 `throw new Error("FORBIDDEN: ...")` 拒绝。
+   * 漏掉 await → 返回的 Promise 被丢弃、throw 变成无人处理的 rejection，
+   * **权限判断完全不生效**。
+   *
+   * 实测后果（chk-demo）：前台账号 front 调这个 action → HTTP 200，
+   * 副本库 stays 0 → 183（写进 183 张入住单 + 183 张账单 + 183 笔流水 + 243 条预订）。
+   *
+   * 这里用 `requirePermissionOrRedirect` 而不是 `requirePermission`：
+   * 后者在生产构建下会被脱敏成 500「操作失败」，
+   * 前者会 303 到 /no-permission 并显示「没有该操作权限」。
+   */
+  await requirePermissionOrRedirect("settings.manage");
 
   try {
     const res = seedUniformDemo(user.hotelId ?? 1, 60, false);

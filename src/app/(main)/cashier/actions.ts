@@ -830,7 +830,14 @@ export async function refundPaymentAction(formData: FormData): Promise<ActionSta
  * → folio_items 记 DEPOSIT 明细 + payments 流水 + folios.paid_amount 累加
  */
 export async function addDepositAction(formData: FormData): Promise<ActionState> {
-  const user = await requireUser();
+  /*
+   * 收押金 = 收款动作，必须有 cashier.receive
+   *
+   * 原来这里是 requireUser() —— **任何登录用户都能收押金**。
+   * 实测（chk-perm）：撤销前台 cashier.receive 后，收款被拒（303 /no-permission），
+   * 但同一个账号调 addDepositAction 仍然成功写库（payments + folio.paid_amount）。
+   */
+  const user = await requirePermissionOrRedirect("cashier.receive");
   /* 第九轮 P1-2：押金收款写 kind=DEPOSIT（不再靠备注识别），老库先兜底补列 */
   ensurePaymentKindSchema();
   const folioId = numOf(formData, "folio_id");
@@ -925,7 +932,8 @@ export async function addDepositAction(formData: FormData): Promise<ActionState>
  * → payments 记收款流水 + folio_items 记 ADJUST 负项（已结记录）
  */
 export async function partialSettleAction(formData: FormData): Promise<ActionState> {
-  const user = await requireUser();
+  /* 部分结账也是收款：撤销 cashier.receive 后本来应该一起被拒（原来只有 requireUser） */
+  const user = await requirePermissionOrRedirect("cashier.receive");
   /* 第九轮 P1-2：部分结账收款写 kind=ROOM_PAYMENT，老库先兜底补列 */
   ensurePaymentKindSchema();
   const folioId = numOf(formData, "folio_id");
@@ -1327,7 +1335,13 @@ function daysBetween(a: string, b: string): number {
  * 延迟退房：把预计离店日期顺延到更晚的日期，同步入住晚数
  */
 export async function delayCheckoutAction(formData: FormData): Promise<ActionState> {
-  const user = await requireUser();
+  /*
+   * 延住会改 stays.expect_check_out / nights，进而影响库存、房费与报表
+   *
+   * 实测（chk-perm）：housekeeper 调它能把离店日从 11-14 改到 11-26（nights 1→13）
+   * 而且不收任何房费。归到 cashier.receive —— 它本质是「改房费/加收」类动作。
+   */
+  const user = await requirePermissionOrRedirect("cashier.receive");
   const stayId = numOf(formData, "stay_id");
   const newDate = str(formData, "new_date");
 
