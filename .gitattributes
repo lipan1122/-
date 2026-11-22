@@ -1,0 +1,40 @@
+# 换行符策略
+#
+# 为什么需要这个文件：
+# Windows 上的 git 默认 core.autocrlf=true，会在 checkout 时把 LF 转成 CRLF。
+# 对 .sh 脚本来说这是致命的 —— 在 Linux 上执行会报
+#   `$'\r': command not found`
+# 而且报错位置往往是第 2 行，看起来像语法错误，很难排查。
+#
+# 这里显式声明：所有 shell 脚本在仓库里和 checkout 后都必须是 LF。
+
+# Shell 脚本：永远 LF
+*.sh            text eol=lf
+*.bash          text eol=lf
+
+# Docker / 部署配置：也必须 LF（Dockerfile 里 RUN 多行续行用 \ 结尾，
+# 如果变成 \r 会让续行失效，构建报奇怪的错）
+Dockerfile      text eol=lf
+.dockerignore   text eol=lf
+
+# 其他文本文件：用平台默认（Windows checkout 成 CRLF 没问题）
+*.ts            text
+*.tsx           text
+*.js            text
+*.mjs           text
+*.json          text
+*.md            text
+*.css           text
+*.sql           text
+
+# 二进制：不要做任何转换
+*.db            binary
+*.db-wal        binary
+*.db-shm        binary
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.webp          binary
+*.ico           binary
+*.woff          binary
+*.woff2         binary
