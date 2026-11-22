@@ -74,15 +74,20 @@ fi
 log "执行幂等迁移"
 node scripts/migrate-all.mjs
 
-# 补全懒建表（全新部署必跑）
+# 补全表结构（全新部署必跑）
 #
 # 本项目有 60 张表的建表语句散落在各个 page/action 里，只有页面被访问时才创建。
-# 老库上没问题（用久了都建出来了），但全新部署会缺表 —— VPS 上
-# /rooms 和 /settings 报 500 就是这个原因（当时只有 30 张表，需要 90 张）。
-# ensure-schema.mjs 执行 scripts/schema-full.sql（从跑起来的库导出的完整 schema），
-# 幂等：已存在的表/索引跳过，不影响已有数据。
-log "补全表结构（懒建表）"
-node scripts/ensure-schema.mjs
+# 老库上没问题（用久了都建出来了），但全新部署会缺表 —— VPS 上实测过：
+#   Error: no such table: shop_sales   → /rooms 500
+#   Error: no such column: sort        → /settings 500
+#
+# sync-schema.mjs 做三件事（三者都幂等，重复跑无害）：
+#   1. 缺表 → 从 scripts/schema-full.sql 里取 DDL 建
+#   2. 缺列 → ALTER TABLE ADD COLUMN（CREATE TABLE IF NOT EXISTS 补不了这个）
+#   3. 缺索引 → CREATE INDEX IF NOT EXISTS
+# 对比基准是 scripts/schema-fingerprint.json（从完整库导出的表→列清单）。
+log "补全表结构（缺表补表、缺列补列）"
+node scripts/sync-schema.mjs
 
 log "数据库概况"
 sqlite3 data/pms.db "SELECT '房间 ' || COUNT(*) || ' 间' FROM rooms; SELECT '用户 ' || COUNT(*) || ' 个' FROM users;" 2>/dev/null || true

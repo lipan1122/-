@@ -70,7 +70,9 @@
     "check:report-map": "node scripts/check-report-map.mjs",
     "recalc:folios": "node scripts/recalc-all-folios.mjs",
     "audit:all": "node scripts/audit.mjs && node scripts/audit-pages.mjs && node scripts/audit-reports.mjs && node scripts/preflight-db.mjs && node scripts/check-sql-params.mjs && node scripts/check-report-map.mjs",
-    "db:ensure-schema": "node scripts/ensure-schema.mjs"
+    "db:ensure-schema": "node scripts/ensure-schema.mjs",
+    "db:dump-schema": "node scripts/dump-schema.mjs",
+    "db:sync-schema": "node scripts/sync-schema.mjs"
   },
   "dependencies": {
     "next": "16.4.6",
