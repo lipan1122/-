@@ -381,12 +381,35 @@ export async function addPaymentAction(formData: FormData): Promise<ActionState>
   /* 事务内要用的会员 id（提前查出来做友好提示，真正的校验在事务里再确认一次） */
   let walletMemberId: number | null = null;
   if (useWallet) {
+    /*
+     * 会员 id 从「账单 → 入住单 → 客人」拿，**不是**从 folios 拿
+     *
+     * ⚠️ 这里原来写的是 `SELECT guest_id FROM folios WHERE id = ?`，
+     *    但 `folios` 表**没有 guest_id 列**（只有 stay_id / guest_name / room_no）。
+     *    于是任何一次「会员储值卡」支付都会抛：
+     *        no such column: guest_id
+     *    → 客人充进储值的钱**一分都花不出去**（收银台收不了，只有
+     *      /members/wallet 页面的「消费」能花，而结账场景用不上）。
+     *
+     * 为什么一直没被发现：`scripts/check-round4-coverage.mjs` 对 P1-9 的两条断言
+     * 只是 `includes("会员储值卡")` / `includes("consumeWallet")` 的**字符串 grep**，
+     * 从来没有真正跑过一次储值卡支付 —— 静态自查把 100% 崩溃的路径判成了「已落地」。
+     *
+     * 修法：改用 `folios.stay_id → stays.guest_id` 的 join，不改表结构
+     * （folios 是账单，账单本身不该冗余客人 id；客人属于入住单）。
+     */
     const g = get<{ guest_id: number | null }>(
-      `SELECT guest_id FROM folios WHERE id = ? AND hotel_id = ?`,
+      `SELECT s.guest_id AS guest_id
+         FROM folios f
+         LEFT JOIN stays s ON s.id = f.stay_id AND s.hotel_id = f.hotel_id
+        WHERE f.id = ? AND f.hotel_id = ?`,
       [folioId, user.hotelId]
     );
     if (!g?.guest_id) {
-      return { error: "该账单没有关联会员档案，不能用储值卡支付。请先在会员里建档并绑定客人。" };
+      return {
+        error:
+          "该账单没有关联会员档案，不能用储值卡支付。请先在会员里建档并绑定客人（或确认这张账单关联的入住单有 guest_id）。",
+      };
     }
     walletMemberId = g.guest_id;
     const bal = getWalletBalance(user.hotelId, walletMemberId);

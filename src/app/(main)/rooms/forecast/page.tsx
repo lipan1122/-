@@ -237,8 +237,26 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
       WHERE s.hotel_id = ? AND s.status = 'INHOUSE'
         AND s.check_in_time IS NOT NULL
         AND substr(s.check_in_time, 1, 10) < ?
-        AND (s.expect_check_out IS NULL OR s.expect_check_out > ?)`,
-    [hotelId, endExclusive, firstDate]
+        /*
+         * ⚠️ 这里**不能**再按 expect_check_out 过滤（本轮修的真 bug）
+         *
+         * 原来还有一行：
+         *     AND (s.expect_check_out IS NULL OR s.expect_check_out > ?)   -- firstDate
+         *
+         * 它的本意是「只看和本区间有交集的在住单」，但副作用是：
+         * **逾期未离店的客人被整条滤掉**。演示库的 21 张在住单
+         * expect_check_out 是 11-14~11-18（都早于区间起始日 11-22），
+         * 于是 stays 查出来是空的 → occupied=0 → 远期房态「剩 N 间」显示 46 间全空，
+         * 而实际在住 21 间 —— 前台按 46 卖会**超卖 21 间**。
+         *
+         * 正确判据只有一个：'status='INHOUSE'' 就代表客人还在，房间就占着。
+         * 逾期（expect_check_out 已过但还没退房）不是「空房」，恰恰是「必须继续占房」。
+         *
+         * 与 src/lib/metrics.ts、src/lib/room-stock.ts 的口径保持一致：
+         * 三处都刻意不看 expect_check_out。
+         */
+        AND s.check_in_time IS NOT NULL`,
+    [hotelId, endExclusive]
   );
 
   /* ---------------- 5. 预订：PENDING / CONFIRMED（已排房的画块，未排房的进表头计数） ---------------- */
@@ -366,12 +384,28 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
   const cellMap = new Map<number, Slot[]>();
   for (const r of rows) cellMap.set(r.id, Array.from({ length: days }, () => EMPTY_SLOT));
 
-  // 在住优先：check_in <= 当天 < expect_check_out
+  // 在住优先：check_in <= 当天 < 离店日
   for (const s of stays) {
     const slots = cellMap.get(s.room_id);
     if (!slots) continue;
     const from = s.check_in_date ?? firstDate;
-    const to = s.out_date ?? endExclusive;
+    /*
+     * 离店日的取法（**这是本轮修的一个真 bug**）
+     *
+     * 原来直接取 `s.out_date`。但「在住单」查的是 status='INHOUSE' 的单，
+     * 而客人**可能逾期未离店** —— 这时 `expect_check_out` 早就过去了，
+     * `d < to` 对今天及之后全不成立，于是：
+     *   · 该房间在远期房态里显示成「空房」
+     *   · 表头「剩 N 间」虚高（实测 46 间全空，而实际在住 21 间 → 前台按 46 卖会超卖 21 间）
+     *
+     * 这正是 `src/lib/metrics.ts` 踩过的同一个坑（按 expect_check_out 截断
+     * 会把逾期房间算成空房，出租率归零）。修法一致：
+     * **只要客人还在（status='INHOUSE'），房间就一直占着**，
+     * 所以离店日取 `max(expect_check_out, 明天)` —— 至少占掉今天和明天。
+     */
+    const rawOut = s.out_date ?? endExclusive;
+    /* stays 查询本身就限定了 status=INHOUSE，所以逾期单直接延续到区间末尾 */
+    const to = rawOut > today ? rawOut : endExclusive;
     const name = (s.guest_name ?? "").trim() || "在住";
     const channel = (s.channel_name ?? "").trim() || "散客";
     const owed = Number(s.balance ?? 0) > 0.01;
@@ -414,10 +448,47 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
   }
 
   /* ---------------- 7. 表头每天的三行数字 ----------------
-   * 剩 N 间   = 可售房量 = 总房数 − 在住占用 − 已排房预订占用 − 待分房（未排房预订）
-   * 待分房 N 间 = 该日覆盖的未排房预订（bookings.room_id 为空）
+   * 剩 N 间 = 可售房量 = 物理可售与 allotment 取小（与房态页同一口径，见 lib/room-stock.ts）
+   *
+   * ⚠️ 这里原来只算 `rows.length − 在住 − 已排房 − 待分房`，有两处漏扣：
+   *    1. **没扣 OOO(维修) / LOCK(锁房)** —— `rows.length` 包含这两种房，
+   *       它们本该整段日期都不能卖，于是「剩 N 间」会虚高
+   *    2. **没读 rate_calendar.allotment** —— 运营手工把某天限售成 2 间，
+   *       远期房态还按物理剩余显示，两张页面给出不同数字
+   *
+   * 清单（第九轮第二节）要求「房态、远期房态、房型预测、渠道推送共用一套库存算法」。
+   * 这里补上 OOO / LOCK / allotment 三项，口径与 `todayRoomTypeStock` 对齐：
+   *   物理可售 = 可视房数 − OOO − LOCK − 在住 − 已排房 − 待分房
+   *   可售     = 配了 allotment ? min(物理可售, allotment) : 物理可售
+   *
+   * 注意 total 仍是**当前视图内的房数**（受楼层/房型筛选影响），
+   * 这是本页的设计（「按当前视图看未来」），不是全店口径 —— 页面上有说明。
    */
   const typesInView = new Set(rows.map((r) => r.room_type_id));
+
+  /* 每天各自的 OOO / LOCK 房数（维修与锁房是房间属性，但可能今天维修明天正常，
+     所以按月查不到当天状态时按「当前状态」兜底 —— 远期房态本来就依赖当前房态快照） */
+  const blockedByType = new Map<number, number>();
+  for (const r of rows) {
+    if (r.room_status === "OOO" || r.room_status === "LOCK") {
+      blockedByType.set(r.room_type_id, (blockedByType.get(r.room_type_id) ?? 0) + 1);
+    }
+  }
+
+  /* 手工房量（allotment）：key = 房型id:日期。语义是「当天剩余可卖数量」 */
+  const allots = new Map<string, number>();
+  try {
+    for (const a of all<{ room_type_id: number; date: string; allotment: number }>(
+      `SELECT room_type_id, date, allotment FROM rate_calendar
+        WHERE hotel_id = ? AND allotment IS NOT NULL AND date >= ? AND date <= ?`,
+      [hotelId, dates[0] ?? "", dates[dates.length - 1] ?? ""]
+    )) {
+      allots.set(`${Number(a.room_type_id)}:${String(a.date).slice(0, 10)}`, Number(a.allotment));
+    }
+  } catch {
+    /* 老库没有 allotment 列：按「没配手工房量」处理 */
+  }
+
   const dayStats = dates.map((d, i) => {
     let occupied = 0;
     let assigned = 0;
@@ -433,8 +504,62 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
       if (b.room_type_id !== null && !typesInView.has(b.room_type_id)) continue;
       if (b.check_in_date <= d && d < b.check_out_date) pending += Math.max(1, Number(b.room_count ?? 1));
     }
+
+    /*
+     * 可视房数（含 OOO/LOCK）→ 扣掉维修/锁房 → 物理可售 → 与 allotment 取小
+     *
+     * allotment 是按房型配的，而本页的「剩 N 间」是全店（或当前视图）汇总，
+     * 所以这里取「该视图内各房型的 allotment 之和」作为当天手工上限；
+     * 某个房型没配就按它的物理可售算（不额外限制）。
+     */
     const total = rows.length;
-    return { day: d, total, occupied, assigned, pending, left: Math.max(0, total - occupied - assigned - pending) };
+    let blocked = 0;
+    for (const r of rows) {
+      if (r.room_status === "OOO" || r.room_status === "LOCK") blocked += 1;
+    }
+    const physicalSellable = Math.max(0, total - blocked - occupied - assigned - pending);
+
+    /* 按房型汇总 allotment 上限（没配的房型贡献它的物理可售） */
+    let manualCap = 0;
+    let anyManual = false;
+    const perType = new Map<number, { total: number; blocked: number; used: number }>();
+    for (const r of rows) {
+      const e = perType.get(r.room_type_id) ?? { total: 0, blocked: 0, used: 0 };
+      e.total += 1;
+      if (r.room_status === "OOO" || r.room_status === "LOCK") e.blocked += 1;
+      perType.set(r.room_type_id, e);
+    }
+    for (const r of rows) {
+      const slot = cellMap.get(r.id)?.[i];
+      if (slot && (slot.kind === "inhouse" || slot.kind === "booking")) {
+        const e = perType.get(r.room_type_id);
+        if (e) e.used += 1;
+      }
+    }
+    for (const [typeId, e] of perType) {
+      const phys = Math.max(0, e.total - e.blocked - e.used);
+      const a = allots.get(`${typeId}:${d}`);
+      if (a === undefined) {
+        manualCap += phys;
+      } else {
+        anyManual = true;
+        manualCap += Math.min(phys, Math.max(0, a));
+      }
+    }
+    /* 待分房属于「还没排到具体房型」的占用，从手工上限里也要扣 */
+    const capAfterManual = anyManual ? Math.max(0, manualCap - pending) : physicalSellable;
+    const left = anyManual ? Math.min(physicalSellable, capAfterManual) : physicalSellable;
+
+    return {
+      day: d,
+      total,
+      blocked,
+      occupied,
+      assigned,
+      pending,
+      allotmentHold: physicalSellable - left,
+      left,
+    };
   });
 
   /* ---------------- 7.5 订单操作面板的数据（点色块弹出，见 ForecastRoomPanel） ----------------

@@ -15,7 +15,7 @@ export type RoomTypeOption = {
   bed_type: string | null;
   max_occupancy: number | null;
   base_price: number;
-  /** 可订数：该房型 status='VC' 的房间数（服务端统计） */
+  /** 今可订数：统一库存口径算出的今日可售（物理可售与 allotment 取小，见 lib/room-stock.ts） */
   vacant_count: number;
 };
 
@@ -649,7 +649,7 @@ export default function BookingForm({
                 <th className={TH}>门市价</th>
                 <th className={TH}>首日房价</th>
                 <th className={TH}>早餐数</th>
-                <th className={TH}>可订数</th>
+                <th className={TH}>今可订</th>
                 <th className={TH}>可超数</th>
                 <th className={TH}>预订间数</th>
                 <th className={TH}>未分配间数</th>

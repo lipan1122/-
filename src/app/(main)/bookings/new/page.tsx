@@ -2,6 +2,8 @@ import Link from "next/link";
 import { all } from "@/lib/db";
 import { requireUser } from "@/lib/session";
 import { addDays, todayStr } from "@/lib/utils";
+/* 统一库存口径（房态页/远期房态/房型预测/渠道推送共用；见 src/lib/room-stock.ts） */
+import { todayRoomTypeStock } from "@/lib/room-stock";
 import BookingForm, {
   type BookingType,
   type ChannelOption,
@@ -36,16 +38,36 @@ export default async function NewBookingPage({ searchParams }: NewBookingPagePro
    */
   const errMsg = typeof sp.err === "string" ? sp.err : "";
 
-  // 房型 + 可订数（该房型 status='VC' 的房间数，由服务端算出后传给前端展示）
-  const roomTypes = all<RoomTypeOption>(
-    `SELECT rt.id, rt.code, rt.name, rt.bed_type, rt.max_occupancy, rt.base_price,
-            (SELECT COUNT(*) FROM rooms r
-              WHERE r.hotel_id = rt.hotel_id AND r.room_type_id = rt.id AND r.status = 'VC') AS vacant_count
+  /*
+   * 房型 + 可订数
+   *
+   * ⚠️ 这里原来是 `COUNT(*) FROM rooms WHERE status='VC'` —— 只算「空净房」，
+   *    **不扣已排房的预订**：一间房被预订了但还没入住，房态仍是 VC，
+   *    于是建单页显示「可订 25 间」，实际能卖的只有 20 间 → 前台按 25 卖就会超卖。
+   *
+   * 清单（第九轮第二节）要求「房态、远期房态、房型预测、渠道推送**共用一套库存算法**」，
+   * 所以这里改用 `todayRoomTypeStock()` 的今日可售：
+   *   物理可售 = 总房 − OOO − LOCK − 在住 − 已排预订
+   *   可售     = 配了 allotment ? min(物理可售, allotment) : 物理可售
+   *
+   * 说明：建单页展示的是**今日**可售（客人选的具体入住日期在本页还没有，
+   * 真正按日期校验在 `createBookingAction` 里）。标签文字已改成「今可订」，
+   * 避免让前台以为是所选日期的房量。
+   */
+  const stockRows = todayRoomTypeStock(hotelId, todayStr());
+  const stockByType = new Map(stockRows.map((r) => [Number(r.roomTypeId), r]));
+  const baseTypes = all<Omit<RoomTypeOption, "vacant_count">>(
+    `SELECT rt.id, rt.code, rt.name, rt.bed_type, rt.max_occupancy, rt.base_price
      FROM room_types rt
      WHERE rt.hotel_id = ?
      ORDER BY rt.sort, rt.id`,
     [hotelId]
   );
+  const roomTypes: RoomTypeOption[] = baseTypes.map((rt) => ({
+    ...rt,
+    /* 今日可售（统一口径）；房型在 stock 里找不到时退化为 0 而不是「全部可订」 */
+    vacant_count: stockByType.get(Number(rt.id))?.sellable ?? 0,
+  }));
 
   const channels = all<ChannelOption>(
     `SELECT id, name FROM channels WHERE hotel_id = ? ORDER BY id`,
