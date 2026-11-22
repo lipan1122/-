@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+#
+# 云栖 PMS 一键部署脚本（Ubuntu 22.04/24.04）
+#
+# 用法（在 VPS 上以有 sudo 权限的用户执行）：
+#   bash deploy-vps.sh
+#
+# 做的事：
+#   1. 装 Node.js 22 + git + 编译工具
+#   2. 拉取代码（从 GitHub 公开仓库）
+#   3. 生成 SESSION_SECRET，写 .env
+#   4. 构建 + 初始化数据库
+#   5. 装成 systemd 服务（开机自启、崩溃自动重启）
+#   6. 打印访问地址
+#
+# 幂等：重复执行会更新代码并重启服务，不会重复建库（建库只在 pms.db 不存在时执行）。
+set -euo pipefail
+
+APP_DIR="/opt/pms"
+APP_USER="${SUDO_USER:-$USER}"
+REPO="https://github.com/lipan1122/-.git"
+PORT=3100
+
+log() { printf '\n\033[1;32m==> %s\033[0m\n' "$*"; }
+warn() { printf '\033[1;33m[警告] %s\033[0m\n' "$*"; }
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "请用 sudo 执行：sudo bash deploy-vps.sh"
+  exit 1
+fi
+
+# ─────────────────────────── 1. 系统依赖 ───────────────────────────
+log "安装系统依赖"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq curl git ca-certificates build-essential python3 sqlite3 >/dev/null
+
+if ! command -v node >/dev/null 2>&1 || [ "$(node -v | tr -d 'v' | cut -d. -f1)" -lt 20 ]; then
+  log "安装 Node.js 22"
+  curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null
+  apt-get install -y -qq nodejs >/dev/null
+fi
+log "Node $(node -v) / npm $(npm -v)"
+
+# ─────────────────────────── 2. 拉代码 ───────────────────────────
+log "准备代码目录 $APP_DIR"
+mkdir -p "$APP_DIR"
+
+if [ -d "$APP_DIR/.git" ]; then
+  log "已有仓库，拉取最新代码"
+  git -C "$APP_DIR" fetch --all -q
+  git -C "$APP_DIR" reset --hard origin/main -q
+else
+  log "首次克隆"
+  git clone -q "$REPO" "$APP_DIR"
+  cd "$APP_DIR" && git checkout -q main
+fi
+cd "$APP_DIR"
+
+# ─────────────────────────── 3. 环境变量 ───────────────────────────
+log "配置环境变量"
+if [ ! -f .env ]; then
+  SECRET="$(node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))")"
+  cat > .env <<EOF
+# 由 deploy-vps.sh 生成于 $(date -Iseconds)
+NODE_ENV=production
+PORT=$PORT
+
+# 会话签名密钥（无状态 token），泄露等于会话可伪造，不要提交到仓库
+SESSION_SECRET=$SECRET
+
+# 公网部署：HTTPS 未配时先允许 HTTP，否则 Cookie 带 Secure 导致登录不生效。
+# 配好 HTTPS 后把它删掉或改成 0。
+PMS_ALLOW_HTTP=1
+
+# 演示账号「一键填入」：公网默认关闭，需要演示时改成 1
+PMS_DEMO_LOGIN=0
+
+# 自动灌演示数据（AR 账户/商品/积分/销售员）：生产必须 0
+PMS_DEMO_SEED=0
+
+# 数据库（默认就是 $APP_DIR/data/pms.db，一般不用改）
+# PMS_DB_PATH=$APP_DIR/data/pms.db
+EOF
+  chmod 600 .env
+  log "已生成 .env（SESSION_SECRET 随机 64 位）"
+else
+  log ".env 已存在，保留原配置"
+fi
+
+export NODE_ENV=production
+
+# ─────────────────────────── 4. 构建 ───────────────────────────
+log "安装依赖（约 1-2 分钟）"
+npm ci --include=dev >/dev/null 2>&1 || npm install --include=dev >/dev/null 2>&1
+
+log "构建（约 1-2 分钟，2G 内存够用；1G 会 OOM）"
+npm run build
+
+# ─────────────────────────── 5. 数据库 ───────────────────────────
+mkdir -p data
+if [ ! -f data/pms.db ]; then
+  log "首次初始化数据库（建表 + 基础配置，不含演示订单）"
+  node scripts/init-db.mjs
+else
+  log "数据库已存在，跳过初始化"
+fi
+log "执行幂等迁移"
+node scripts/migrate-all.mjs
+
+# 权限：服务以 $APP_USER 运行，data 目录要可写
+chown -R "$APP_USER":"$APP_USER" "$APP_DIR"
+
+# ─────────────────────────── 6. systemd ───────────────────────────
+log "安装 systemd 服务（开机自启 + 崩溃自动重启）"
+NODE_BIN="$(command -v node)"
+cat > /etc/systemd/system/pms.service <<EOF
+[Unit]
+Description=云栖 PMS 酒店管理系统
+After=network.target
+
+[Service]
+Type=simple
+User=$APP_USER
+WorkingDirectory=$APP_DIR
+EnvironmentFile=$APP_DIR/.env
+ExecStart=$NODE_BIN node_modules/next/dist/bin/next start -p $PORT -H 0.0.0.0
+Restart=always
+RestartSec=5
+# 2G 机器上 Node 默认堆可能过大，限制一下避免 OOM killer 直接杀掉
+Environment=NODE_OPTIONS=--max-old-space-size=1536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable pms >/dev/null 2>&1
+systemctl restart pms
+sleep 3
+
+# ─────────────────────────── 7. 结果 ───────────────────────────
+IP="$(curl -s --max-time 5 https://api.ipify.org || hostname -I | awk '{print $1}')"
+
+log "部署完成"
+systemctl --no-pager --lines=0 status pms || true
+
+cat <<EOF
+
+================================================================
+  访问地址：  http://$IP:$PORT
+  初始账号：  admin / admin123
+             （首次登录后请立刻在「设置 → 授权」改密码）
+
+  配置文件：  $APP_DIR/.env
+  数据目录：  $APP_DIR/data/pms.db
+  服务管理：
+    sudo systemctl status pms      # 看状态
+    sudo systemctl restart pms     # 重启
+    sudo journalctl -u pms -f      # 看日志
+
+  更新代码：
+    cd $APP_DIR && sudo git pull && sudo npm ci && sudo npm run build && sudo systemctl restart pms
+    （或者重新执行本脚本，它是幂等的）
+
+  防火墙：如果打不开，在云控制台「防火墙/安全组」放行 TCP $PORT
+================================================================
+
+EOF

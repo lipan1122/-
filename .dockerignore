@@ -14,6 +14,11 @@ data/*.bak-*
 *.log
 .git
 .src-backup-*
+# 同类备份目录（与 .gitignore 同步）：改功能前 cp -r src 的快照。
+# 原来只有 .src-backup-*，workbuddy / before-clean / before-bizdate 三个漏了，
+# docker build 会把三份完整旧源码（约 500 文件）打进构建上下文和镜像层。
+.src-workbuddy-*
+.src-before-*
 dsh-home.*.vercel.cli
 .env
 .env.local
