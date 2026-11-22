@@ -15,7 +15,7 @@ type ReportMeta = { label: string; desc: string };
 const REPORTS: Record<string, ReportMeta> = {
   "credit-checkin": { label: "闪住对账报表", desc: "闪住订单与渠道结算对账" },
   "sms-report": { label: "短信汇总报表", desc: "短信发送量、成功率与失败原因" },
-  "police-report": { label: "公安报表", desc: "住客身份信息上传清单" },
+  "police-report": { label: "公安上传准备清单", desc: "待上传住客身份信息汇总（需对接公安系统接口后自动上传）" },
   "recharge-sum": { label: "会员卡充值汇总表", desc: "按支付方式汇总充值金额" },
   "recharge-salesman": { label: "会员充值明细(销售员)", desc: "按销售员统计充值笔数与金额" },
   "room-biz-daily": { label: "综合营业日报-房间", desc: "逐日 × 房间的房费与间夜" },
@@ -8000,7 +8000,13 @@ const REPORT_VIEWS: Record<string, ReportComponent> = {
    * "police-report"（公安报表）尚未实现：SQL 引用了 stays.id_no（证件号在 guests 表）
    * 原来映射到真组件会 500，改指向占位说明。
    */
-  "police-report": (props: ReportProps) => <ReportNotReady {...props} title="公安报表" why="SQL 引用了 stays.id_no（证件号在 guests 表）" />,
+  "police-report": (props: ReportProps) => (
+    <ReportNotReady
+      {...props}
+      title="公安上传准备清单"
+      why="当前为占位。真实的公安上传需要读卡器 + 公安部接口 + 回执确认，本项目未对接，所以不谎称「已实现」。待上传数据本身可以从 guests 表取（证件号在 guests.id_no，不在 stays）。"
+    />
+  ),
   /*
    * "recharge-sum"（充值汇总报表）尚未实现：SQL 引用了不存在的 biz_type 列
    * 原来映射到真组件会 500，改指向占位说明。

@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { all, get, run, tx } from "@/lib/db";
-import { requireUser } from "@/lib/session";
+import { requirePermission, requireUser } from "@/lib/session";
 import { addDays, nightsBetween, nowIso, todayStr } from "@/lib/utils";
 import { nextBookingNo } from "@/lib/channels/booking-no";
 import { DEMO_SEED_DISABLED_MESSAGE, demoSeedEnabled } from "@/lib/channels/demo-mode";
@@ -10,6 +10,26 @@ import { pushOrderStatusForChannelOrder } from "@/lib/channels/order-status";
 import { markStockDirty } from "@/lib/channels/stock-trigger";
 import type { ChannelOrderStatus } from "@/lib/channels/types";
 
+/*
+ * ══════════════════════════════════════════════════════════════════════════
+ * 动作层权限（整改清单 P0-1「渠道订单权限越权」）
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * 问题：本文件原来的所有业务动作只调 `requireUser()`（只校验「登录了」），
+ *   前台 / 收银 / 客房账号直接构造请求就能：
+ *     · 转入预订 —— 建订单、占房量（影响渠道库存与对账）
+ *     · 回传渠道状态 —— 真调上游 OTA 接口（对外发生副作用）
+ *   而 src/lib/session.ts 的 PERMISSIONS 表里 `channel.sync` 只给 admin。
+ *
+ * 现在的守卫：
+ *   importChannelOrderAction      requireUser() → requirePermission("channel.sync")
+ *   pushChannelOrderStatusAction  requireUser() → requirePermission("channel.sync")
+ *   seedChannelOrdersAction       保持 requireUser()（理由见该函数注释）
+ *
+ * 权限断言放在函数体最前面（早于任何读上下文 / 写库），
+ * 无权限直接抛 FORBIDDEN，连订单是否存在都不探测，避免被当成枚举探针。
+ * admin 在 hasPermission() 里短路放行，管理员不受影响。
+ */
 /* --------------------------------------------------------------- 类型 */
 
 type RoomTypeRow = { id: number; code: string; name: string; base_price: number };
@@ -137,6 +157,16 @@ function revalidateChannelOrderPaths() {
  * 默认直接返回并留一条同步日志 —— 不静默、不写库、不污染生产数据。
  * 判断放在函数**第一行**（在 requireUser 之前）：连会话都不需要，
  * 就不可能因为「忘记登录态校验」等原因绕过开关。
+ *
+ * ── 为什么这个动作**不**加 requirePermission("channel.sync")（P0-1 的处理）──
+ * 它是「生成演示假数据」的开关型演示功能，不是渠道业务能力：
+ *   · 真正的闸门是 PMS_DEMO_SEED 门禁（默认关闭，上面已说明），
+ *     比给它挂一个业务权限点更严格 —— 有权限的 admin 默认也点不动；
+ *   · 如果给它挂 channel.sync，会让人误以为「渠道同步的权限能生成假数据」，
+ *     权限语义反而不清楚；
+ *   · 门禁打开时仍要求登录会话（requireUser）拿到真实 hotel_id，
+ *     保证多租户隔离，不会往别家酒店写数据。
+ * 结论：保持 requireUser() + 门禁，不放宽、也不假装它是业务动作。
  */
 export async function seedChannelOrdersAction(formData: FormData) {
   if (!demoSeedEnabled()) {
@@ -265,9 +295,12 @@ export async function seedChannelOrdersAction(formData: FormData) {
  * 渠道订单转入预订：写入 bookings（来源渠道、渠道单号、预付方式随单带过去），
  * 并把订单状态置为 IMPORTED（页面显示「已入住」）。
  * 已取消 / 已转入的订单不允许重复转入。
+ *
+ * 权限（P0-1）：转入预订会建订单、占房量、影响渠道库存与对账 → 仅 channel.sync（admin）。
+ * 权限断言必须在最前面：无权限连订单是否存在都不探测。
  */
 export async function importChannelOrderAction(formData: FormData) {
-  const user = await requireUser();
+  const user = await requirePermission("channel.sync");
   const hotelId = user.hotelId;
 
   const orderId = Number(formData.get("orderId"));
@@ -386,9 +419,11 @@ export async function importChannelOrderAction(formData: FormData) {
  *   没有这个入口时，运维唯一的办法是手工改数据库。
  *
  * 表单字段：orderId（必填）、status（CHECKED_IN / CHECKED_OUT / NOSHOW / CANCELLED / CONFIRMED）
+ *
+ * 权限（P0-1）：回传会真调上游 OTA 接口（对外发生副作用）→ 仅 channel.sync（admin）。
  */
 export async function pushChannelOrderStatusAction(formData: FormData) {
-  const user = await requireUser();
+  const user = await requirePermission("channel.sync");
   const hotelId = user.hotelId;
   const orderId = Number(formData.get("orderId"));
   const statusRaw = String(formData.get("status") ?? "").trim();

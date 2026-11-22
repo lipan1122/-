@@ -4,6 +4,8 @@ import { all, get } from "@/lib/db";
 import { requireUser } from "@/lib/session";
 import { fmtMoney } from "@/lib/utils";
 import { consumeWalletAction, rechargeWalletAction, refundWalletAction } from "./actions";
+/* 第 5 轮 P2-1：退款加二次确认（预设金额改成只填值，不再点一下就退钱） */
+import RefundForm from "./RefundForm";
 
 export const dynamic = "force-dynamic";
 
@@ -274,34 +276,19 @@ export default async function MemberWalletPage({ searchParams }: { searchParams:
             <button className="btn-danger mt-1">确认扣款</button>
           </form>
 
-          {/* 退款 */}
-          <form action={refundWalletAction} className="card flex flex-col gap-2.5 p-4">
-            <input type="hidden" name="guest_id" value={selected.id} />
-            <div className="text-[13px] font-semibold text-gray-800">退款退回</div>
-            <div>
-              <label className="label">金额（元）</label>
-              <input name="amount" type="number" min="0.01" step="0.01" className="input" placeholder="输入退款金额" />
-              <div className="mt-1.5 flex flex-wrap gap-1.5">
-                {PRESETS.map((v) => (
-                  <button
-                    key={v}
-                    type="submit"
-                    name="preset"
-                    value={String(v)}
-                    className="btn-default px-2 py-0.5 text-[11px]"
-                  >
-                    {v}
-                  </button>
-                ))}
-              </div>
-            </div>
-            <div>
-              <label className="label">备注</label>
-              <input name="note" className="input" placeholder="可空，如：订单取消退回" />
-            </div>
-            <div className="text-[11px] text-gray-400">退款金额退回会员储值账户，余额相应增加</div>
-            <button className="btn-default mt-1">确认退款</button>
-          </form>
+          {/*
+            退款：换成客户端组件 RefundForm
+            原因（codex 第 5 轮清单 P2-1）：
+              · 原来没有任何二次确认，点「确认退款」直接退钱
+              · 预设金额按钮是 type="submit"，点 100/500 就直接提交退款
+            现在预设只填值，提交走 ConfirmForm（显示会员姓名+金额+退款后余额+原因必填）。
+          */}
+          <RefundForm
+            guestId={selected.id}
+            guestName={selected.name}
+            balance={selectedBalance}
+            action={refundWalletAction}
+          />
         </div>
       )}
 

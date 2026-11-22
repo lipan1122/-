@@ -4,6 +4,8 @@ import { requireUser } from "@/lib/session";
 import { fmtMoney } from "@/lib/utils";
 import { round2 } from "@/lib/folio";
 import { bizToday } from "@/lib/biz-date";
+/* 第 5 轮 P1-2：出租率口径唯一来源（可售房量 = 总房量 − 维修房 OOO − 锁房 LOCK） */
+import { occupancyOfDay } from "@/lib/metrics";
 import { runNightAuditAction, undoNightAuditAction } from "./actions";
 import { nightAuditPreflight } from "./preflight";
 
@@ -233,8 +235,33 @@ export default async function NightAuditPage() {
     pending_amount: Number(pendingRow.amount ?? 0),
   };
 
-  /** 实时出租率：出租间夜 / 总房量（房间数口径，分母不扣维修房） */
-  const liveOccupancy = totalRooms > 0 ? overnight / totalRooms : 0;
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   * 实时出租率（整改清单 P1-2「夜审口径不一致」）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * 问题：night-audit/actions.ts 第 4 轮 P1-5 已把**写入** night_audits 的出租率
+   *   改成「出租间夜 / 可售房量」（扣 OOO / LOCK），但本页实时预估还是
+   *   `overnight / 总房量` —— 于是同一营业日在夜审前显示一个数、
+   *   点完「执行夜审」后变成另一个数，店员会以为夜审把出租率改坏了。
+   *
+   * 统一口径（src/lib/metrics.ts，与工作台 / 报表 / 夜审写入完全同一份）：
+   *   分子 出租间夜 = 过夜在住房间数（stays 里 nights > 0 且不是钟点房）
+   *   分母 可售房量 = 总房量 − 维修房(OOO) − 锁房(LOCK)
+   *   出租率 OCC   = 出租间夜 / 可售房量
+   *
+   * 为什么分子仍用下面这条 overnight 查询、而不是直接用 metrics 的 roomNights：
+   *   metrics 的 roomNights 是**区间口径**（会把 CHECKED_OUT 单落在区间内的晚数累加），
+   *   夜审写入的值是「今晚在住的房间数」。两者在正常数据下相等，但要保证
+   *   「夜审前页面预估 == 夜审后写入值」逐位相同，分子必须与 actions.ts 的
+   *   SQL_ROOM_NIGHTS 完全一致（就是下面这条 overnight 查询，一字不差）。
+   *   分母则由 metrics 提供 —— 它正是 actions.ts 里那条 SUM(CASE status IN ('OOO','LOCK') ...)。
+   */
+  const dayMetrics = occupancyOfDay(hotelId, today);
+  const sellableRooms = dayMetrics.sellableRooms;
+  const blockedRooms = Math.max(0, totalRooms - sellableRooms);
+  /** 实时出租率：出租间夜 / 可售房量（分母扣维修房 OOO 与锁房 LOCK，与夜审写入同口径） */
+  const liveOccupancy = sellableRooms > 0 ? overnight / sellableRooms : 0;
 
   const history = all<AuditRow>(
     `SELECT biz_date, status, rooms_sold, hourly_rooms, revenue, occupancy,
@@ -283,7 +310,9 @@ export default async function NightAuditPage() {
       label: "在住房间",
       value: String(stats.inhouse),
       unit: "间",
-      sub: `共 ${stats.total_rooms} 间 · 出租率 ${fmtPct(liveOccupancy)}（过夜 ${stats.overnight} 间，钟点 ${stats.hourly} 间不计间夜）`,
+      sub: `共 ${stats.total_rooms} 间 · 可售 ${sellableRooms} 间${
+        blockedRooms > 0 ? `（维修/锁房 ${blockedRooms} 间不计）` : ""
+      } · 出租率 ${fmtPct(liveOccupancy)}（过夜 ${stats.overnight} 间，钟点 ${stats.hourly} 间不计间夜）`,
       tone: "bg-blue-50 text-blue-600",
     },
     {
@@ -406,7 +435,9 @@ export default async function NightAuditPage() {
           <span>
             钟点房 <b className="tabular-nums text-gray-800">{stats.hourly}</b> 间（不计间夜）
           </span>
-          <span>
+          <span
+            title={`出租率 = 出租间夜 ${stats.overnight} / 可售房量 ${sellableRooms}（总房量 ${stats.total_rooms} − 维修/锁房 ${blockedRooms}），与夜审写入 night_audits 的口径一致`}
+          >
             出租率 <b className="tabular-nums text-gray-800">{fmtPct(liveOccupancy)}</b>
           </span>
           <span>
@@ -491,7 +522,8 @@ export default async function NightAuditPage() {
             <p className="mt-1 text-[12px] leading-relaxed text-gray-500">
               夜审会把今日房费过账到每间在住房间：为尚无「房费 {today}」明细的在住账务单补录一条房费，随后重算账务单合计与应收余额，
               并把「到店日已过但仍未入住」的预订单标记为<span className="text-gray-700">未到店（NOSHOW）</span>，
-              最后按「出租间夜（不含钟点房）+ 房费/餐饮/其他 + 退款冲减」生成当日营业日报。同一营业日只允许执行一次。
+              最后按「出租间夜（不含钟点房）/ 可售房量（总房量扣维修房与锁房）+ 房费/餐饮/其他 + 退款冲减」生成当日营业日报，
+              出租率口径与本页实时预估完全一致（夜审前看到的就是写入后的值）。同一营业日只允许执行一次。
             </p>
             {todayAudit && (
               <p className="mt-2 rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[12px] text-emerald-700">
@@ -590,7 +622,14 @@ export default async function NightAuditPage() {
                     >
                       {legacy ? fmtMoney(a.revenue) : fmtSigned(split.net)}
                     </td>
-                    <td className="td tabular-nums" title="出租率 = 出租间夜 / 总房量（房间数口径）">
+                    <td
+                      className="td tabular-nums"
+                      title={
+                        legacy
+                          ? "历史行：旧口径「出租间夜 / 总房量」（分母含维修房与锁房），无法反推当时的维修房数，未重算"
+                          : "出租率 = 出租间夜 / 可售房量（可售房量 = 总房量 − 维修房 OOO − 锁房 LOCK），与上方实时预估同口径"
+                      }
+                    >
                       {fmtPct(a.occupancy)}
                     </td>
                     <td className="td text-gray-600">{a.operator ?? "—"}</td>

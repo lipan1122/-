@@ -373,6 +373,7 @@ function FormPanel({
   state,
   onSubmit,
   onClose,
+  confirmText,
   children,
 }: {
   title: string;
@@ -382,10 +383,37 @@ function FormPanel({
   state: FormState;
   onSubmit: (formData: FormData) => void | Promise<void>;
   onClose: () => void;
+  /*
+   * 二次确认文案（第 5 轮 P2-1）
+   *
+   * 退款 / 撤销退房这类**不可逆的资金操作**，点一下提交就真的执行了。
+   * 传了这个 prop 后，第一次点提交只弹确认（把表单内容摘要展示一遍），
+   * 第二次点才真正提交 —— 用两层 state 实现，不需要 portal 弹窗。
+   *
+   * 不传就保持原行为（普通表单直接提交）。
+   */
+  confirmText?: React.ReactNode;
   children: React.ReactNode;
 }) {
+  const [confirming, setConfirming] = useState(false);
+
+  /* 没传 confirmText → 原来的直接提交 */
+  const needConfirm = Boolean(confirmText);
+
   return (
-    <form action={onSubmit} className="space-y-2 rounded border border-[#eee] bg-[#fafcfa] p-3">
+    <form
+      action={onSubmit}
+      onSubmit={(e) => {
+        if (!needConfirm) return;
+        if (!confirming) {
+          /* 第一次点：拦下来，展示确认区 */
+          e.preventDefault();
+          setConfirming(true);
+        }
+        /* confirming=true 时放行，真正提交 */
+      }}
+      className="space-y-2 rounded border border-[#eee] bg-[#fafcfa] p-3"
+    >
       <div className="flex items-center justify-between gap-2">
         <span className="text-[12px] font-medium text-[#333]">{title}</span>
         <div className="flex items-center gap-3 text-[11px] text-[#999]">
@@ -406,8 +434,25 @@ function FormPanel({
           {state.ok}
         </div>
       )}
-      <button type="submit" disabled={pending} className={BTN_GREEN + " w-full"}>
-        {pending ? "处理中…" : submitLabel}
+
+      {/* 确认区：只在第一次点提交后出现 */}
+      {needConfirm && confirming && (
+        <div className="rounded border border-rose-300 bg-rose-50 px-2.5 py-2 text-[11.5px] leading-relaxed text-rose-800">
+          <div className="mb-1 font-medium">请确认这项操作</div>
+          <div>{confirmText}</div>
+          <div className="mt-1 text-[11px] text-rose-600">此操作不可撤销，再点一次下面的按钮才会执行。</div>
+        </div>
+      )}
+
+      <button
+        type="submit"
+        disabled={pending}
+        className={
+          (needConfirm && confirming ? "rounded bg-rose-600 px-3 py-1.5 text-white hover:bg-rose-700 " : BTN_GREEN) +
+          " w-full"
+        }
+      >
+        {pending ? "处理中…" : needConfirm && confirming ? `确认${submitLabel}` : submitLabel}
       </button>
     </form>
   );
@@ -1882,10 +1927,16 @@ export default function CashierPanel({
               账单 {folio.folioNo} · 已收 <b className="tabular-nums">{fmtMoney(folio.paidAmount)}</b>
             </>
           }
-          submitLabel={refundPending ? "退款中…" : "确认退款"}
+          submitLabel={refundPending ? "退款中…" : "退款"}
           pending={refundPending}
           state={refundState}
           onSubmit={refundFormAction}
+          confirmText={
+            <>
+              将从账单 <b>{folio.folioNo}</b> 退款，款项原路退回客人。
+              退完后余额会重新计算，流水留痕。
+            </>
+          }
           onClose={close}
         >
           <div>

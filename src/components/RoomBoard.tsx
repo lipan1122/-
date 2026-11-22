@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useFormStatus } from "react-dom";
+import ConfirmForm from "@/components/ConfirmForm";
 import {
   addCompanionAction,
   addDepositAction,
@@ -28,6 +29,7 @@ import {
   toHourlyAction,
   updateCheckoutAction,
 } from "@/app/(main)/rooms/actions";
+import { ROOM_TAGS, matchesRoomTag, type RoomTagKey } from "@/lib/room-tags";
 import { ROOM_STATUS, fmtMoney, todayStr } from "@/lib/utils";
 
 export type RoomRow = {
@@ -64,6 +66,20 @@ export type RoomRow = {
   consume_amount?: number | null;
   paid_amount?: number | null;
   link_rooms?: string | null;
+  /** 渠道订单号（stays.channel_order_no），渠道直连单才有值 */
+  channel_order_no?: string | null;
+  /**
+   * 快捷标签判定字段（第 5 轮 P1-4）
+   *
+   * 由 rooms/page.tsx 按 `@/lib/room-tags` 的 ROOM_TAG_FIELD_SQL 算好，
+   * 客户端点击标签时用 matchesRoomTag 过滤，与左侧数量同口径。
+   */
+  link_room_count?: number | null;
+  guest_vip_level?: number | null;
+  guest_id_no?: string | null;
+  guest_stay_count?: number | null;
+  hk_pending?: number | null;
+  pending_cancel_count?: number | null;
   /** 门锁通讯信号：GOOD / BAD / LOW */
   lock_signal: string | null;
   /** 门锁电量百分比 */
@@ -87,12 +103,32 @@ export type ArrivalRow = {
   arrival_time?: string | null;
 };
 
-/** 左侧「联房 / 团队 / 常用标签」统计，全部由服务端 SQL 汇总后传入 */
-export type TagStats = {
-  linked: number;
-  team: number;
-  hourly: number;
-  owed: number;
+/**
+ * 12 个快捷标签的房间数（第 5 轮 P1-4）
+ *
+ * 全部由服务端 SQL 汇总后传入（rooms/page.tsx），前端不写死；
+ * 缺字段的标签（自用 / 打扫中）恒为 0，界面灰显。
+ */
+export type TagStats = Record<RoomTagKey, number>;
+
+/**
+ * 当日经营指标（第 5 轮 P1-1）
+ *
+ * 出租率的分子分母都由 `src/lib/metrics.ts` 算好再传下来：
+ * 那个模块 import 了 `@/lib/db`，属于服务端模块，客户端组件不能直接引用，
+ * 所以房态页（服务端组件）算完通过 props 传 —— 客户端只渲染，不自己算分母。
+ */
+export type DayMetrics = {
+  /** 总房量（含维修房 / 锁房） */
+  totalRooms: number;
+  /** 可售房量 = 总房量 − 维修房(OOO) − 锁房(LOCK) */
+  sellableRooms: number;
+  /** 出租间夜（不含钟点房） */
+  roomNights: number;
+  /** 已售房量 = 出租间夜 / 统计天数（单日等于出租间夜） */
+  roomsSold: number;
+  /** 出租率 0-1 */
+  occupancy: number;
 };
 
 type Props = {
@@ -102,6 +138,8 @@ type Props = {
   roomTypes: { id: number; name: string; count: number }[];
   channels: { name: string; count: number }[];
   tagStats: TagStats;
+  /** 当日经营指标（出租率口径统一走 metrics.ts） */
+  dayMetrics?: DayMetrics;
   initialStatus?: string;
   /** 底部功能条四个角标的真实计数（去呼呼这里也是实时数） */
   badgeCounts?: { orders: number; tasks: number; shop: number; alerts: number };
@@ -128,8 +166,6 @@ export type PendingBookingRow = {
   check_out_date: string;
   room_count: number | null;
 };
-
-type CommonTag = "hourly" | "linked" | "owed";
 
 /** 订单操作类 server action 的返回结构（与 rooms/actions.ts 保持一致） */
 type ActionResult = { error?: string; ok?: string } | undefined;
@@ -204,11 +240,13 @@ function loadBoardConfig(): BoardConfig {
   }
 }
 
-const COMMON_TAGS: { key: CommonTag; label: string }[] = [
-  { key: "hourly", label: "钟点" },
-  { key: "linked", label: "联房" },
-];
-
+/*
+ * 快捷标签定义（第 5 轮 P1-4）
+ *
+ * 12 个标签的 key / 文案 / 判定说明 / 是否可用统一放在 `@/lib/room-tags`，
+ * 服务端统计与客户端筛选共用同一份定义，避免两边各写一套。
+ * 缺字段的两个标签（自用 / 打扫中）在该文件里 available=false，界面灰显。
+ */
 const FLOOR_NAMES = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"];
 
 function floorLabel(floor: number) {
@@ -226,6 +264,19 @@ function daysToCheckout(expect: string | null) {
 /** 钟点房：晚数为 0 或价码标记为钟点 */
 function isHourlyRoom(room: RoomRow) {
   return room.nights === 0 || room.rate_code === "钟点";
+}
+
+/**
+ * 房态卡片用的紧凑金额（第 5 轮 P2-2）
+ *
+ * 卡片只有 160px 宽，fmtMoney 的「¥1,234.00」带两位小数太长会被裁，
+ * 这里去掉无意义的 .00、保留千分位；有小数才显示小数（12.5）。
+ * 只是展示用，正式账单金额一律走 fmtMoney，未经手任何计算。
+ */
+function fmtMoneyShort(n: number | null | undefined) {
+  const v = Math.round(Number(n ?? 0) * 100) / 100;
+  const s = Number.isInteger(v) ? String(v) : v.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+  return s.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
 /** 手机号脱敏：138****0001 */
@@ -279,6 +330,7 @@ export default function RoomBoard({
   roomTypes,
   channels,
   tagStats,
+  dayMetrics,
   initialStatus,
   badgeCounts,
   badgeList,
@@ -302,7 +354,10 @@ export default function RoomBoard({
   const [linkedOnly, setLinkedOnly] = useState(false);
   const [teamFilter, setTeamFilter] = useState("");
   const router = useRouter();
-  const [tagFilter, setTagFilter] = useState<CommonTag | null>(null);
+  /** 快捷标签筛选（第 5 轮 P1-4）：12 个标签单选，再点一次或点「清除」取消 */
+  const [tagFilter, setTagFilter] = useState<RoomTagKey | null>(null);
+  /** 身份证设备说明面板（第 5 轮 P1-3）：设备未配置，点按钮出说明 + 配置入口，不再假装能刷证 */
+  const [idDeviceOpen, setIdDeviceOpen] = useState(false);
   /** 房态设置弹窗（去呼呼是弹窗，不是跳页） */
   const [settingsOpen, setSettingsOpen] = useState(false);
   /** 悬停面板里的二级操作弹窗（去呼呼点续住/换房等会弹表单） */
@@ -320,9 +375,7 @@ export default function RoomBoard({
     } catch {}
   };
   const [showAllTypes, setShowAllTypes] = useState(false);
-  const [toast, setToast] = useState("");
   const [notice, setNotice] = useState<Notice | null>(null);
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** 房间卡片悬浮层：进入 300ms 后出现，离开 200ms 后消失 */
   const [hoverCard, setHoverCard] = useState<HoverCard | null>(null);
@@ -348,13 +401,6 @@ export default function RoomBoard({
     if (hoverOutTimer.current) clearTimeout(hoverOutTimer.current);
     hoverOutTimer.current = setTimeout(() => setHoverCard(null), 400);
   };
-
-  const showToast = (msg: string) => {
-    setToast(msg);
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(""), 2200);
-  };
-  const police = () => showToast("需对接公安系统");
 
   /** 订单操作结果：页面顶部一条提示（成功 / 失败都可见） */
   const showNotice = (kind: Notice["kind"], text: string) => {
@@ -394,8 +440,21 @@ export default function RoomBoard({
 
   const stats: Record<string, number> = { VC: 0, VD: 0, OC: 0, OD: 0, OOO: 0, LOCK: 0 };
   for (const r of rooms) stats[r.status] = (stats[r.status] ?? 0) + 1;
+  /** 当前占房数：实时房态口径（在住 = OC + OD，含钟点房） */
   const occupied = stats.OC + stats.OD;
-  const occupancy = rooms.length ? ((occupied / rooms.length) * 100).toFixed(2) : "0";
+
+  /*
+   * —— 出租率（第 5 轮 P1-1）——
+   *
+   * 旧代码：occupied / rooms.length —— 分母包含维修房(OOO) 和锁房(LOCK)。
+   * 那些房根本卖不出去，算进分母会把出租率算低，和工作台 / 报表 / 夜审的数字打架。
+   *
+   * 现在分母 = 可售房量（总房量 − OOO − LOCK），口径由 src/lib/metrics.ts 统一。
+   * 注意：metrics.ts 导入了 @/lib/db，是服务端模块，客户端组件不能直接 import，
+   * 所以由 rooms/page.tsx（服务端组件）用 occupancyOfDay() 算好，经 dayMetrics 传入。
+   */
+  const occupancy = dayMetrics ? (dayMetrics.occupancy * 100).toFixed(2) : "0.00";
+  const sellableRooms = dayMetrics?.sellableRooms ?? 0;
 
   let filtered = rooms;
   // 房态：多选取并集
@@ -411,9 +470,11 @@ export default function RoomBoard({
   if (linkedOnly) filtered = filtered.filter((r) => r.link_count > 1);
   // 团队：按 stays.team_name 精确过滤
   if (teamFilter) filtered = filtered.filter((r) => r.team_name === teamFilter);
-  if (tagFilter === "hourly") filtered = filtered.filter(isHourlyRoom);
-  else if (tagFilter === "linked") filtered = filtered.filter((r) => r.link_count > 1);
-  else if (tagFilter === "owed") filtered = filtered.filter((r) => (r.balance ?? 0) > 0.01);
+  /*
+   * 快捷标签（第 5 轮 P1-4）：判定条件与左侧数量的 SQL 同源（@/lib/room-tags），
+   * 所以点标签筛出来的间数必然等于标签上的数字。
+   */
+  if (tagFilter) filtered = filtered.filter((r) => matchesRoomTag(tagFilter, r));
   // 快速查询：姓名（包含匹配）/ 房号（前缀匹配）
   if (guestQuery) filtered = filtered.filter((r) => (r.guest_name ?? "").includes(guestQuery));
   if (roomQuery) filtered = filtered.filter((r) => r.room_no.startsWith(roomQuery));
@@ -473,8 +534,10 @@ export default function RoomBoard({
     setTagFilter(null);
   };
 
-  const tagCount = (key: CommonTag) =>
-    key === "hourly" ? tagStats.hourly : key === "linked" ? tagStats.linked : tagStats.owed;
+  /*
+   * 标签数量一律取服务端统计（tagStats），前端不写死；
+   * 缺字段的标签（自用 / 打扫中）定义里 available=false，数量恒为 0。
+   */
 
   return (
     <div className="relative flex h-full min-h-0">
@@ -512,12 +575,24 @@ export default function RoomBoard({
             </button>
           </div>
 
+          {/*
+           * 身份证（第 5 轮 P1-3）
+           *
+           * 原来这个按钮叫「刷身份证查询」，点了只弹一句 toast「需对接公安系统」——
+           * 看起来能用、实际什么都没做，是假可用按钮。
+           * 本机既没有读卡器也没有公安上传接口，就不装成能用的样子：
+           * 按钮文案直接写「身份证设备未配置」，样式降级为虚线灰底，
+           * 点开说明面板并给两条真实可走的路径（去配置 / 手工核验）。
+           * 等设备接好、配置写进 settings 后，再把这里换成真正的刷证调用。
+           */}
           <button
             type="button"
-            onClick={police}
-            className="mb-1 h-7 w-full rounded-[2px] bg-[#32c141] text-[12px] text-white hover:bg-[#2cb03b]"
+            onClick={() => setIdDeviceOpen(true)}
+            title="未接入身份证读卡器与公安上传接口，点击查看配置说明"
+            className="mb-1 flex h-7 w-full items-center justify-center gap-1 rounded-[2px] border border-dashed border-[#d9d9d9] bg-[#fafafa] text-[12px] text-[#999] hover:border-[#32c141] hover:text-[#2a9d5c]"
           >
-            刷身份证查询
+            <span aria-hidden>⚠</span>
+            身份证设备未配置
           </button>
 
           {/* 房间号 + 查询 */}
@@ -707,22 +782,51 @@ export default function RoomBoard({
 
         {/* 渠道筛选：已改为房态板顶部的横排复选框（见右侧栏顶部） */}
 
-        {/* 常用标签（单选） */}
+        {/* 常用标签（第 5 轮 P1-4：12 个标签 / 数量服务端统计 / 点击筛选 / 清除筛选） */}
         <div className="px-2 py-1.5">
           <div className="mb-1 flex items-center gap-1">
             <i className="h-[11px] w-[2px] shrink-0 bg-[#32c141]" />
             <span className="text-[13px] font-bold text-[#333]">
               常用标签<span className="font-normal text-[#999]">(单选)</span>
             </span>
+            {tagFilter && (
+              <button
+                type="button"
+                onClick={() => setTagFilter(null)}
+                className="ml-auto text-[11px] text-[#32c141] hover:underline"
+              >
+                清除筛选
+              </button>
+            )}
           </div>
-          <div className="flex items-center gap-2">
-            {COMMON_TAGS.map((t) => {
+          <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
+            {ROOM_TAGS.map((t) => {
               const active = tagFilter === t.key;
+              const count = tagStats[t.key] ?? 0;
+              /*
+               * 缺字段的标签（自用 / 打扫中）：灰显 + 不可点击，
+               * title 里写明缺哪张表的哪个字段，避免「点了没反应」这种假功能。
+               */
+              if (!t.available) {
+                return (
+                  <button
+                    key={t.key}
+                    type="button"
+                    disabled
+                    title={`${t.label}：${t.missing ?? "数据来源未接入"}`}
+                    className="flex h-[20px] cursor-not-allowed items-center gap-1 rounded-[2px] border border-dashed border-[#e8e8e8] px-1.5 text-[12px] text-[#c4c4c4]"
+                  >
+                    <span>{t.label}</span>
+                    <span className="tabular-nums">—</span>
+                  </button>
+                );
+              }
               return (
                 <button
                   key={t.key}
                   type="button"
                   onClick={() => setTagFilter(active ? null : t.key)}
+                  title={`${t.hint}（当前 ${count} 间）`}
                   className={`flex h-[20px] items-center gap-1 rounded-[2px] border px-1.5 text-[12px] ${
                     active
                       ? "border-[#32c141] bg-[#e6f6e8] text-[#2a8f37]"
@@ -730,8 +834,10 @@ export default function RoomBoard({
                   }`}
                 >
                   <span>{t.label}</span>
-                  <span className={`tabular-nums ${active ? "text-[#32c141]" : "text-[#c4c4c4]"}`}>
-                    {tagCount(t.key)}
+                  <span
+                    className={`tabular-nums ${active ? "text-[#32c141]" : count > 0 ? "text-[#a8a8a8]" : "text-[#d5d5d5]"}`}
+                  >
+                    {count}
                   </span>
                 </button>
               );
@@ -960,11 +1066,22 @@ export default function RoomBoard({
           )}
 
           <div className="ml-auto flex shrink-0 items-center gap-1.5 whitespace-nowrap pl-3 text-[12px] text-[#8a8a8a]">
-            <span>
+            <span title="实时房态口径：在住房间数（住净 + 住脏，含钟点房）">
               当前占房数：<b className="font-semibold text-[#333]">{occupied}</b>
             </span>
             <span className="text-[#d5d5d5]">·</span>
-            <span>
+            <span
+              className="cursor-help underline decoration-dotted decoration-[#d5d5d5] underline-offset-2"
+              title={
+                /*
+                 * 第 5 轮 P1-1：把分母写进 tooltip，前台点开就知道这个数怎么来的，
+                 * 不用再去猜「为什么不是总房量」。
+                 */
+                `出租率 = 已售房量 ${dayMetrics?.roomsSold ?? 0} / 可售房量 ${sellableRooms}` +
+                `（总房量 ${dayMetrics?.totalRooms ?? rooms.length}，已扣除维修房与锁房；` +
+                `钟点房按间夜口径不计入出租间夜）`
+              }
+            >
               预计出租率：<b className="font-semibold text-[#333]">{occupancy}%</b>
             </span>
             <span className="text-[#d5d5d5]">·</span>
@@ -1212,6 +1329,13 @@ export default function RoomBoard({
                     <div>团队：<span className="text-[#333]">{hoverRoom.team_name?.trim() || "无"}</span></div>
                     <div>会员卡：<span className="text-[#333]">{hoverRoom.member_card?.trim() || "无"}</span></div>
                     <div>支付方式：<span className="text-[#333]">{hoverRoom.pay_type ?? "-"}</span></div>
+                    {/* 第 5 轮 P2-2：渠道订单号（stays.channel_order_no），直连单才有值 */}
+                    <div className="col-span-2">
+                      渠道单号：
+                      <span className="tabular-nums text-[#333]">
+                        {hoverRoom.channel_order_no?.trim() || "无（非直连单）"}
+                      </span>
+                    </div>
                   </div>
                 </div>
               )}
@@ -1366,6 +1490,69 @@ export default function RoomBoard({
         </div>
       )}
 
+      {/*
+       * 身份证设备说明面板（第 5 轮 P1-3）
+       *
+       * 设备没接、公安上传接口没配，就把话说清楚，并给出两个真能走的方向：
+       *   · /settings?tab=advanced「高级设置」—— 登记读卡器与接口参数
+       *   · /id-verify「人证核验」—— 现在就能用的手工核验（校验校验码 + 比对客史）
+       * 不再用一个点了只弹 toast 的绿色按钮糊弄人。
+       */}
+      {idDeviceOpen && (
+        <div
+          className="fixed inset-0 z-[90] flex items-center justify-center bg-black/25 p-4"
+          onClick={() => setIdDeviceOpen(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="身份证设备未配置"
+            className="w-[440px] max-w-full overflow-hidden rounded-[3px] bg-white shadow-[0_12px_36px_rgba(0,0,0,0.25)]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-[#f0f0f0] px-3 py-2">
+              <span className="text-[13px] font-semibold text-[#222]">身份证设备未配置</span>
+              <button
+                type="button"
+                onClick={() => setIdDeviceOpen(false)}
+                aria-label="关闭身份证设备说明"
+                className="text-[16px] leading-none text-[#999] hover:text-[#e53935]"
+              >
+                ×
+              </button>
+            </div>
+            <div className="space-y-2 px-3 py-3 text-[12px] leading-[19px] text-[#555]">
+              <p>本机还没有接入身份证读卡器与公安上传接口，暂时不能直接「刷身份证」。</p>
+              <ol className="list-decimal space-y-0.5 pl-4 text-[11.5px] text-[#666]">
+                <li>在「高级设置」里登记读卡器型号与端口；</li>
+                <li>填写公安上传接口地址、商户编号与密钥；</li>
+                <li>保存后回到房态页，这里会变成可用的刷证查询。</li>
+              </ol>
+              <p className="text-[11.5px] text-[#999]">
+                急着核验证件时，可以到「人证核验」页手工录入姓名与身份证号：
+                那边会校验校验码、解析出生日期与性别，并比对客史档案。
+              </p>
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-[#f0f0f0] bg-[#fafafa] px-3 py-2">
+              <Link
+                prefetch={false}
+                href="/id-verify"
+                className="rounded-[2px] border border-[#dcdcdc] bg-white px-2.5 py-[5px] text-[12px] text-[#555] hover:border-[#32c141] hover:text-[#2a9d5c]"
+              >
+                手工核验身份证 ›
+              </Link>
+              <Link
+                prefetch={false}
+                href="/settings?tab=advanced"
+                className="rounded-[2px] bg-[#32c141] px-2.5 py-[5px] text-[12px] text-white hover:bg-[#2bb038]"
+              >
+                去配置 ›
+              </Link>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 页面顶部操作结果提示：订单操作提交后的成功 / 失败反馈 */}
       {notice && (
         <div
@@ -1378,11 +1565,6 @@ export default function RoomBoard({
         </div>
       )}
 
-      {toast && (
-        <div className="pointer-events-none fixed bottom-14 left-1/2 z-50 -translate-x-1/2 rounded bg-gray-900/90 px-3 py-2 text-[12px] text-white shadow-lg">
-          {toast}
-        </div>
-      )}
     </div>
   );
 }
@@ -1474,6 +1656,10 @@ function RoomCard({
               {room.mobile && (
                 <span className="ml-0.5 text-[12px] opacity-80">~{String(room.mobile).slice(-3)}</span>
               )}
+              {/* 第 5 轮 P2-2：今日房价（stays.rate），去呼呼卡片上客人行右侧就是房费 */}
+              {room.rate !== null && room.rate !== undefined && (
+                <span className="ml-1 text-[12px] opacity-90">¥{fmtMoneyShort(room.rate)}</span>
+              )}
             </>
           ) : preArrival ? (
             <>
@@ -1520,22 +1706,37 @@ function RoomCard({
         </div>
       </div>
 
-      {/* 底部签条：去呼呼把「欠 / 预 / 联N / 抵」放在色块下方的白条上 */}
+      {/* 底部签条：去呼呼把「欠多少 / 联N / 抵」放在色块下方的白条上（第 5 轮 P2-2 补金额） */}
       {(inhouse || preArrival) && (owed || linked || preArrival) ? (
-        <div className="flex h-[20px] shrink-0 items-center gap-1 border-t border-[#ededed] bg-white px-1.5">
+        <div className="flex h-[20px] shrink-0 items-center gap-1 overflow-hidden border-t border-[#ededed] bg-white px-1.5">
           {owed && (
-            <span className="rounded-[1px] bg-[#e53935] px-1 text-[12px] leading-[16px] text-white">欠</span>
+            /*
+             * 第 5 轮 P2-2：原来只显示一个「欠」字，看不出欠多少。
+             * 现在把余额直接写在签条上（hover 显示完整两位小数），
+             * 前台扫一眼房态图就知道哪间欠得多。
+             */
+            <span
+              className="min-w-0 shrink-0 truncate rounded-[1px] bg-[#e53935] px-1 text-[12px] leading-[16px] text-white"
+              title={`欠费余额 ${fmtMoney(room.balance)}`}
+            >
+              欠{fmtMoneyShort(room.balance)}
+            </span>
           )}
           {linked && (
             <span
-              className="rounded-[1px] border border-[#5cb85c] px-1 text-[12px] leading-[15px] text-[#2e7d32]"
-              title={`同房型同客人联房 ${room.link_count} 间`}
+              className="shrink-0 rounded-[1px] border border-[#5cb85c] px-1 text-[12px] leading-[15px] text-[#2e7d32]"
+              title={
+                /* P2-2：联房优先用 room_links 口径（P1-4），没有联房组时退回同客人同房型口径 */
+                (room.link_room_count ?? 0) > 1
+                  ? `联房组内 ${room.link_room_count} 间在住`
+                  : `同房型同客人联房 ${room.link_count} 间`
+              }
             >
-              联{room.link_count}
+              联{(room.link_room_count ?? 0) > 1 ? room.link_room_count : room.link_count}
             </span>
           )}
           {preArrival && (
-            <span className="rounded-[1px] bg-[#52c41a] px-1 text-[12px] leading-[16px] text-white">抵</span>
+            <span className="shrink-0 rounded-[1px] bg-[#52c41a] px-1 text-[12px] leading-[16px] text-white">抵</span>
           )}
         </div>
       ) : null}
@@ -1723,13 +1924,35 @@ function QuickOpForm({
           </form>
         );
       case "cancel":
+        /*
+         * 第 5 轮 P2-1（危险操作二次确认）：
+         * 取消入住是本组件里唯一真正不可逆的写操作 —— 服务端会物理删除
+         * 入住单、账单、明细和收款流水，原来点一下按钮就直接提交了。
+         *
+         * 现在用项目统一的 ConfirmForm（与 CashierPanel / bookings 同一套组件）：
+         *   · message：操作对象（房号 + 客人）
+         *   · detail ：影响范围（删什么、房间变什么、有没有欠款）
+         *   · requireReason：原因必填，随表单提交写进 op_logs 快照
+         * 换房 / 续住 / 调价这些可逆操作没有加确认，避免前台每步都被拦。
+         */
         return (
-          <form action={wrap(cancelCheckinAction)}>
+          <ConfirmForm
+            action={wrap(cancelCheckinAction)}
+            message={`确认取消入住 ${room.room_no} · ${room.guest_name ?? "该客人"}？`}
+            detail={
+              `将删除入住单 ${room.stay_no ?? "（本单）"}、账单及全部收款流水，房间 ${room.room_no} ` +
+              `恢复为空房。服务端会先留一份操作日志快照，但业务数据本身不可恢复。` +
+              ((room.balance ?? 0) > 0.01 ? ` 当前仍有欠款 ${fmtMoney(room.balance)}，需先结清才能取消。` : "")
+            }
+            confirmLabel="确认取消入住"
+            requireReason="取消原因"
+          >
             <input type="hidden" name="stay_id" value={stayId ?? ""} />
-            <p className="mb-2 text-[12px] leading-[18px] text-[#e53935]">取消入住会删除入住单、账单与流水，并把房间恢复为空房，不可恢复。</p>
-            <Field label="取消原因（必填）"><input name="reason" required placeholder="如：客人临时不来 / 开错房" className={inputCls} /></Field>
-            <button className={btnCls}>确认取消入住</button>
-          </form>
+            <p className="mb-2 text-[12px] leading-[18px] text-[#e53935]">
+              取消入住会删除入住单、账单与流水，并把房间恢复为空房，不可恢复。
+            </p>
+            <button className={btnCls}>取消入住</button>
+          </ConfirmForm>
         );
       case "hourly":
         return (
@@ -2289,13 +2512,30 @@ function RoomDrawer({
                   </ActionPanel>
 
                   <ActionPanel label="取消入住" hint="不可撤销 ▾">
-                    <form action={submitWith(cancelCheckinAction)} className="space-y-2">
+                    {/*
+                     * 第 5 轮 P2-1：抽屉里的取消入住同样加统一确认框。
+                     * ConfirmForm 会把 children 包进它自己的表单，点按钮先弹确认，
+                     * 确认时再调 submitWith(cancelCheckinAction) 提交（原因由确认框注入）。
+                     */}
+                    <ConfirmForm
+                      action={submitWith(cancelCheckinAction)}
+                      message={`确认取消入住 ${room.room_no} · ${room.guest_name ?? "该客人"}？`}
+                      detail={
+                        `将删除入住单 ${room.stay_no ?? "（本单）"}、账单、账务明细及收款流水，` +
+                        `房间 ${room.room_no} 置为空净房。账单仍有欠款时会被服务端拒绝。` +
+                        `操作前会写入操作日志快照，业务数据不可恢复。`
+                      }
+                      confirmLabel="确认取消入住"
+                      requireReason="取消原因"
+                    >
                       <input type="hidden" name="stay_id" value={stayId} />
                       <p className="rounded border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] leading-relaxed text-amber-700">
                         将删除该入住单及对应账单、账务明细与收款流水，房间置为空净房。账单仍有欠款时会被拒绝。
                       </p>
-                      <SubmitButton label="确认取消入住" danger />
-                    </form>
+                      <button type="submit" className="btn-danger w-full py-1.5 text-[12px]">
+                        取消入住
+                      </button>
+                    </ConfirmForm>
                   </ActionPanel>
 
                   <ActionPanel label="转钟点房">

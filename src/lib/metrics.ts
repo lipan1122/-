@@ -103,6 +103,28 @@ export function occupancyMetrics(hotelId: number, from: string, to: string): Occ
    *   check_in_time 现在存的是本地时间戳（nowLocalIso），
    *   SQLite 的 date() 会按 UTC 解析，导致凌晨入住的房少算一天。
    */
+  /*
+   * 条件必须整体加括号（这里曾经是个真实的多租户漏洞）
+   *
+   * 上一版的 WHERE 长这样：
+   *     WHERE s.hotel_id = ?
+   *       AND s.status IN ('INHOUSE','CHECKED_OUT')
+   *       AND COALESCE(s.rate_code,'') <> '钟点'
+   *       AND substr(s.check_in_time,1,10) <= ?
+   *       AND COALESCE(s.expect_check_out, ...) > ?
+   *          OR (s.status = 'INHOUSE' AND substr(s.check_in_time,1,10) <= ?)
+   *
+   * SQL 里 AND 优先级高于 OR，所以它实际等价于：
+   *     WHERE (hotel_id=? AND 状态 AND 非钟点 AND 在区间内)
+   *        OR (status='INHOUSE' AND check_in <= ?)          ← 这个分支没有 hotel_id！
+   *
+   * 后果：所有酒店的 INHOUSE 单都会被算进本酒店的间夜，「排除钟点房」也失效。
+   * 当前演示库只有 1 家酒店、唯一钟点单已退房，所以数字看起来是对的 ——
+   * 一旦上多店部署，房态/报表/夜审的出租率会全部串店虚高。
+   *
+   * 修法：把「区间内 或 在住」这一组条件用括号包起来，
+   * 让它只决定「算不算这一晚」，而不是绕开前面的租户/状态/钟点过滤。
+   */
   const nightRow = get<{ nights: number }>(
     `SELECT COALESCE(SUM(
               MAX(0,
@@ -117,9 +139,11 @@ export function occupancyMetrics(hotelId: number, from: string, to: string): Occ
       WHERE s.hotel_id = ?
         AND s.status IN ('INHOUSE','CHECKED_OUT')
         AND COALESCE(s.rate_code,'') <> '钟点'
-        AND substr(s.check_in_time,1,10) <= ?
-        AND COALESCE(s.expect_check_out, substr(s.check_in_time,1,10)) > ?
-           OR (s.status = 'INHOUSE' AND substr(s.check_in_time,1,10) <= ?)`,
+        AND (
+              (substr(s.check_in_time,1,10) <= ?
+               AND COALESCE(s.expect_check_out, substr(s.check_in_time,1,10)) > ?)
+           OR (s.status = 'INHOUSE' AND substr(s.check_in_time,1,10) <= ?)
+        )`,
     [to, to, from, hotelId, to, from, to]
   );
   const roomNights = Math.max(0, Math.round(Number(nightRow?.nights ?? 0)));

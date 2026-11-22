@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { Fragment } from "react";
 import { all } from "@/lib/db";
-import { requireUser } from "@/lib/session";
+import { hasPermission, requireUser } from "@/lib/session";
 import { fmtMoney, nightsBetween } from "@/lib/utils";
 import { demoSeedEnabled } from "@/lib/channels/demo-mode";
 import { importChannelOrderAction, pushChannelOrderStatusAction, seedChannelOrdersAction } from "./actions";
@@ -323,6 +323,14 @@ function toViewRow(row: ChannelOrderRow): ViewRow {
 
 export default async function ChannelOrdersPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
   const user = await requireUser();
+  /*
+   * 第 5 轮 P0-1 配套：按钮级权限
+   *
+   * importChannelOrderAction / pushChannelOrderStatusAction 已加 requirePermission("channel.sync")，
+   * 服务端会拦住无权限的调用（返回 FORBIDDEN）。但页面仍对所有角色渲染这两个按钮，
+   * 前台点了会看到报错 —— 安全上正确，体验上应该直接不显示。
+   */
+  const canSync = hasPermission(user.role, "channel.sync", user.hotelId);
   const filters = parseFilters(await searchParams);
 
   const rows = all<ChannelOrderRow>(
@@ -696,7 +704,17 @@ export default async function ChannelOrdersPage({ searchParams }: { searchParams
                               <dd className="text-gray-700">{r.statusLabel}</dd>
                             </dl>
 
-                            {r.statusKey === "NEW" || r.statusKey === "CONFIRMED" ? (
+                            {/*
+                              按钮级权限（第 5 轮 P0-1 配套）
+                              服务端已给 importChannelOrderAction / pushChannelOrderStatusAction
+                              加了 requirePermission("channel.sync")，无权限调用会被拦成 FORBIDDEN。
+                              这里直接不渲染按钮 —— 安全上正确，但没必要让人点了才报错。
+                            */}
+                            {!canSync ? (
+                              <div className="rounded border border-dashed border-gray-200 bg-gray-50 px-2 py-1.5 text-center text-[11.5px] text-gray-400">
+                                需要「渠道同步」权限才能转入预订 / 回传状态
+                              </div>
+                            ) : r.statusKey === "NEW" || r.statusKey === "CONFIRMED" ? (
                               <form action={importChannelOrderAction}>
                                 <input type="hidden" name="orderId" value={r.id} />
                                 <button className="btn-primary w-full py-1.5 text-[12px]">转入预订</button>
@@ -715,7 +733,7 @@ export default async function ChannelOrdersPage({ searchParams }: { searchParams
                                 自动化接线在 frontdesk（入住）/ cashier（退房），
                                 但补传、重传、渠道未配置后重试这些情况必须能在单据上点一次 —— 
                                 没有这个入口就只能改数据库。 */}
-                            {r.bookingId ? (
+                            {r.bookingId && canSync ? (
                               <div className="mt-1.5 rounded border border-gray-200 p-1.5">
                                 <div className="mb-1 text-[11px] text-gray-500">回传渠道状态</div>
                                 <div className="grid grid-cols-3 gap-1">
