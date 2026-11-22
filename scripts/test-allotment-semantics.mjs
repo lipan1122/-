@@ -247,18 +247,27 @@ check(
 /* ─────────── 6. OOO / LOCK 继续扣 ─────────── */
 console.log(`\n=== 5. 维修房 / 锁房 ===\n`);
 
+/*
+     * 先清掉第 4 节的预订，单独测 OOO/LOCK
+     *
+     * 不清的话：那间房被改成 OOO 后，occupancy 查询会命中它，
+     * physicalsSellable 里 booked 会被 blockedRooms 跳过（正确行为：不重复扣），
+     * 于是「加 OOO 可售少 1」这条断言就分不清是 OOO 生效还是预订被跳过。
+     */
+run(`DELETE FROM booking_rooms WHERE hotel_id = ?`, [TEST_HOTEL]);
+run(`DELETE FROM bookings WHERE hotel_id = ?`, [TEST_HOTEL]);
 run(`UPDATE rate_calendar SET allotment = NULL WHERE hotel_id = ? AND room_type_id = ? AND date = ?`, [TEST_HOTEL, rtId, today]);
 run(
   `UPDATE rooms SET status = 'OOO' WHERE id = (SELECT id FROM rooms WHERE hotel_id = ? AND room_type_id = ? AND status = 'VC' ORDER BY id LIMIT 1)`,
   [TEST_HOTEL, rtId]
 );
-check("加 1 间维修房 → 可售 = 3", sellableNow() === 3, `实际 ${sellableNow()}`);
+check("1 在住 + 1 维修 → 可售 = 4（6−1−1）", sellableNow() === 4, `实际 ${sellableNow()}`);
 
 run(
   `UPDATE rooms SET status = 'LOCK' WHERE id = (SELECT id FROM rooms WHERE hotel_id = ? AND room_type_id = ? AND status = 'VC' ORDER BY id LIMIT 1)`,
   [TEST_HOTEL, rtId]
 );
-check("再加 1 间锁房 → 可售 = 2", sellableNow() === 2, `实际 ${sellableNow()}`);
+check("再加 1 锁房 → 可售 = 3（6−1−1−1）", sellableNow() === 3, `实际 ${sellableNow()}`);
 
 /* ─────────── 7. 多租户隔离 ─────────── */
 console.log(`\n=== 6. 多租户隔离 ===\n`);
