@@ -3,6 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { all, get, run, tx } from "@/lib/db";
+import { ensureCancelRequestsTable } from "@/lib/cancel-requests";
 /* 第 4 轮 P1-29：钟点房报价统一口径 */
 import { quoteHourly } from "@/lib/hourly-rate";
 import { requirePermission } from "@/lib/session";
@@ -62,22 +63,8 @@ type CancelRequestRow = {
  * 取消入住审批表（去呼呼「取消入住审批」）。
  * 首次导入本模块时懒创建，页面查询前即可用；CREATE TABLE IF NOT EXISTS 幂等。
  */
-const CANCEL_REQUESTS_DDL = `CREATE TABLE IF NOT EXISTS cancel_requests (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  hotel_id INTEGER NOT NULL,
-  stay_id INTEGER,
-  room_no TEXT,
-  guest_name TEXT,
-  reason TEXT,
-  status TEXT DEFAULT 'PENDING',
-  requested_by TEXT,
-  approved_by TEXT,
-  created_at TEXT,
-  approved_at TEXT
-)`;
+/* 建表逻辑已抽到 src/lib/cancel-requests.ts（构建期不写库、Server Component 也能用） */
 
-// 顶部懒创建：页面导入本模块即执行（CREATE TABLE IF NOT EXISTS 幂等）
-run(CANCEL_REQUESTS_DDL);
 
 const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 
@@ -484,6 +471,8 @@ export async function postAllMissingRoomChargesAction(): Promise<void> {
  * 申请取消入住：对在住单发起审批申请（cancel_requests.status = PENDING）。
  */
 export async function requestCancelAction(formData: FormData): Promise<void> {
+  /* 懒建表：首次调用时创建 cancel_requests（构建期不再写库） */
+  ensureCancelRequestsTable();
   // 权限（整改 P0-3）：发起取消入住申请会写 cancel_requests，属入住取消流程；checkin.cancel 授权 admin / frontdesk。
   const user = await requirePermission("checkin.cancel");
   const stayId = Number(formData.get("stay_id"));
@@ -524,6 +513,8 @@ export async function requestCancelAction(formData: FormData): Promise<void> {
  * → stays CHECKED_OUT / folios SETTLED / 房间 VD（并记房态日志与打扫任务）
  */
 export async function approveCancelAction(formData: FormData): Promise<void> {
+  /* 懒建表：首次调用时创建 cancel_requests（构建期不再写库） */
+  ensureCancelRequestsTable();
   // 权限（整改 P0-3）：审批通过会真正执行退房（stays CHECKED_OUT / folios SETTLED / 房间 VD），属入住取消审批；checkin.cancel 授权 admin / frontdesk，收银与客房被拦。
   const user = await requirePermission("checkin.cancel");
   const id = Number(formData.get("id"));
@@ -603,6 +594,8 @@ export async function approveCancelAction(formData: FormData): Promise<void> {
 
 /** 拒绝取消入住：只改审批状态，不动入住单与房态 */
 export async function rejectCancelAction(formData: FormData): Promise<void> {
+  /* 懒建表：首次调用时创建 cancel_requests（构建期不再写库） */
+  ensureCancelRequestsTable();
   // 权限（整改 P0-3）：驳回取消申请是同一审批流程的写操作，用 checkin.cancel。
   const user = await requirePermission("checkin.cancel");
   const id = Number(formData.get("id"));

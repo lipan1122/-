@@ -14,8 +14,38 @@ export function getDb(): DatabaseSync {
   if (globalThis.__pmsDb) return globalThis.__pmsDb;
   fs.mkdirSync(DB_DIR, { recursive: true });
   const db = new DatabaseSync(DB_FILE);
-  db.exec("PRAGMA journal_mode = WAL;");
-  db.exec("PRAGMA foreign_keys = ON;");
+
+  /*
+   * PRAGMA 必须容错（这是 VPS 构建失败的直接原因）
+   *
+   * ── 事故现场 ──
+   * `next build` 的「Collecting page data」阶段会开多个 worker 并行分析页面，
+   * 每个 worker 都 import 了本模块 → 各自 new DatabaseSync() 打开同一个库文件。
+   * 而 `PRAGMA journal_mode = WAL` 需要**独占锁**：第一个进程切成功了，
+   * 后两个进程拿不到锁就抛 `database is locked`（ERR_SQLITE_ERROR, errcode 5）：
+   *
+   *   Error: Failed to collect page data for /inhouse
+   *   [cause]: Error: database is locked  (src/lib/db.ts:17)
+   *
+   * 本地没暴露是因为 .next 已存在 / 构建单进程跑过；VPS 全新构建 3 worker 并行必炸。
+   *
+   * ── 为什么用 try/catch 而不是别的办法 ──
+   * WAL / busy_timeout 都是**性能与并发优化**，不是功能依赖：
+   *   · 拿不到 WAL 就退回默认的 rollback journal，功能完全正常，只是并发写差一点；
+   *   · 库已经是 WAL 时再次设置是幂等的，冲突只发生在「同时切换」那一瞬间。
+   * 所以拿不到锁就跳过，让构建继续 —— 切 WAL 是「尽力而为」而不是「必须成功」。
+   *
+   * 生产运行时（单进程 next start）第一次调用仍然会成功切到 WAL。
+   */
+  const tryPragma = (sql: string) => {
+    try {
+      db.exec(sql);
+    } catch {
+      /* 构建期多 worker 抢锁 / 只读镜像等场景：跳过，不影响功能 */
+    }
+  };
+  tryPragma("PRAGMA journal_mode = WAL;");
+  tryPragma("PRAGMA foreign_keys = ON;");
   /*
    * 写锁等待（整改清单 P2-29 配套）：
    * tx() 改成 BEGIN IMMEDIATE 后，事务开头就要取 RESERVED 锁。
@@ -24,7 +54,7 @@ export function getDb(): DatabaseSync {
    * 10 秒上限与 scripts/migrate-all.mjs 的 CLI 保持一致：
    * 正常的业务事务是亚毫秒级，真等满 10 秒说明有长事务卡住，此时报错比无限等更好。
    */
-  db.exec("PRAGMA busy_timeout = 10000;");
+  tryPragma("PRAGMA busy_timeout = 10000;");
   globalThis.__pmsDb = db;
   return db;
 }

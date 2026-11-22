@@ -1,6 +1,7 @@
 import Link from "next/link";
 import ConfirmForm from "@/components/ConfirmForm";
 import { all } from "@/lib/db";
+import { ensureCancelRequestsTable } from "@/lib/cancel-requests";
 import { requireUser } from "@/lib/session";
 import { addDays, fmtMoney, todayStr } from "@/lib/utils";
 import {
@@ -212,6 +213,7 @@ export default async function InHousePage({
   // ---------------------------------------------------------------------------
   // 取消入住审批
   // ---------------------------------------------------------------------------
+  ensureCancelRequestsTable();
   const cancelRequests = all<CancelRow>(
     `SELECT id, stay_id, room_no, guest_name, reason, status,
             requested_by, approved_by, created_at, approved_at
