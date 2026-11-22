@@ -14,6 +14,8 @@ import ConfirmForm from "@/components/ConfirmForm";
 import { createCreditItemFormAction, createDebitItemFormAction, createDictItemFormAction, createFloorFormAction, createPackageFormAction, createPositionFormAction, createRateCodeFormAction, createRoomFormAction, createSalesmanFormAction, createStaffFormAction, deleteDictItemFormAction, deleteFloorFormAction, deletePackageFormAction, resetStaffPasswordFormAction, toggleStaffStatusFormAction, ensureSettingsSchema, ensureRbacSchema, saveRoleModulesFormAction, saveRolePermissionsFormAction, batchUpdateAllotmentFormAction, fillMonthRateFormAction, saveAdvancedFormAction, saveHotelInfoAction, saveCleaningTemplateAction, deleteCleaningTemplateAction, saveHourlyRateAction, toggleCreditItemStatusFormAction, toggleDebitItemStatusFormAction, toggleRateCodeStatusFormAction, toggleSalesmanStatusFormAction, updateFloorFormAction, updatePositionFormAction, updateRateCalendarFormAction, updateRateCodeFormAction, updateRoomTypePriceFormAction, createRoomTypeFormAction, updateSettingFormAction, deleteStaffAction, updateUserPositionFormAction, /* 小程序配置（整改清单 F12） */
   saveMiniProgramConfigAction } from "./actions";
 import { getMiniProgramConfig, maskAppId } from "@/lib/mini-config";
+/* 演示数据一键导入面板（设置页「演示数据」Tab） */
+import DemoDataPanel from "./DemoDataPanel";
 
 export const dynamic = "force-dynamic";
 
@@ -196,6 +198,8 @@ const TABS = [
   { key: "advanced", label: "高级设置" },
   /* 小程序配置（整改清单 F12）：微信小程序 / 会员端的 AppID、AppSecret、商户号 */
   { key: "miniprogram", label: "小程序配置" },
+  /* 演示数据：一键导入一整套可演示的业务数据（46 房 / 588 预订 / 200 账单） */
+  { key: "demo", label: "演示数据" },
 ] as const;
 
 type TabKey = (typeof TABS)[number]["key"];
@@ -3745,6 +3749,17 @@ export default async function SettingsPage({ searchParams }: { searchParams: Pro
         </Section>
       )}
       </div>
+
+      {/* ===== 演示数据（一键导入 46 房 / 588 预订 / 200 账单，给客户演示用） ===== */}
+      {activeTab === "demo" && (
+        <Section
+          id="demo"
+          title="演示数据"
+          desc="给客户演示、给同事试用、培训新人时，一键导入一整套有数的业务数据。导入会覆盖现有业务数据（房间/预订/入住/账单/客人/会员），配置类数据保留。"
+        >
+          <DemoDataPanel />
+        </Section>
+      )}
     </div>
   );
 }
