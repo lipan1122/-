@@ -22,7 +22,7 @@ import { get } from "@/lib/db";
 import { getActiveMiniConfig } from "@/lib/mini-config";
 import { issueMiniToken } from "@/lib/mini-auth";
 import { rateLimit } from "@/lib/mini-rate-limit";
-import { fail, ok, readJsonBody, str } from "../_shared";
+import { fail, maskGuestName, ok, readJsonBody, str } from "../_shared";
 
 export const dynamic = "force-dynamic";
 
@@ -156,7 +156,18 @@ export async function POST(req: Request) {
     ]);
     if (guest) {
       hasGuest = true;
-      guestName = guest.name;
+      /*
+       * 姓名脱敏（清单第 445 行「手机号和姓名响应脱敏」）
+       *
+       * 原来这里直接回 guest.name（完整姓名），是整批小程序接口里最后一处
+       * 漏脱敏的地方（其他接口早就用 maskGuestName 了）。
+       *
+       * ⚠️ 前端注意：返回的是「张*」这种形态，**不能用它预填表单的真实姓名**。
+       * 现在 pages/booking 与 pages/bind 若把 guestName 预填进姓名输入框，
+       * 提交上去的就是「张*」而不是真名。前端应先判断是否含「*」，
+       * 含则只作称呼展示、不预填输入框。
+       */
+      guestName = maskGuestName(guest.name);
     }
   }
 

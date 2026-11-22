@@ -403,14 +403,43 @@ export function miniGuard(req: Request, scope: string, limit: number): MiniGuard
     };
   }
 
-  if (!isMiniConfiguredFor(user.hotelId)) {
-    return {
-      ok: false,
-      response: fail("NOT_CONFIGURED", "小程序未配置，请管理员在系统设置里填写 AppID/AppSecret"),
-    };
-  }
+  const blocked = miniConfigBlocked(user);
+  if (blocked) return { ok: false, response: blocked };
 
   return { ok: true, user, hotelId: user.hotelId, guestId: user.guestId };
+}
+
+/**
+ * 小程序配置门槛（只查配置，不做鉴权、不限流）—— 返回 null 表示放行。
+ *
+ * ── 为什么需要这个函数（第九轮专项测试发现的实际缺陷）───────
+ * 除 12 个走 miniGuard 的接口外，还有一批接口只 `requireMiniToken`：
+ *   bind / bookings(列表 GET) / member / member/ledger / member/unbind /
+ *   notifications / notifications/read / breakfast / invoices（+ 本批的 bookings POST）。
+ * 它们因此**绕过了配置检查**：`mini_program_config` 一行都没有、或管理员把
+ * `enabled` 关掉之后，这些接口仍然返回 200 —— 等于「停用小程序」只停住了
+ * 订单/在住那一半，会员资料、储值流水、发票、通知照常可读可写。
+ * 整改清单第 431 行要求「未配置小程序时返回 NOT_CONFIGURED」，覆盖范围必须是
+ * **所有需要登录的小程序接口**，而不只是第一批。
+ *
+ * ── 为什么不做成「第二个 miniGuard」──
+ * miniGuard 自带限流。这些接口早就有自己按业务调好的限流阈值（bind 20/分、
+ * 标记已读 30/分、breakfast 更紧……），再做一层网关限流会叠加出两套配额，
+ * 线上调一个阈值要改两处，且更紧的那层会先 429，排查时分不清是谁挡的。
+ * 所以这里只抽「鉴权之后、业务之前」这一步，调用顺序保持：
+ *   限流（各接口自己的）→ 鉴权 → 配置 → 业务。
+ *
+ * ── 为什么有些接口故意不调用它 ──
+ *   · /api/mini/logout：退出是**清理动作**（服务端吊销 token）。小程序被停用后
+ *     若连退出都返回 NOT_CONFIGURED，客户端会留着一个 7 天有效的服务端凭证，
+ *     反而延长了风险窗口；吊销自己 token 也不泄露任何数据，所以按「始终允许」处理。
+ *   · /api/mini/hotel、/api/mini/rooms、/api/mini/room-types/[id]：匿名公开接口，
+ *     客人还没登录就要能看酒店信息与房价；它们用 getActiveMiniConfig() 只回一个
+ *     `miniConfigured` 布尔，不需要（也不应该）整体拒绝。
+ */
+export function miniConfigBlocked(user: MiniUser): NextResponse | null {
+  if (isMiniConfiguredFor(user.hotelId)) return null;
+  return fail("NOT_CONFIGURED", "小程序未配置，请管理员在系统设置里填写 AppID/AppSecret");
 }
 
 /**

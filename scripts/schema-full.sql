@@ -118,7 +118,11 @@ CREATE TABLE bookings (
   retain_time TEXT, pay_type TEXT DEFAULT '到店付款',
   breakfast INTEGER DEFAULT 0, channel_order_no TEXT,
   created_by INTEGER, created_at TEXT, updated_at TEXT
-, total_price REAL);
+, total_price REAL
+-- 小程序下单幂等键（整改清单第 109 行「request_id 幂等 / 网络超时重试不重复建单」）。
+-- 同一 (hotel_id, mini_request_id) 只能建一张订单；NULL = 历史单 / 非小程序单，
+-- 不参与部分唯一索引（见下方 idx_bookings_mini_request）。
+, mini_request_id TEXT);
 
 CREATE TABLE stays (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1187,6 +1191,8 @@ CREATE INDEX idx_channel_settlements_date ON channel_settlements(hotel_id, biz_d
 CREATE INDEX idx_channel_dead_letter ON channel_sync_dead_letter(hotel_id, created_at);
 
 CREATE UNIQUE INDEX idx_bookings_no ON bookings(hotel_id, booking_no);
+
+CREATE UNIQUE INDEX idx_bookings_mini_request ON bookings(hotel_id, mini_request_id) WHERE mini_request_id IS NOT NULL;
 
 /*
  * 单号「酒店内唯一」的三组索引

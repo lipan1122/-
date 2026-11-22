@@ -158,6 +158,10 @@ CREATE TABLE IF NOT EXISTS bookings (
   -- rate 是「每晚价」，钟点房的总价没有列可放，曾经直接混写进 rate 导致报表口径错误；
   -- 这里升成正式列，新建库一次建全，老库由 scripts/migrate-all.mjs 的 addColumn 补齐。
   total_price REAL,
+  -- 小程序下单幂等键（整改清单第 109 行）：同一 (hotel_id, mini_request_id) 只建一张订单。
+  -- NULL = 历史单 / 非小程序单；部分唯一索引见 scripts/migrate-all.mjs 的 12.5 段
+  -- （全新库由 runMigrations 收尾建好，与 schema-full.sql / 运行时 ensureBookingRequestSchema 一致）。
+  mini_request_id TEXT,
   status TEXT DEFAULT 'PENDING',
   guarantee TEXT, remark TEXT,
   booking_type TEXT DEFAULT 'guest',

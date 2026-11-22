@@ -29,7 +29,7 @@
 
 import { requireMiniToken } from "@/lib/mini-auth";
 import { rateLimit } from "@/lib/mini-rate-limit";
-import { fail, ok } from "../_shared";
+import { fail, miniConfigBlocked, ok } from "../_shared";
 import {
   countNotifications,
   countUnreadNotifications,
@@ -57,6 +57,14 @@ export async function GET(req: Request) {
 
   const user = requireMiniToken(req);
   if (!user) return fail("UNAUTHORIZED", "未登录或登录已过期，请重新进入小程序", 401);
+
+  /*
+   * 配置门槛（整改清单第 431 行）：停用小程序后通知列表也应停止下发。
+   * 通知是「这个微信的站内信」，但内容里可能有订单/金额/房号 —— 停用后继续可读
+   * 等于停用不彻底。
+   */
+  const blocked = miniConfigBlocked(user);
+  if (blocked) return blocked;
 
   /* ---------- 收件人 = token 里的 mini_user_id，不接受任何客户端参数 ---------- */
   const hotelId = user.hotelId;

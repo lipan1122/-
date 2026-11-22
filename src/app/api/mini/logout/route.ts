@@ -43,6 +43,19 @@ export async function POST(req: Request) {
   if (!user) return fail("UNAUTHORIZED", "未登录或登录已过期，请重新进入小程序", 401);
 
   /*
+   * 这里**故意**不做小程序配置检查（miniConfigBlocked）。
+   *
+   * 退出是清理动作：服务端吊销 token 才是真正的「止损」手段。如果管理员把小程序
+   * 停用后退出也返回 NOT_CONFIGURED，客户端的旧 token 会继续有效最多 7 天
+   * （MINI_TOKEN_TTL_MS），反而把风险窗口拉长。而且本接口只吊销**当前请求携带的
+   * 那一个 token**（revokeMiniToken(user.id)），既不读业务数据也不写业务数据，
+   * 停用期间允许调用不会造成任何越权或状态污染。
+   *
+   * 与之相对：解绑（/api/mini/member/unbind）改的是业务绑定关系，停用期间按
+   * NOT_CONFIGURED 拒绝（见该文件说明）。
+   */
+
+  /*
    * revokeMiniToken 自己会按 id 取回 hotel_id 再写（租户隔离），
    * 幂等：token 已经失效时重复调用不会报错，接口仍回 ok。
    */

@@ -19,7 +19,7 @@
 import { all, get } from "@/lib/db";
 import { requireMiniToken } from "@/lib/mini-auth";
 import { getWalletBalance, getWalletSummary } from "@/lib/member-wallet";
-import { fail, maskMobile, ok, round2 } from "../_shared";
+import { fail, maskGuestName, maskMobile, miniConfigBlocked, ok, round2 } from "../_shared";
 
 export const dynamic = "force-dynamic";
 
@@ -32,6 +32,13 @@ function tableExists(name: string): boolean {
 export async function GET(req: Request) {
   const user = requireMiniToken(req);
   if (!user) return fail("UNAUTHORIZED", "未登录或登录已过期，请重新进入小程序", 401);
+
+  /*
+   * 配置门槛（整改清单第 431 行）：停用小程序后会员资料必须立刻不可读。
+   * 放在鉴权之后、NOT_BOUND 之前：未配置是管理员要处理的事，优先于「还没绑定」。
+   */
+  const blocked = miniConfigBlocked(user);
+  if (blocked) return blocked;
 
   if (!user.guestId) {
     return fail("NOT_BOUND", "尚未绑定手机号，请先绑定后再查看会员信息");
@@ -109,7 +116,13 @@ export async function GET(req: Request) {
 
   return ok({
     guestId: guest.id,
-    guestName: guest.name,
+    /*
+     * 整改清单第 445 行「手机号和姓名响应脱敏」：姓名与手机号同一口径。
+     * 旧实现直接回 `guest.name`（张三），而订单详情 / 在住 / 绑定都回 `张*` ——
+     * 会员中心成了「输入一个已登录的微信号就能拿到真实姓名」的入口，
+     * 截图、日志、代理缓存任意一处落地都收不回。这里统一走 maskGuestName。
+     */
+    guestName: maskGuestName(guest.name),
     mobile: maskMobile(guest.mobile ?? ""),
     /** 会员等级：0 = 普通客人，1/2/3 = VIP1/VIP2/VIP3 */
     level: vip,

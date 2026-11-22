@@ -1545,6 +1545,37 @@ export function runMigrations(db, { checkOnly = false } = {}) {
     `CREATE INDEX idx_mini_service_requests_status ON mini_service_requests(hotel_id, status, id)`
   );
 
+  /* ---------- 12.5 小程序下单幂等键 bookings.mini_request_id（第九轮清单第 109 行） ----------
+   *
+   * 缺陷（第九轮专项测试实测）：`POST /api/mini/bookings` 全文没有任何 request_id 校验。
+   * 同一个 requestId 顺序提交两次 → 建出两张单（BK3003 / BK3004）；并发两次 → 同样两张。
+   * 现实后果是客人网络超时后重点一次就多一张重复单 —— 前台重复排房 / 重复锁房，
+   * 接入在线支付后还可能重复收款。清单第 109 行明确要求「request_id 幂等」
+   * 「网络超时重试不重复建单」。
+   *
+   * 为什么是「订单表加一列」而不是新建一张 request_id 映射表：
+   *   · 幂等键必须是**订单的不可分割属性**：同一事务写入，不会出现「单建了、键没写」，
+   *     也就不会因为键缺失而在重试时重复建单（映射表要多一次写入 + 一张表的一致性维护）；
+   *   · 唯一约束落在订单表上，SQLite 单表写入即可保证「一家店一个键最多一张单」；
+   *   · 查重就是一次带索引的等值查询，不额外增加读路径。
+   *
+   * 为什么用**部分**唯一索引（WHERE mini_request_id IS NOT NULL）：
+   *   历史订单 / 前台 / 渠道建的单没有幂等键，全是 NULL。SQLite 里 NULL 互不相等，
+   *   但显式排除掉更清楚，索引也更小更快；将来若有人把 NULL 当作「空串」写入，
+   *   也不会因为一批空串互相冲突而在迁移阶段炸掉。
+   *
+   * ⚠️ 本段必须与 scripts/schema-full.sql（建表 + 索引）、scripts/init-db.mjs（建表）、
+   *    运行时 src/app/api/mini/bookings/route.ts 的 ensureBookingRequestSchema()
+   *    以及 scripts/schema-fingerprint.json 一致（5 处同步，清单第六节第 387-394 行）。
+   *
+   * 回滚：只增列 + 只增索引，不动任何既有列与数据；回滚方式仍是「还原升级前备份的库」。
+   */
+  addColumn("bookings", "mini_request_id", "TEXT");
+  addIndex(
+    "idx_bookings_mini_request",
+    `CREATE UNIQUE INDEX idx_bookings_mini_request ON bookings(hotel_id, mini_request_id) WHERE mini_request_id IS NOT NULL`
+  );
+
   /* ---------- 13. 幂等键：账务明细 + 商品库存流水（整改 7.1） ----------
    * 资金 / 库存类写操作必须能挡住「网络重试、连点两次、客户端重发」造成的重复入账：
    * 客户端带一个 request_id，唯一索引保证同一家店同一 request_id 只能落一行。

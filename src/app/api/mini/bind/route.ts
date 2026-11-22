@@ -88,7 +88,7 @@ import {
 } from "@/lib/mini-auth";
 import { rateLimit } from "@/lib/mini-rate-limit";
 import { nowIso } from "@/lib/utils";
-import { fail, isMobile, maskGuestName, maskMobile, ok, readJsonBody, str } from "../_shared";
+import { fail, isMobile, maskGuestName, maskMobile, miniConfigBlocked, ok, readJsonBody, str } from "../_shared";
 
 export const dynamic = "force-dynamic";
 
@@ -265,6 +265,14 @@ export async function POST(req: Request) {
 
   const user = requireMiniToken(req);
   if (!user) return fail("UNAUTHORIZED", "未登录或登录已过期，请重新进入小程序", 401);
+
+  /*
+   * 配置门槛（整改清单第 431 行）：管理员停用小程序后，绑定也必须立刻不可用。
+   * 放在鉴权之后、任何业务读写之前 —— 绑定会写 guests / op_logs，
+   * 不能先落库再发现「小程序已经停用了」。
+   */
+  const blocked = miniConfigBlocked(user);
+  if (blocked) return blocked;
 
   const body = await readJsonBody(req);
   if (!body) return fail("BAD_REQUEST", "请求体必须是 JSON 对象", 400);

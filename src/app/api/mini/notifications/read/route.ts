@@ -28,7 +28,7 @@ import { run } from "@/lib/db";
 import { requireMiniToken } from "@/lib/mini-auth";
 import { rateLimit } from "@/lib/mini-rate-limit";
 import { nowIso } from "@/lib/utils";
-import { fail, int, ok, readJsonBody } from "../../_shared";
+import { fail, int, miniConfigBlocked, ok, readJsonBody } from "../../_shared";
 import { countUnreadNotifications, ensureMiniNotificationsSchema } from "../_notify";
 
 export const dynamic = "force-dynamic";
@@ -49,6 +49,13 @@ export async function POST(req: Request) {
 
   const user = requireMiniToken(req);
   if (!user) return fail("UNAUTHORIZED", "未登录或登录已过期，请重新进入小程序", 401);
+
+  /*
+   * 配置门槛（整改清单第 431 行）：停用后不再接受「标记已读」这类写操作。
+   * 放在读请求体之前 —— 配置就不合规时没有任何理由解析业务入参。
+   */
+  const blocked = miniConfigBlocked(user);
+  if (blocked) return blocked;
 
   const body = await readJsonBody(req);
   if (!body) return fail("BAD_REQUEST", "请求体必须是 JSON 对象", 400);

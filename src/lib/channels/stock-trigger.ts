@@ -136,6 +136,37 @@ export function buildRateRows(
     maintenance.set(Number(r.room_type_id), Number(r.c));
   }
 
+  /* 锁房（LOCK）：同样整段日期都不能卖 —— 旧实现漏了这一项，会把锁房推给渠道（超卖） */
+  const locked = new Map<number, number>();
+  for (const r of all<{ room_type_id: number; c: number }>(
+    `SELECT room_type_id, COUNT(*) AS c FROM rooms WHERE hotel_id = ? AND status = 'LOCK' GROUP BY room_type_id`,
+    [hotelId]
+  )) {
+    locked.set(Number(r.room_type_id), Number(r.c));
+  }
+
+  /*
+   * 手工房量（rate_calendar.allotment），key = `房型id:日期`
+   *
+   * 语义（2026-11-22 经酒店确认）：**当天剩余可卖数量**。
+   * 旧实现完全没读这张表 → 运营在「设置 → 房量」手工限售 5 间，
+   * 渠道那边还在按物理剩余卖，限售形同虚设。
+   *
+   * 只取非 NULL 的行：没配的日期按物理可售走。
+   */
+  const rateAllotments = new Map<string, number>();
+  try {
+    for (const r of all<{ room_type_id: number; date: string; allotment: number }>(
+      `SELECT room_type_id, date, allotment FROM rate_calendar
+        WHERE hotel_id = ? AND allotment IS NOT NULL`,
+      [hotelId]
+    )) {
+      rateAllotments.set(`${Number(r.room_type_id)}:${String(r.date).slice(0, 10)}`, Number(r.allotment));
+    }
+  } catch {
+    /* 老库没有 rate_calendar 或没有 allotment 列：按「没配手工房量」处理 */
+  }
+
   // 已占用：在住（stays）+ 已排具体房间的预订（bookings.room_id 非空）
   const occupied = all<{ room_type_id: number; from_date: string; to_date: string }>(
     `SELECT r.room_type_id, date(s.check_in_time) AS from_date, s.expect_check_out AS to_date
@@ -195,7 +226,9 @@ export function buildRateRows(
   const rows: RatePush[] = [];
   for (const rt of roomTypes) {
     const total = totals.get(rt.id) ?? 0;
+    /* 维修(OOO) + 锁房(LOCK)：两种情况整段日期都不能卖 */
     const ooo = maintenance.get(rt.id) ?? 0;
+    const lock = locked.get(rt.id) ?? 0;
     for (const day of dates) {
       let used = 0;
       for (const o of occupied) {
@@ -209,8 +242,27 @@ export function buildRateRows(
         }
       }
 
-      const raw = total - used - ooo;
-      const allotment = toChannelAllotment(raw, oversell);
+      /*
+       * 可售 = 配了 rate_calendar.allotment ? min(物理可售, allotment) : 物理可售
+       *
+       * 与 src/lib/room-stock.ts 同口径（2026-11-22 经酒店确认：
+       * allotment 是「当天剩余可卖数量」，不是「渠道总放量上限」）。
+       *
+       * 两个旧实现的缺陷在这轮一并修掉：
+       *   1. 只扣了 OOO，**没扣 LOCK** → 锁房会被当成可卖推给渠道（超卖）
+       *   2. **完全没读 rate_calendar.allotment** → 运营手工限售形同虚设
+       *
+       * ⚠️ 这里**不能** `Math.max(0, ...)`：
+       *    物理可售可能是**负数**（卖超了），而负数是「还能再卖超几间」的信息，
+       *    下游 toChannelAllotment(oversell) 要用它决定「关房」还是「继续放量」。
+       *    房态页（room-stock.ts）才需要夹到 0，因为页面不显示负库存。
+       */
+      const physicalSellable = total - used - ooo - lock;
+      const manual = rateAllotments.get(`${rt.id}:${day}`);
+      const sellable =
+        manual === null || manual === undefined ? physicalSellable : Math.min(physicalSellable, Math.max(0, manual));
+
+      const allotment = toChannelAllotment(sellable, oversell);
       rows.push({
         channelRoomTypeCode: channelCodes.get(rt.id) ?? rt.code,
         // 整改清单 P2-10：把「编码是映射来的还是本地兜底的」显式带出来，

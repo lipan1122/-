@@ -34,7 +34,7 @@ import { get } from "@/lib/db";
 import { requireMiniToken } from "@/lib/mini-auth";
 import { rateLimit } from "@/lib/mini-rate-limit";
 import { getWalletBalance, getWalletSummary, listWalletLedger } from "@/lib/member-wallet";
-import { fail, ok, round2 } from "../../_shared";
+import { fail, miniConfigBlocked, ok, round2 } from "../../_shared";
 
 export const dynamic = "force-dynamic";
 
@@ -62,6 +62,14 @@ export async function GET(req: Request) {
 
   const user = requireMiniToken(req);
   if (!user) return fail("UNAUTHORIZED", "未登录或登录已过期，请重新进入小程序", 401);
+
+  /*
+   * 配置门槛（整改清单第 431 行）：停用小程序后储值流水必须立刻不可读。
+   * 放在鉴权之后、NOT_BOUND 之前：未配置是管理员要处理的事，优先于「还没绑定」。
+   */
+  const blocked = miniConfigBlocked(user);
+  if (blocked) return blocked;
+
   if (!user.guestId) {
     /* 未绑定用户没有账本：返回业务码而不是空列表，前端才能引导去绑定 */
     return fail("NOT_BOUND", "尚未绑定手机号，请先绑定后再查看储值流水");

@@ -59,7 +59,7 @@ import {
 } from "@/lib/mini-auth";
 import { rateLimit } from "@/lib/mini-rate-limit";
 import { nowIso } from "@/lib/utils";
-import { fail, maskGuestName, maskMobile, ok, readJsonBody, str } from "../../_shared";
+import { fail, maskGuestName, maskMobile, miniConfigBlocked, ok, readJsonBody, str } from "../../_shared";
 import { MINI_NOTIFY_TYPE, safeNotify } from "../../notifications/_notify";
 
 export const dynamic = "force-dynamic";
@@ -180,6 +180,17 @@ export async function POST(req: Request) {
 
   const user = requireMiniToken(req);
   if (!user) return fail("UNAUTHORIZED", "未登录或登录已过期，请重新进入小程序", 401);
+
+  /*
+   * 配置门槛（整改清单第 431 行）：停用小程序后不允许再解绑。
+   *
+   * 与 /api/mini/logout 的区别：退出登录是**清理凭据**（停用后更该允许，见 _shared.ts
+   * 的 miniConfigBlocked 说明）；解绑改的是业务绑定关系（mini_program_users.guest_id），
+   * 停用期间没有任何理由继续变更，交给前台处理即可。
+   */
+  const blocked = miniConfigBlocked(user);
+  if (blocked) return blocked;
+
   if (!user.guestId) {
     return fail("NOT_BOUND", "当前账号尚未绑定手机号，无需解绑");
   }

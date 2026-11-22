@@ -53,7 +53,7 @@ import { recalcFolioBalance } from "@/lib/folio";
 import { requireMiniToken } from "@/lib/mini-auth";
 import { rateLimit } from "@/lib/mini-rate-limit";
 import { nowIso } from "@/lib/utils";
-import { fail, int, isDateStr, maskGuestName, ok, readJsonBody, round2, str } from "../_shared";
+import { fail, int, isDateStr, maskGuestName, miniConfigBlocked, ok, readJsonBody, round2, str } from "../_shared";
 import { MINI_NOTIFY_TYPE, safeNotify } from "../notifications/_notify";
 
 export const dynamic = "force-dynamic";
@@ -171,6 +171,15 @@ export async function POST(req: Request) {
   /* ---------- 1. 鉴权：身份 / 租户 / 客史全部来自 token ---------- */
   const user = requireMiniToken(req);
   if (!user) return fail("UNAUTHORIZED", "未登录或登录已过期，请重新进入小程序", 401);
+
+  /*
+   * 配置门槛（整改清单第 431 行）：停用小程序后不能再预购早餐。
+   * 这一条尤其重要 —— 早餐会挂房账（folio_items）并写收银口径，
+   * 停用期间继续入账会出现「小程序说买了、前台没看到」的金额差异。
+   */
+  const blocked = miniConfigBlocked(user);
+  if (blocked) return blocked;
+
   if (!user.guestId) {
     return fail("NOT_BOUND", "尚未绑定手机号，请先绑定后再购买早餐");
   }

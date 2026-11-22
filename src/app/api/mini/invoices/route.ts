@@ -39,7 +39,7 @@ import { getFolioInvoiced, issueInvoice } from "@/lib/invoice";
 import { requireMiniToken } from "@/lib/mini-auth";
 import { rateLimit } from "@/lib/mini-rate-limit";
 import { nowIso } from "@/lib/utils";
-import { fail, maskGuestName, ok, readJsonBody, round2, str } from "../_shared";
+import { fail, maskGuestName, miniConfigBlocked, ok, readJsonBody, round2, str } from "../_shared";
 import { MINI_NOTIFY_TYPE, safeNotify } from "../notifications/_notify";
 
 export const dynamic = "force-dynamic";
@@ -151,6 +151,11 @@ export async function GET(req: Request) {
 
   const user = requireMiniToken(req);
   if (!user) return fail("UNAUTHORIZED", "未登录或登录已过期，请重新进入小程序", 401);
+
+  /* 配置门槛（整改清单第 431 行）：停用小程序后发票列表不再下发 */
+  const blocked = miniConfigBlocked(user);
+  if (blocked) return blocked;
+
   if (!user.guestId) return fail("NOT_BOUND", "尚未绑定手机号，请先绑定后再查看发票");
 
   const hotelId = user.hotelId;
@@ -221,6 +226,14 @@ export async function POST(req: Request) {
 
   const user = requireMiniToken(req);
   if (!user) return fail("UNAUTHORIZED", "未登录或登录已过期，请重新进入小程序", 401);
+
+  /*
+   * 配置门槛（整改清单第 431 行）：停用小程序后不能再申请开票。
+   * 放在读请求体之前：配置就不合规时不该先解析/校验业务入参。
+   */
+  const blocked = miniConfigBlocked(user);
+  if (blocked) return blocked;
+
   if (!user.guestId) return fail("NOT_BOUND", "尚未绑定手机号，请先绑定后再申请开票");
 
   const body = await readJsonBody(req);

@@ -69,7 +69,7 @@
     "preflight:code": "node scripts/preflight-code.mjs",
     "check:report-map": "node scripts/check-report-map.mjs",
     "recalc:folios": "node scripts/recalc-all-folios.mjs",
-    "audit:all": "node scripts/audit.mjs && node scripts/audit-pages.mjs && node scripts/audit-reports.mjs && node scripts/preflight-db.mjs && node scripts/check-sql-params.mjs && node scripts/check-report-map.mjs && node scripts/test-channel-order-permissions.mjs && node scripts/test-channel-order-badge-status.mjs && node scripts/test-room-stock-today.mjs && node scripts/test-room-stock-multiroom.mjs && node scripts/test-room-stock-allotment.mjs && node scripts/test-occupancy-tenant-isolation.mjs && node scripts/test-room-tags-cleaning.mjs && node scripts/test-room-tags-pending-review.mjs && node scripts/test-refund-confirmation.mjs && node scripts/test-checkout-room-status.mjs && node scripts/test-night-audit-occupancy.mjs && node scripts/test-pre-arrival-buckets.mjs && node scripts/test-breakfast-permissions.mjs && node scripts/test-shop-permissions.mjs && node scripts/test-goods-permissions.mjs && node scripts/test-today-todo-permissions.mjs && node scripts/test-ar-permissions.mjs && node scripts/test-invoice-permissions.mjs && node scripts/test-member-permissions.mjs && node scripts/test-quote-permissions.mjs && node scripts/test-schema-fresh-install.mjs && node scripts/test-schema-rebuild-idempotent.mjs && node scripts/test-allotment-semantics.mjs && node scripts/test-companies-permissions.mjs && node scripts/test-cleaners-permissions.mjs && node scripts/test-shop-double-submit.mjs && node scripts/test-invoice-red-flush-concurrency.mjs && node scripts/test-nav-channel-badge.mjs && node scripts/test-shop-multicart.mjs",
+    "audit:all": "node scripts/audit.mjs && node scripts/audit-pages.mjs && node scripts/audit-reports.mjs && node scripts/preflight-db.mjs && node scripts/check-sql-params.mjs && node scripts/check-report-map.mjs && node scripts/test-channel-order-permissions.mjs && node scripts/test-channel-order-badge-status.mjs && node scripts/test-room-stock-today.mjs && node scripts/test-room-stock-multiroom.mjs && node scripts/test-room-stock-allotment.mjs && node scripts/test-occupancy-tenant-isolation.mjs && node scripts/test-room-tags-cleaning.mjs && node scripts/test-room-tags-pending-review.mjs && node scripts/test-refund-confirmation.mjs && node scripts/test-checkout-room-status.mjs && node scripts/test-night-audit-occupancy.mjs && node scripts/test-pre-arrival-buckets.mjs && node scripts/test-breakfast-permissions.mjs && node scripts/test-shop-permissions.mjs && node scripts/test-goods-permissions.mjs && node scripts/test-today-todo-permissions.mjs && node scripts/test-ar-permissions.mjs && node scripts/test-invoice-permissions.mjs && node scripts/test-member-permissions.mjs && node scripts/test-quote-permissions.mjs && node scripts/test-schema-fresh-install.mjs && node scripts/test-schema-rebuild-idempotent.mjs && node scripts/test-allotment-semantics.mjs && node scripts/test-companies-permissions.mjs && node scripts/test-cleaners-permissions.mjs && node scripts/test-shop-double-submit.mjs && node scripts/test-invoice-red-flush-concurrency.mjs && node scripts/test-nav-channel-badge.mjs && node scripts/test-shop-multicart.mjs && node scripts/test-miniprogram.mjs && node scripts/test-miniprogram-pages.mjs && node scripts/test-mini-auth-security.mjs && node scripts/test-mini-bind-security.mjs && node scripts/test-mini-booking-idempotency.mjs && node scripts/test-mini-availability.mjs && node scripts/test-mini-cancel-booking.mjs && node scripts/test-mini-extend-stay.mjs && node scripts/test-mini-service-orders.mjs && node scripts/test-mini-notifications.mjs && node scripts/test-mini-order-access.mjs && node scripts/test-mini-member-wallet.mjs",
     "db:ensure-schema": "node scripts/ensure-schema.mjs",
     "db:dump-schema": "node scripts/dump-schema.mjs",
     "db:sync-schema": "node scripts/sync-schema.mjs",
@@ -106,7 +106,18 @@
     "test:shop-double-submit": "node scripts/test-shop-double-submit.mjs",
     "test:invoice-red-flush": "node scripts/test-invoice-red-flush-concurrency.mjs",
     "test:nav-channel-badge": "node scripts/test-nav-channel-badge.mjs",
-    "test:shop-multicart": "node scripts/test-shop-multicart.mjs"
+    "test:shop-multicart": "node scripts/test-shop-multicart.mjs",
+    "test:mini-pages": "node scripts/test-miniprogram-pages.mjs",
+    "test:mini-auth": "node scripts/test-mini-auth-security.mjs",
+    "test:mini-bind": "node scripts/test-mini-bind-security.mjs",
+    "test:mini-idempotency": "node scripts/test-mini-booking-idempotency.mjs",
+    "test:mini-availability": "node scripts/test-mini-availability.mjs",
+    "test:mini-cancel": "node scripts/test-mini-cancel-booking.mjs",
+    "test:mini-extend": "node scripts/test-mini-extend-stay.mjs",
+    "test:mini-services": "node scripts/test-mini-service-orders.mjs",
+    "test:mini-notifications": "node scripts/test-mini-notifications.mjs",
+    "test:mini-order-access": "node scripts/test-mini-order-access.mjs",
+    "test:mini-wallet": "node scripts/test-mini-member-wallet.mjs"
   },
   "dependencies": {
     "next": "16.4.6",
