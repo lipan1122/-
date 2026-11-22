@@ -87,7 +87,8 @@
     "test:night-audit-occupancy": "node scripts/test-night-audit-occupancy.mjs",
     "test:pre-arrival-buckets": "node scripts/test-pre-arrival-buckets.mjs",
     "test:all": "node scripts/verify-release.mjs",
-    "verify:release": "node scripts/verify-release.mjs"
+    "verify:release": "node scripts/verify-release.mjs",
+    "smoke:business": "node scripts/smoke-business-flow.mjs"
   },
   "dependencies": {
     "next": "16.4.6",
