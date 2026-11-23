@@ -157,9 +157,9 @@ else
   log "跳过演示数据（需要的话设 PMS_LOAD_DEMO=1 重跑）"
 fi
 
-# ── 数据收尾：一条命令跑完「修 + 验」 ──
+# ── 数据收尾：一条命令跑完「结构 + 数据 + 体检」 ──
 #
-# 上面三步只解决**结构**。真正让系统能对外服务的是后面这串**数据修复**，
+# 前面几步只解决**结构**。真正让系统能对外服务的是后面这串**数据修复**，
 # 而它们以前全靠部署完手动一条条敲，顺序还是口口相传的：
 #
 #   押金残留 → 房态复位 → 演示日期滚动 → 超卖修复 → 客史回填 → 体检
@@ -170,28 +170,28 @@ fi
 #   漏超卖修复 → /rooms/predict 显示占用 47 > 总房量 46，出租率 102%
 #   漏客史回填 → 在住单没有 guest_id，会员/积分/历史入住全关联不上
 #
-# scripts/post-deploy.mjs 把这串收成固定顺序 + 每步幂等 + 失败不中断 + 最后自体检。
+# scripts/post-deploy.mjs 把这串收成固定顺序 + 每步幂等 + 失败即停 + 最后自体检。
 # 重复执行是安全的：第二次跑应该看到「变更 0 处」。
 #
-# 退出码不能直接交给 set -e 中断部署：
-#   0 = 全通过           → 继续
-#   1 = 有数据残留/脚本缺失 → 继续部署，但要人看一眼（例如演示库的欠费积压本来就该留着）
-#   2 = 有步骤失败/体检严重 → 继续部署（服务能起），但必须立刻排查
+# ⚠️ 默认只读，**必须显式 --apply**（不写库的话这条命令只会打印报告）：
+#    node scripts/post-deploy.mjs --check   # 只报告（默认行为，部署脚本里不要用这个）
+#    node scripts/post-deploy.mjs --apply   # 备份一次 → 写库
+# ⚠️ 退出码：0 = 十步全部成功；1 = 有步骤失败（脚本当场停下，不会继续往后跑）。
+#    部署不因它中断（服务要能起来），但非 0 必须立刻看上面报告排查。
+# ⚠️ 紧跟其后的 chown 不能省！sudo 跑脚本会让 SQLite 创建归属 root 的
+#    data/pms.db-wal / -shm，而服务以 $APP_USER 运行 —— 漏了这行，
+#    下一个请求就 attempt to write a readonly database（第九轮真踩过）。
 if [ -f scripts/post-deploy.mjs ]; then
-  log "数据收尾：押金/房态/日期/超卖/客史 + 体检（scripts/post-deploy.mjs）"
-  if node scripts/post-deploy.mjs; then
+  log "数据收尾：结构 + 押金/房态/日期/超卖/客史 + 体检（scripts/post-deploy.mjs --apply）"
+  if node scripts/post-deploy.mjs --apply; then
     log "数据收尾全部通过"
   else
     RC=$?
-    if [ "$RC" -ge 2 ]; then
-      warn "收尾有失败项（退出码 $RC），部署继续，但请立刻看上面报告排查"
-    else
-      warn "收尾有数据残留（退出码 $RC），部署继续，数据可能需要人工核对"
-    fi
+    warn "数据收尾失败（退出码 $RC）：已按「失败即停」处理，后续步骤未执行，部署继续但请立刻排查"
   fi
 else
   warn "scripts/post-deploy.mjs 不存在（老代码？），跳过数据收尾"
-  warn "手动补跑：node scripts/fix-deposit-residual.mjs --apply && node scripts/fix-room-status.mjs --apply"
+  warn "手动补跑：node scripts/migrate-all.mjs && node scripts/fix-deposit-residual.mjs --apply && node scripts/roll-demo-dates.mjs --apply && node scripts/fix-oversell-bookings.mjs --apply && node scripts/backfill-guest-id-last8.mjs --apply"
 fi
 
 # 权限：服务以 $APP_USER 运行，data 目录要可写

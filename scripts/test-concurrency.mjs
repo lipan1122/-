@@ -810,7 +810,16 @@ if (want("status")) {
       reason: "并发改房态",
     })),
   });
-  const s = summarize("改房态", res);
+  /*
+   * setRoomStatusAction 成功时没有返回值（return undefined），所以不能套用
+   * 「{ok:true} 才算成功」的判定。这里按「没有抛异常」统计受理数，
+   * 再用 room_logs 的行数核对真实生效次数。
+   */
+  const accepted = res.filter((r) => kindOf(r) === "returned" || kindOf(r) === "ok").length;
+  const thrownCount = res.filter(isThrown).length;
+  const s = { ok: accepted, rejected: res.length - accepted - thrownCount, thrown: thrownCount };
+  console.log(`  → 改房态：受理 ${s.ok} / 被拒 ${s.rejected} / 请求异常 ${s.thrown}`);
+  if (thrownCount > 0) observe("改房态：请求抛异常（生产环境是 500）", res.filter(isThrown).map(msgOf).join(" | "));
 
   const logs = all(
     `SELECT id, from_status, to_status, operator FROM room_logs WHERE hotel_id = ? AND room_id = ? ORDER BY id`,

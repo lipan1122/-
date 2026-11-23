@@ -102,6 +102,16 @@ function login() {
   process.exit(1);
 }
 
+/** 等 3100 恢复（并行开发时可能在 next build / 重启） */
+function waitForServer(timeoutMs = 90000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (serverUp()) return true;
+    sleep(2000);
+  }
+  return false;
+}
+
 /** 测一个 URL：预热 1 次 + 正式 5 次，返回中位数 / 最小 / 最大 / 状态码 / 字节数 */
 function measurePage(urlPath) {
   const url = `${BASE}${urlPath}`;
@@ -114,9 +124,30 @@ function measurePage(urlPath) {
     return { status, ms: sec * 1000, bytes };
   };
 
+  /** 采样一次；服务重启/会话失效时自动等待并重登，避免把「别的 agent 在重启」记成页面失败 */
+  const sample = () => {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      let r;
+      try {
+        r = one();
+      } catch (e) {
+        r = { status: 0, ms: NaN, bytes: 0, error: String(e?.message ?? e) };
+      }
+      if (Number.isFinite(r.status) && r.status === 200) return r;
+      if (Number.isFinite(r.status) && (r.status === 301 || r.status === 302 || r.status === 307 || r.status === 308)) {
+        /* 跳登录页 = 服务被重启/会话表被清，重新登录后再试 */
+        login();
+        continue;
+      }
+      /* status 0 / NaN = 连接失败，等它起来 */
+      if (!waitForServer()) return r;
+    }
+    return { status: 0, ms: NaN, bytes: 0, error: "多次重试仍失败" };
+  };
+
   let warm;
   try {
-    warm = one();
+    warm = sample();
   } catch (e) {
     return { path: urlPath, error: String(e?.message ?? e), samples: [] };
   }
@@ -126,11 +157,7 @@ function measurePage(urlPath) {
 
   const samples = [];
   for (let i = 0; i < RUNS; i += 1) {
-    try {
-      samples.push(one());
-    } catch (e) {
-      samples.push({ status: 0, ms: NaN, bytes: 0, error: String(e?.message ?? e) });
-    }
+    samples.push(sample());
   }
   const times = samples.map((s) => s.ms).filter((n) => Number.isFinite(n)).sort((a, b) => a - b);
   const statuses = [...new Set(samples.map((s) => s.status))];

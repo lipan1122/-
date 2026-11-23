@@ -114,26 +114,24 @@ fi
 log "数据库概况"
 sqlite3 data/pms.db "SELECT '房间 ' || COUNT(*) || ' 间' FROM rooms; SELECT '用户 ' || COUNT(*) || ' 个' FROM users;" 2>/dev/null || true
 
-# ── 数据收尾：一条命令跑完「修 + 验」 ──
+# ── 数据收尾：一条命令跑完「结构 + 数据 + 体检」 ──
 #
-# 上面三步只解决**结构**。真正让系统能对外服务的是后面这串**数据修复**，
-# 而它们以前全靠部署完手动一条条敲（押金残留 → 房态复位 → 日期滚动 →
-# 超卖修复 → 客史回填 → 体检）。每一步漏掉都是这个项目真实踩过的故障，
-# 详见 deploy-vps.sh 里同一段注释。
+# 前面几步只解决**结构**。真正让系统能对外服务的是后面这串**数据修复**
+# （押金残留 → 房态复位 → 日期滚动 → 超卖修复 → 客史回填 → 体检）。
+# 每一步漏掉都是这个项目真实踩过的故障，详见 deploy-vps.sh 里同一段注释。
 #
-# 退出码：0 全通过 / 1 有残留 / 2 有失败。都不中断部署（服务要能起来），
-# 但 1 和 2 都会打警告，需要人看报告。
+# ⚠️ 默认只读，**必须显式 --apply**（不加就只打印报告，不写库）。
+# ⚠️ 退出码：0 = 十步全部成功；1 = 有步骤失败（当场停下）。部署不中断，
+#    但非 0 必须立刻看报告排查。
+# ⚠️ 紧跟其后的 chown 不能省：sudo 跑脚本会产生 root 的 data/pms.db-wal / -shm，
+#    服务以 $APP_USER 运行时下一个请求就 readonly database。
 if [ -f scripts/post-deploy.mjs ]; then
-  log "数据收尾：押金/房态/日期/超卖/客史 + 体检（scripts/post-deploy.mjs）"
-  if node scripts/post-deploy.mjs; then
+  log "数据收尾：结构 + 押金/房态/日期/超卖/客史 + 体检（scripts/post-deploy.mjs --apply）"
+  if node scripts/post-deploy.mjs --apply; then
     log "数据收尾全部通过"
   else
     RC=$?
-    if [ "$RC" -ge 2 ]; then
-      warn "收尾有失败项（退出码 $RC），部署继续，但请立刻看上面报告排查"
-    else
-      warn "收尾有数据残留（退出码 $RC），部署继续，数据可能需要人工核对"
-    fi
+    warn "数据收尾失败（退出码 $RC）：已按「失败即停」处理，后续步骤未执行，部署继续但请立刻排查"
   fi
 else
   warn "scripts/post-deploy.mjs 不存在（老代码？），跳过数据收尾"

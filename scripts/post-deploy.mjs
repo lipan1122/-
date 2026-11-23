@@ -68,9 +68,14 @@
  *   node scripts/post-deploy.mjs --check              # 同上（显式写法；--dry-run 是它的旧别名）
  *   node scripts/post-deploy.mjs --apply              # 备份一次 → 写库
  *   node scripts/post-deploy.mjs --apply --skip 房态复位 --skip roll-dates,oversell
+ *   node scripts/post-deploy.mjs --apply --only deposit,room-status   # 只跑指定步骤（排查用）
  *   node scripts/post-deploy.mjs --apply --days 60    # 超卖检查窗口（默认 30 天）
  *   node scripts/post-deploy.mjs --apply --verbose     # 打印子脚本完整输出
  *   PMS_DB_PATH=/path/to/pms.db node scripts/post-deploy.mjs --check
+ *
+ * 与合并前那一版相比，`--json` 没有保留：它要重写整套输出（人类可读 vs 机器可读两套），
+ * 而部署脚本里没有任何地方读 JSON；需要机器可读时单跑对应脚本（它们自己有结构化输出）。
+ * `--dry-run`、`--skip a,b`、单步超时环境变量 `PMS_POST_DEPLOY_TIMEOUT_MS` 都保留。
  */
 
 import { spawnSync } from "node:child_process";
@@ -114,6 +119,9 @@ const one = (db, sql, p = []) => {
 const tableExists = (db, name) =>
   Number(one(db, `SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name = ?`, [name])?.n ?? 0) > 0;
 
+const timeoutText = () =>
+  STEP_TIMEOUT_MS >= 1000 ? `${Math.round(STEP_TIMEOUT_MS / 1000)}s` : `${STEP_TIMEOUT_MS}ms`;
+
 const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 const money = (n) => round2(n).toFixed(2);
 const todayYmd = (db) =>
@@ -151,7 +159,7 @@ const STEP_DEFS = [
   {
     id: "migrate",
     name: "schema 迁移",
-    unit: "项",
+    unit: "处",
     kind: "fix",
     title: "数据库迁移 + 押金残留第 24 段",
     why: "补表/补列/补索引，并把押金残留修干净；缺了它页面直接 500",
@@ -159,7 +167,7 @@ const STEP_DEFS = [
   {
     id: "sync-schema",
     name: "补齐表结构",
-    unit: "项",
+    unit: "处",
     kind: "fix",
     script: "sync-schema.mjs",
     checkArgs: ["--check"],
@@ -170,7 +178,7 @@ const STEP_DEFS = [
   {
     id: "unique",
     name: "单号唯一约束",
-    unit: "项",
+    unit: "张",
     kind: "fix",
     script: "rebuild-unique-constraints.mjs",
     checkArgs: ["--check"],
@@ -252,12 +260,12 @@ const STEP_DEFS = [
 ];
 
 const SKIP_ALIASES = {
-  migrate: ["migrate", "migration", "schema迁移", "迁移", "数据库迁移", "1"],
+  migrate: ["migrate", "migration", "migrations", "schema", "schema迁移", "迁移", "数据库迁移", "1"],
   "sync-schema": ["sync-schema", "sync_schema", "sync", "补表", "补齐表结构", "表结构", "2"],
   unique: ["unique", "唯一约束", "单号唯一约束", "约束", "3"],
   deposit: ["deposit", "押金", "押金残留", "押金残留修复", "4"],
   "room-status": ["room-status", "room_status", "房态", "房态复位", "5"],
-  "roll-dates": ["roll-dates", "roll_dates", "roll-demo-dates", "日期", "日期滚动", "演示日期滚动", "6"],
+  "roll-dates": ["roll-dates", "roll_dates", "roll-demo-dates", "demo-dates", "日期", "日期滚动", "演示日期滚动", "6"],
   oversell: ["oversell", "超卖", "存量超卖", "存量超卖修复", "7"],
   "guest-id": ["guest-id", "guest_id", "客史", "客史回填", "8"],
   preflight: ["preflight", "体检", "一致性体检", "数据一致性体检", "9"],
@@ -296,6 +304,32 @@ function parseSkips() {
 }
 
 const SKIP = parseSkips();
+
+/** --only a,b：只跑指定步骤（id 或中文名），与 --skip 叠加时 ——only 优先 */
+function parseOnly() {
+  const i = ARGV.indexOf("--only");
+  let raw = [];
+  if (i >= 0) {
+    if (!ARGV[i + 1] || ARGV[i + 1].startsWith("--")) fail("--only 后面要跟步骤名，例如 --only deposit,room-status");
+    raw = ARGV[i + 1].split(",");
+  } else {
+    const eq = ARGV.find((a) => a.startsWith("--only="));
+    if (eq) raw = eq.slice("--only=".length).split(",");
+  }
+  const out = new Set();
+  for (const item of raw) {
+    const key = String(item).trim().toLowerCase().replace(/[\s_]+/g, "");
+    if (!key) continue;
+    const hit = Object.entries(SKIP_ALIASES).find(([, aliases]) =>
+      aliases.some((x) => x.toLowerCase().replace(/[\s_]+/g, "") === key || x.toLowerCase() === key)
+    );
+    if (!hit) fail(`不认识的 --only 步骤：${item}\n  可用：` + STEP_DEFS.map((x) => x.id).join(" / "));
+    out.add(hit[0]);
+  }
+  return out;
+}
+
+const ONLY = parseOnly();
 
 /* ============================================================ 子进程 */
 
@@ -352,8 +386,8 @@ function tail(s, n = 3) {
     .join(" ⏎ ");
 }
 
-/** 默认只打印「带数字/结论」的那几行；--verbose 打印全部 */
-function printChildOutput(out, err) {
+/** 默认只打印「带数字/结论」的那几行（--verbose 打印全部；体检类步骤传更小的 max，避免刷屏） */
+function printChildOutput(out, err, max = 14) {
   if (VERBOSE) {
     for (const line of String(out).split("\n")) if (line.trim()) console.log(`    │ ${line}`);
     for (const line of String(err).split("\n")) if (line.trim()) console.log(`    ! ${line}`);
@@ -368,8 +402,8 @@ function printChildOutput(out, err) {
       keep.push(t);
     }
   }
-  for (const line of keep.slice(0, 14)) console.log(`    │ ${line}`);
-  if (keep.length > 14) console.log(`    │ …… 还有 ${keep.length - 14} 行（--verbose 看全部）`);
+  for (const line of keep.slice(0, max)) console.log(`    │ ${line}`);
+  if (keep.length > max) console.log(`    │ …… 还有 ${keep.length - max} 行（--verbose 看全部）`);
 }
 
 /* ============================================================ 第 5 步：房态复位
@@ -590,6 +624,47 @@ function probeOversell(db, days) {
   };
 }
 
+/**
+ * 结构探针：按 schema-fingerprint.json 数「还缺多少表/列/索引」
+ *
+ * 为什么不解析 sync-schema.mjs 的输出：它的「补索引：N 条」是**执行了多少条
+ * CREATE INDEX IF NOT EXISTS**（脚本里 addedIndexes++ 不看索引是否已存在），
+ * 干净库上照样打 84 条 —— 拿它当变更数会让「幂等」看起来永远不成立。
+ * 这里自己按指纹比对，干净库恒为 0。
+ */
+let FP_CACHE;
+function fingerprint() {
+  if (FP_CACHE !== undefined) return FP_CACHE;
+  try {
+    FP_CACHE = JSON.parse(fs.readFileSync(path.join(HERE, "schema-fingerprint.json"), "utf8"));
+  } catch {
+    FP_CACHE = null;
+  }
+  return FP_CACHE;
+}
+
+function probeSchema(db) {
+  const fp = fingerprint();
+  if (!fp || !fp.tables) return { n: 0, text: "schema-fingerprint.json 不可读，跳过结构比对" };
+  const existing = new Set(
+    all(db, `SELECT name FROM sqlite_master WHERE type IN ('table','index')`).map((r) => String(r.name))
+  );
+  const fpTables = Object.keys(fp.tables);
+  const missingTables = fpTables.filter((t) => !existing.has(t));
+  let missingColumns = 0;
+  for (const t of fpTables) {
+    if (!existing.has(t)) continue;
+    const cols = new Set(all(db, `PRAGMA table_info(${t})`).map((c) => String(c.name)));
+    for (const c of fp.tables[t] ?? []) if (!cols.has(String(c.name))) missingColumns += 1;
+  }
+  const missingIndexes = (fp.indexes ?? []).filter((i) => existing.has(i.table) && !existing.has(i.name)).length;
+  const n = missingTables.length + missingColumns + missingIndexes;
+  return {
+    n,
+    text: `缺表 ${missingTables.length} 张 / 缺列 ${missingColumns} 个 / 缺索引 ${missingIndexes} 条`,
+  };
+}
+
 /** 客史：在住单 guest_id 为空 */
 function probeGuestId(db) {
   const r =
@@ -701,7 +776,7 @@ function runScriptStep(step, ctx) {
   const before = step.probe ? step.probe(db) : null;
   const out = runChild(base.script, args);
   if (out.missing) throw new Error(out.err);
-  if (out.timedOut) throw new Error(`超时（>${Math.round(STEP_TIMEOUT_MS / 1000)}s 被终止）`);
+  if (out.timedOut) throw new Error(`超时（>${timeoutText()} 被终止）`);
   if (!out.ok) {
     printChildOutput(out.out, out.err);
     const stderrTail = out.err ? `stderr：${tail(out.err)}` : "";
@@ -722,25 +797,21 @@ const STEP_RUNNERS = {
   deposit: stepDeposit,
   "room-status": stepRoomStatus,
 
-  /* 2. 补齐表结构 */
+  /* 2. 补齐表结构（计数用指纹探针的前后差，不用脚本自报的「补索引 N 条」） */
   "sync-schema": (ctx) =>
     runScriptStep(
       {
-        probe: (db) => {
-          const r = one(db, `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'index'`) ?? { n: 0 };
-          return { n: 0, text: `索引 ${r.n} 个（缺表/缺列/缺索引由脚本按指纹比对）` };
-        },
-        count: (s) =>
-          (pickNum(s, [/缺表：(\d+) 张/]) ?? 0) +
-          (pickNum(s, [/缺列：(\d+) 个/]) ?? 0) +
-          (pickNum(s, [/补索引：(\d+) 条/]) ?? 0) +
-          (pickNum(s, [/补表 (\d+) 张/, /新建表 (\d+) 张/]) ?? 0),
-        shape: ({ apply, changes, out }) => ({
-          changes,
-          result: changes === 0 ? (apply ? "已是目标状态" : "已是目标状态") : apply ? "已同步" : "待同步",
+        probe: probeSchema,
+        count: () => null,
+        shape: ({ apply, before, after }) => ({
+          changes: apply ? Math.max(0, before.n - after.n) : before.n,
+          before: before.text,
+          after: after.text,
+          result: before.n === 0 ? "已是目标状态" : apply ? "已同步" : "待同步",
           lines: [
-            `缺表 ${pickNum(out, [/缺表：(\d+) 张/]) ?? 0} 张 / 缺列 ${pickNum(out, [/缺列：(\d+) 个/]) ?? 0} 个` +
-              ((pickNum(out, [/补索引：(\d+) 条/]) ?? 0) > 0 ? ` / 补索引 ${pickNum(out, [/补索引：(\d+) 条/])} 条` : ""),
+            apply
+              ? `补上 ${Math.max(0, before.n - after.n)} 处结构差异（表 / 列 / 索引，按 schema-fingerprint.json）`
+              : `按指纹比对还差 ${before.n} 处`,
           ],
         }),
       },
@@ -831,7 +902,7 @@ const STEP_RUNNERS = {
   preflight: (ctx) => {
     const out = runChild("preflight-db.mjs", []);
     if (out.missing) throw new Error(out.err);
-    if (out.timedOut) throw new Error(`超时（>${Math.round(STEP_TIMEOUT_MS / 1000)}s 被终止）`);
+    if (out.timedOut) throw new Error(`超时（>${timeoutText()} 被终止）`);
     const severe = pickNum(out.out, [/检查项 \d+ 项：严重 (\d+)/]) ?? 0;
     const total = pickNum(out.out, [/检查项 (\d+) 项/]) ?? 0;
     const warn = pickNum(out.out, [/严重 \d+ \/ 警告 (\d+)/]) ?? 0;
@@ -840,7 +911,7 @@ const STEP_RUNNERS = {
       printChildOutput(out.out, out.err);
       throw new Error(`preflight-db.mjs 退出码 ${out.code}；${tail(out.err || out.out)}`);
     }
-    printChildOutput(out.out, out.err);
+    printChildOutput(out.out, out.err, 5);
     return {
       changes: 0,
       unitText: "—",
@@ -854,13 +925,13 @@ const STEP_RUNNERS = {
   health: (ctx) => {
     const out = runChild("health-check.mjs", ["--no-persist"]);
     if (out.missing) throw new Error(out.err);
-    if (out.timedOut) throw new Error(`超时（>${Math.round(STEP_TIMEOUT_MS / 1000)}s 被终止）`);
+    if (out.timedOut) throw new Error(`超时（>${timeoutText()} 被终止）`);
     const problems = pickNum(out.out, [/共 (\d+) 处待处理/]);
     if (out.code !== 0 && out.code !== 1) {
       printChildOutput(out.out, out.err);
       throw new Error(`health-check.mjs 退出码 ${out.code}；${tail(out.err || out.out)}`);
     }
-    printChildOutput(out.out, out.err);
+    printChildOutput(out.out, out.err, 5);
     return {
       changes: 0,
       unitText: "—",
@@ -934,14 +1005,18 @@ function main() {
     );
   }
 
-  const steps = STEP_DEFS.filter((s) => !SKIP.has(s.id));
+  const steps = STEP_DEFS.filter((s) => !SKIP.has(s.id) && (ONLY.size === 0 || ONLY.has(s.id)));
 
   console.log("═".repeat(78));
   console.log("部署后收尾（结构 → 数据 → 体检）");
   console.log(`数据库：${DB_PATH}`);
   console.log(`模式：${APPLY ? "APPLY（写库）" : "CHECK（只报告，不写任何数据）"}`);
-  console.log(`步骤：${steps.length}/${STEP_DEFS.length} 个${SKIP.size > 0 ? `；跳过 ${[...SKIP].join("、")}` : ""}`);
-  console.log(`超卖检查窗口：${DAYS} 天；单步超时：${Math.round(STEP_TIMEOUT_MS / 1000)}s`);
+  console.log(
+    `步骤：${steps.length}/${STEP_DEFS.length} 个` +
+      `${SKIP.size > 0 ? `；跳过 ${[...SKIP].join("、")}` : ""}` +
+      `${ONLY.size > 0 ? `；只跑 ${[...ONLY].join("、")}` : ""}`
+  );
+  console.log(`超卖检查窗口：${DAYS} 天；单步超时：${timeoutText()}`);
   console.log("═".repeat(78) + "\n");
 
   const db = new DatabaseSync(DB_PATH);
@@ -1005,7 +1080,10 @@ function main() {
     console.log("═".repeat(78));
 
     const changed = rows.reduce((s, r) => s + (Number.parseInt(r[1], 10) || 0), 0);
-    console.log(`合计：${steps.length} 步${SKIP.size > 0 ? `（跳过 ${SKIP.size} 步）` : ""} · 变更 ${changed} 处`);
+    console.log(
+      `合计：已跑 ${rows.length}/${steps.length} 步${failed ? "（失败即停）" : ""}` +
+        `${SKIP.size > 0 ? `（跳过 ${SKIP.size} 步）` : ""} · 变更 ${changed} 处`
+    );
     if (APPLY) {
       console.log(`备份：${backupPath}`);
       console.log("");

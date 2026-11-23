@@ -17,13 +17,18 @@ cp .env.example .env
 vi .env                     # 必改 SESSION_SECRET；公网部署删掉 PMS_ALLOW_HTTP 一行
 
 npm run db:init             # 建表 + 基础字典 + 演示数据
-npm run db:migrate          # 幂等，可重复跑
+node scripts/post-deploy.mjs --check   # 部署后收尾：先看会改什么（只读，默认就是这个模式）
+node scripts/post-deploy.mjs --apply   # 备份一次 → 写库（结构 + 数据修复 + 体检，一条命令）
 npm run reset:passwords     # 生成随机初始密码并打印，务必保存终端输出
 npm run preflight           # 上线自检，全部通过才继续
 
 npm run build
 npm run start
 ```
+
+`post-deploy --apply` 就是原来的「migrate-all + 押金/房态/日期/超卖/客史五个修复脚本」，
+十步固定顺序、每步幂等、失败即停，最后两步是体检。**默认只读**：
+不加 `--apply` 只打印报告，一个字节都不写。详见第 5 节。
 
 `reset:passwords` 会为 4 个初始账号生成随机密码并打印。**必须在公网开放前执行**：
 生产模式会直接拒绝 `admin123` / `123456` 等初始口令登录。
@@ -56,18 +61,50 @@ docker exec -it pms node scripts/reset-demo-passwords.mjs
 > HTTP 反代说明：若公网入口是 HTTPS、nginx 到应用走 HTTP，仍不要设 `PMS_ALLOW_HTTP=1`，
 > 浏览器看到的是 HTTPS，Secure Cookie 正常工作。只有「浏览器直接用 http:// 访问」时才需要设。
 
-## 5. 升级
+## 5. 升级 / 部署后数据收尾（一条命令）
+
+原来升级要按顺序敲 5~7 条命令（migrate-all → 押金 → 日期 → 超卖 → 客史 → chown → 重启），
+**漏一条不报错，数据就一直错着**（押金修复漏跑过两次，在住押金虚高 6800 元）。现在收成一条：
 
 ```bash
 cp data/pms.db data/backup-$(date +%Y%m%d%H%M).db   # 先备份，务必
 pm2 stop pms                                         # 或停掉 next start
 tar -xzf <新版本>.tar.gz --strip-components=1        # 保留 data/ 目录
 npm ci
-npm run db:migrate
+
+node scripts/post-deploy.mjs --check   # ① 只报告：十步各自会改什么（默认模式，不写库）
+node scripts/post-deploy.mjs --apply   # ② 备份一次 → 写库（结构 + 数据修复 + 体检）
+
 npm run build
 npm run preflight
 pm2 start pms
 ```
+
+VPS（systemd + sudo 跑脚本）的标准顺序：
+
+```bash
+sudo node scripts/post-deploy.mjs --apply
+sudo chown -R ubuntu:ubuntu data       # ← 这行必须留！见下面的「坑」
+sudo systemctl restart pms
+```
+
+⚠️ **`chown` 那行不能删、位置不能挪**（第九轮在 VPS 上真踩过）：
+`sudo node scripts/post-deploy.mjs --apply` 是**以 root 运行**的，SQLite 会顺手创建/改写
+`data/pms.db-wal`、`data/pms.db-shm`，它们的归属变成 `root`；而服务是 `ubuntu` 跑的，
+结果服务下一个请求就报 `attempt to write a readonly database` —— 页面全挂，但脚本输出全绿。
+所以：**任何 `sudo node scripts/x.mjs` 之后，都要在重启服务前 `chown` 一次 `data/`**。
+
+`--check` / `--apply` 的差别（这是本条命令唯一容易用错的地方）：
+
+| 参数 | 行为 | 用在哪 |
+| --- | --- | --- |
+| （不加）/ `--check` / `--dry-run` | 十步全部**只读**：修复类步骤用各自脚本的检查模式跑，体检类本来就只读。一个字节都不写 | 上线前预演、排查「部署后该不该修」 |
+| `--apply` | 第 1 步之前做一次 `VACUUM INTO data/backup/pms.db.bak-post-deploy-<时间戳>`，然后十步真写库。失败即停 | 真正的部署 / 升级 |
+
+十步（顺序有依赖，别改）：schema 迁移（含押金残留第 24 段）→ 补齐表结构 → 单号唯一约束 →
+押金残留 → 房态复位 → 演示日期滚动 → 超卖修复 → 客史回填 → 数据一致性体检（38 项）→ 业务体检。
+第 4 步在正常流程里恒为 0 变更（第 1 步已经修过），它是独立复核与兜底；
+`--skip <步骤名>` 可以跳过某步（如 `--skip oversell --skip roll-dates`）。
 
 迁移幂等，重复执行 0 变更。
 
@@ -91,7 +128,8 @@ npm run start
 
 ```bash
 npm run health             # 数据一致性 + 业务积压
-npm run db:migrate:check   # 检查未应用的迁移
+node scripts/post-deploy.mjs --check   # 十步收尾全跑一遍「只读版」：该修什么一眼看完
+npm run db:migrate:check   # 只看迁移（post-deploy 第 1 步的子集）
 npm run preflight          # 上线安全自检
 npm run lint / typecheck
 ```
@@ -103,6 +141,8 @@ npm run lint / typecheck
 - [ ] 公网部署已删除 `PMS_ALLOW_HTTP`，入口配好 HTTPS
 - [ ] 已执行 `npm run preflight`，无 ❌ 项
 - [ ] 演示数据已清空或换成真实门店基础数据
+- [ ] `post-deploy.mjs --apply` 跑过一遍，且**紧接着 `chown -R <服务用户>:<服务用户> data`**
+      （sudo 跑脚本会留下 root 的 `pms.db-wal`/`-shm`，漏了 chown 服务就写不了库）
 - [ ] `data/` 不在 Web 可访问路径下
 - [ ] 每日备份已配置并验证过一次恢复
 - [ ] 防火墙只开放 3100（或反代端口）

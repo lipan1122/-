@@ -7,7 +7,7 @@
  * 前台 / 收银 / 客房账号可以直接构造请求调用越权的写动作。
  * 「补了权限点」不等于「运行时真会拒」：权限点拼错、守卫写在写库之后、
  * 权限点没进 role_permissions、会话里的酒店 id 没校验……静态 grep 都看不出来。
- * 所以本脚本分三段，静态 + 运行时都要过：
+ * 所以本脚本分四段，静态 + 运行时都要过：
  *
  *   一、【静态源码校验】逐模块解析 actions.ts
  *      - 每个导出 action 必须在函数体最前面调用
@@ -526,8 +526,55 @@ const NEW_MODULES = [
         runtime: {
           call: "fd",
           params: (c) => {
-            c.marks.ptStockBefore = c.h.one(`SELECT stock FROM score_goods WHERE id = ?`, [c.ids.scoreGoods])?.stock ?? -1;
-            return { guest_id: c.ids.vipGuest, goods_id: c.ids.scoreGoods };
+            /* 会员 + 积分商品都惰性挑（ensurePointsSchema 已在本模块先跑过，表与种子一定存在） */
+            let guest = c.h.one(
+              `SELECT g.id, COALESCE(SUM(r.points), 0) AS bal
+                 FROM guests g
+                 LEFT JOIN score_records r ON r.hotel_id = g.hotel_id AND r.guest_id = g.id
+                WHERE g.hotel_id = 1 AND g.vip_level > 0 AND COALESCE(g.deleted, 0) = 0
+                GROUP BY g.id ORDER BY bal DESC LIMIT 1`
+            );
+            if (!guest) {
+              const gid = c.h.run(
+                `INSERT INTO guests (hotel_id, name, gender, id_type, id_no, mobile, company, vip_level, blacklist, note, created_at, deleted)
+                 VALUES (1,?,?,?,?,?,?,?,?,?,?,0)`,
+                [`权限验收会员-${c.suffix}`, "", "", "", "", "", 1, 0, "", new Date().toISOString()]
+              ).lastInsertRowid;
+              c.h.run(
+                `INSERT INTO score_records (hotel_id, guest_id, guest_name, type, points, balance_after, note, operator, created_at)
+                 VALUES (1,?,?,?,?,?,?,?,?)`,
+                [gid, `权限验收会员-${c.suffix}`, "EARN", 10000, 10000, "权限验收造数", "权限验收", new Date().toISOString()]
+              );
+              guest = { id: gid, bal: 10000 };
+            }
+            /* 余额太低（种子数据被改过）就补一笔调整，保证「放行后库存 -1」这条副作用断言稳定 */
+            if (Number(guest.bal) < 200) {
+              const after = Number(guest.bal) + 10000;
+              c.h.run(
+                `INSERT INTO score_records (hotel_id, guest_id, guest_name, type, points, balance_after, note, operator, created_at)
+                 VALUES (1,?,?,?,?,?,?,?,?)`,
+                [guest.id, `权限验收会员-${c.suffix}`, "ADJUST", 10000, after, "权限验收造数：补积分", "权限验收", new Date().toISOString()]
+              );
+              guest = { id: guest.id, bal: after };
+            }
+            let goods = c.h.one(
+              `SELECT id, points, stock FROM score_goods
+                WHERE hotel_id = 1 AND status = 'ACTIVE' AND stock > 0 AND points <= ?
+                ORDER BY points ASC LIMIT 1`,
+              [guest.bal]
+            );
+            if (!goods) {
+              const gid = c.h.run(
+                `INSERT INTO score_goods (hotel_id, name, points, stock, status, note, created_at)
+                 VALUES (1,?,?,?,?,?,?)`,
+                [`权限验收积分商品-${c.suffix}`, 100, 5, "ACTIVE", "", new Date().toISOString()]
+              ).lastInsertRowid;
+              goods = { id: gid, points: 100, stock: 5 };
+            }
+            c.ids.vipGuest = guest.id;
+            c.ids.scoreGoods = goods.id;
+            c.marks.ptStockBefore = goods.stock;
+            return { guest_id: guest.id, goods_id: goods.id };
           },
           allowed: ["frontdesk"],
           probe: "cashier",
@@ -1332,26 +1379,11 @@ async function prepareRuntime() {
   ids.tplToggleId = insertTpl(`PG${suffix}`);
   ids.tplSendId = insertTpl(`PS${suffix}`);
 
-  // 积分：先由 admin 调 ensurePointsSchema 建表 + 种子，再挑一个会员余额够的客人与最低价商品
-  ids.vipGuest = h.one(
-    `SELECT g.id
-       FROM guests g
-       LEFT JOIN score_records r ON r.hotel_id = g.hotel_id AND r.guest_id = g.id
-      WHERE g.hotel_id = 1 AND g.vip_level > 0 AND COALESCE(g.deleted, 0) = 0
-      GROUP BY g.id
-     HAVING COALESCE(SUM(r.points), 0) >= 100
-      ORDER BY COALESCE(SUM(r.points), 0) DESC
-      LIMIT 1`
-  )?.id;
-  // 积分商品用原值的「探针商品」，不依赖种子内容
-  const ensureGoodsId = h.one(`SELECT id FROM score_goods WHERE hotel_id = 1 ORDER BY id LIMIT 1`)?.id;
-  ids.scoreGoods =
-    ensureGoodsId ??
-    h.run(
-      `INSERT INTO score_goods (hotel_id, name, points, stock, status, note, created_at)
-       VALUES (1,?,?,?,?,?,?)`,
-      [`权限验收积分商品-${suffix}`, 100, 50, "ACTIVE", "", now]
-    ).lastInsertRowid;
+  /*
+   * 积分：score_goods / score_records 是 ensurePointsSchema 懒建的表，
+   * 所以「挑会员 + 挑商品」不在这里做，放到 redeemPointsAction 的参数里惰性解析
+   * （那时 ensurePointsSchema 已经在同一模块里先跑过，表和种子一定存在）。
+   */
 
   // 跨酒店：二店的一条失物（一店身份不能删它）
   ids.h2LostItem = h.run(
@@ -1428,8 +1460,9 @@ const resolveValue = (v, ctx) => (typeof v === "function" ? v(ctx) : v);
 async function callAs(ctx, mod, name, spec, role) {
   const fn = ctx.mods[mod.key]?.[name];
   if (typeof fn !== "function") throw new Error(`action 未加载：${mod.file}#${name}`);
-  ctx.h.useSession(ctx.sidOf[role]);
-  if (!ctx.sidOf[role]) throw new Error(`没有 ${role} 的会话`);
+  const sid = ctx.sidOf[role];
+  if (!sid) throw new Error(`没有 ${role} 的会话`);
+  ctx.h.useSession(sid);
   const rt = spec.runtime;
   if (rt.call === "pos") {
     const args = resolveValue(rt.args, ctx) ?? [];
@@ -1479,7 +1512,7 @@ function restoreRolePermission(ctx, role, permission, rows) {
 
 /* ---------- 运行时主流程 ---------- */
 
-const evidence = { revoked: [], allowed: [], effects: [] };
+const evidence = { denied: [], revoked: [], allowed: [], effects: [] };
 
 function recordEvidence(bucket, entry) {
   if (bucket.length < 12) bucket.push(entry);
@@ -1531,7 +1564,7 @@ async function auditRuntime(ctx) {
           d.ok ? "" : `实际：${describeResult(r)}`
         );
         if (d.ok) {
-          recordEvidence(evidence.revoked, {
+          recordEvidence(evidence.denied, {
             action: `${mod.file}#${name}`,
             permission: spec.permission,
             role,
@@ -1870,7 +1903,6 @@ async function main() {
     console.error(`❌ 运行时环境准备失败：${e?.stack ?? e}`);
     process.exit(1);
   }
-  ctx.constRoles = table;
 
   const db = makeDbRoles(ctx.h);
 
@@ -1889,17 +1921,22 @@ async function main() {
 
   /* 运行时证据（给验收报告直接引用） */
   console.log("\n=== 运行时证据 ===");
-  console.log("① 撤权 → 被拒（10 例，完整列表见上方逐 action 的 ✅ 行）：");
-  for (const [i, e] of evidence.revoked.slice(0, 10).entries()) {
+  console.log("① 无权角色直接调用 → 被拒（8 例，完整列表见上方逐 action 的 ✅ 行）：");
+  for (const [i, e] of evidence.denied.slice(0, 8).entries()) {
     console.log(`   ${i + 1}. ${e.action}`);
     console.log(`      角色 ${e.role} · 权限点 ${e.permission} → ${e.how}`);
   }
-  console.log("② 有权 → 放行并真实写库（10 例）：");
-  for (const [i, e] of evidence.allowed.slice(0, 10).entries()) {
+  console.log("② 从副本库撤销权限 → 同一个角色再调 → 被拒（8 例）：");
+  for (const [i, e] of evidence.revoked.slice(0, 8).entries()) {
+    console.log(`   ${i + 1}. ${e.action}`);
+    console.log(`      角色 ${e.role} · 权限点 ${e.permission} → ${e.how}`);
+  }
+  console.log("③ 有权限 → 放行并真实写库（8 例）：");
+  for (const [i, e] of evidence.allowed.slice(0, 8).entries()) {
     console.log(`   ${i + 1}. ${e.action} · ${e.role} → ${e.how}`);
   }
-  console.log("③ 放行后的真实副作用（10 例）：");
-  for (const [i, e] of evidence.effects.slice(0, 10).entries()) {
+  console.log("④ 放行后的真实副作用（8 例）：");
+  for (const [i, e] of evidence.effects.slice(0, 8).entries()) {
     console.log(`   ${i + 1}. ${e.action} → ${e.how}`);
   }
 

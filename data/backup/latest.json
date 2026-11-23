@@ -1,13 +1,13 @@
 {
-  "generatedAt": "2026-11-23T14:26:29+08:00",
-  "generatedAtUtc": "2026-11-23T06:26:29.847Z",
-  "file": "pms.2026-11-23T14-26-29.db",
-  "path": "D:\\dsh-home\\downloads\\pms酒管系统\\pms\\data\\backup\\pms.2026-11-23T14-26-29.db",
-  "sizeBytes": 2113536,
-  "sizeHuman": "2.0 MB",
-  "sha256": "13cdf6265fb4772fa1d6884c20f314ec1b1f2fdddac1e94d44102a2166d8052c",
+  "generatedAt": "2026-11-23T14:38:31+08:00",
+  "generatedAtUtc": "2026-11-23T06:38:31.295Z",
+  "file": "pms.2026-11-23T14-38-31.db",
+  "path": "D:\\dsh-home\\downloads\\pms酒管系统\\pms\\data\\backup\\pms.2026-11-23T14-38-31.db",
+  "sizeBytes": 2166784,
+  "sizeHuman": "2.1 MB",
+  "sha256": "13a4c328cfa098f8986e80cefca5f1e7e9d94f99c93daa58ec0253322ba4c9cb",
   "tableCount": 93,
-  "indexCount": 96,
+  "indexCount": 101,
   "counts": {
     "users": 4,
     "rooms": 46,
@@ -22,7 +22,7 @@
     "members": null,
     "ar_accounts": 5,
     "housekeeping_tasks": null,
-    "op_logs": 1802
+    "op_logs": 1842
   },
   "integrity": "ok",
   "foreignKeyViolations": 0,
@@ -33,7 +33,7 @@
     "sizeBytes": 2756608
   },
   "keep": 10,
-  "durationMs": 28,
+  "durationMs": 27,
   "node": "v24.22.3",
   "warnings": []
 }
