@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { getSession, PERMISSION_LABELS } from "@/lib/session";
+import { ROLE_LABEL } from "@/lib/utils";
 
 /**
  * 「没有该操作权限」提示页（第十轮验收 P2）
@@ -45,6 +46,16 @@ export default async function NoPermissionPage({
   const permission = /^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)?$/.test(raw) ? raw : "";
   const label = permission ? PERMISSION_LABELS[permission] : undefined;
 
+  /*
+   * 角色显示中文名（问题 3）
+   *
+   * 改前这里直接渲染 `user.role`，页面上出现的是「当前角色：frontdesk」，
+   * 而全站其它地方（顶部栏 / 设置页权限矩阵 / 移动端「我的」）都是中文岗位名。
+   * 映射用 `@/lib/utils` 的 ROLE_LABEL（全站同一份，新增角色请改那里），
+   * 找不到映射（比如以后加的自定义岗位）就回退显示 code，绝不显示空白。
+   */
+  const roleLabel = user ? ROLE_LABEL[user.role] ?? user.role : "";
+
   return (
     <div className="flex min-h-[60vh] items-center justify-center p-6">
       <div className="w-full max-w-[460px] rounded border border-amber-200 bg-amber-50 p-5">
@@ -57,7 +68,8 @@ export default async function NoPermissionPage({
           当前账号
           {user ? (
             <>
-              （<b>{user.realName || user.username}</b> / 角色 <code className="rounded bg-white px-1 font-mono text-[11px]">{user.role}</code>）
+              （<b>{user.realName || user.username}</b> / 角色{" "}
+              <b title={`角色代码：${user.role}`}>{roleLabel}</b>）
             </>
           ) : null}
           的角色不允许执行这个操作。这不是系统故障，数据没有任何改动。

@@ -1,4 +1,4 @@
-import { cookies } from "next/headers";
+import { cookies, headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { all, get, run } from "./db";
 import { nowIso } from "./utils";
@@ -84,9 +84,253 @@ export function cleanupExpiredSessions(): number {
   return res.changes;
 }
 
+/**
+ * 页面级守卫：当前角色能不能站在这条路径上
+ *
+ * ── 为什么放在这里（P0 架构：页面守卫曾经拦不住 Server Action）──
+ *
+ * `(main)/layout.tsx` 只在**页面渲染**时执行；Server Action 走的是 `POST /<页面路径>`，
+ * 不经过 layout。实测（改前）housekeeper 访问 /cashier 会被 307 挡回，但直接
+ * `POST /cashier` 调该页面的 action 照样执行并写库 —— 页面守卫与动作守卫是两套东西。
+ *
+ * 所有页面和所有 server action 的第一行都会调 `requireUser()` / `requirePermission()`，
+ * 所以把页面判定挂在这里 = 一处生效、动作层自动继承，不需要改 30+ 个 action 文件
+ * （其中 bookings / night-audit / rooms 等还在并行改动中，也不该被本修复碰到）。
+ *
+ * 判定口径只有一份（下面的 pageAccessOf）：`(main)/layout.tsx` 也从这里 import，
+ * 避免「两处各写一份」再次分叉。
+ *
+ * ── 为什么不放在 middleware（方案 B 的调查结论）──
+ * middleware 跑在 edge runtime（生产构建产物在 .next/server/edge/chunks），
+ * 而角色必须来自 SQLite（不能信任 Cookie，整改报告 P0-2.1）—— edge 里读不了库。
+ * 硬做只有「middleware 里 fetch 内部鉴权接口」（每个 action 多一次进程内往返 +
+ * 新增一个可探测接口）或「把 middleware.ts 改名 proxy.ts 换 Node 运行时」
+ * （改的是全局文件约定，牵扯 3100 上正在跑的构建），都不划算。
+ * 关键前提（实测）：Next 16 已经把 action 限定在它所属的页面 ——
+ * 把 /cashier 的 action id POST 到 /dashboard 会得到 409 Server Action unavailable。
+ * 所以「POST 的路径」就是「该 action 所属页面」，用请求路径做页面级判定是精确的。
+ *
+ * ── 三种结果 ──
+ *   · 放行（x-pathname 头不存在时也放行：`/api/**`、测试 harness、构建期都不参与判定）；
+ *   · 页面 GET 被拒 → `redirect()` 到原来的落点（/dashboard 或 /m，带同样的 err 文案）；
+ *   · 写请求（Server Action 一律 POST）被拒 → 抛 FORBIDDEN，动作不会被执行。
+ *     这里不能用 redirect：动作的 redirect 是受控返回，客户端会跟随，
+ *     而「无权限的人不该拿到任何可跟随的响应」，抛错同时让
+ *     `scripts/test-action-permissions.mjs` 的 HTTP 段仍判为「被拒」（500）。
+ *
+ * ── 为什么 GET 的要在这里判、不能只靠 layout（问题 2）──
+ * layout 与 page 是并行渲染的：layout 的 redirect 生效时，page 可能已经把
+ * 在住客人名单等数据流进了响应体（实测 housekeeper 拿 /cashier 的 307 响应体能读到
+ * 全部 17 位在住客人姓名）。页面第一行调的是 requireUser()，在这里 redirect 就能
+ * 在**任何数据查询之前**中断，307 响应体里不再有业务数据。
+ */
+
+/**
+ * middleware 透传下来的「请求路径」头
+ *
+ * 与 `src/middleware.ts` 里的名字必须一致。middleware 无条件覆盖该头，
+ * 客户端自己塞同名头不会影响判定。
+ */
+export const PATHNAME_HEADER = "x-pathname";
+
+/**
+ * middleware 透传下来的「HTTP 方法」头
+ *
+ * 为什么要方法：同一个 `requireUser()` 既被页面渲染调用、又被 action 调用。
+ *   · GET/HEAD（页面渲染）→ 被拒时 `redirect()`，保持原有页面体验；
+ *   · 其它方法（Server Action 一律 POST）→ 被拒时抛 FORBIDDEN，
+ *     绝不让动作继续往下跑（也不会给客户端留下可跟随的页面数据）。
+ * 客户端伪造该头无效：middleware 用 `req.method` 覆盖。
+ */
+export const METHOD_HEADER = "x-pms-http-method";
+
+/**
+ * 管理类页面：只有 admin 能进
+ * （改动请只改这里；(main)/layout.tsx 不再自带一份清单）
+ */
+export const ADMIN_ONLY_PATHS = [
+  "/settings",
+  "/channels",
+  "/lock-settings",
+  "/logs",
+  "/query-logs",
+  "/wechat",
+  "/dummy-rooms",
+  "/rate-codes",
+  "/sms",
+  "/devices",
+];
+
+/**
+ * 移动端子路由 → 桌面模块名
+ *
+ * ⚠️ 必须与 `src/app/(mobile)/layout.tsx` 里的 `MOBILE_MODULE_OF` 保持一致：
+ * 权限矩阵登记的是桌面路径，`/m/xxx` 只是同一个模块的手机版入口。
+ * （那份代码不在本次可改范围内，所以这里做一份镜像；以后改任一份都要同步。）
+ */
+export const MOBILE_MODULE_OF: Record<string, string> = {
+  "/m/rooms": "/rooms",
+  "/m/checkin": "/frontdesk",
+  "/m/orders": "/orders",
+  "/m/cashier": "/cashier",
+  "/m/housekeeping": "/mobile-housekeeping",
+};
+
+/** 所有角色都能进的移动端页面（工作台 / 我的 / 旧入口跳转页） */
+export const MOBILE_PUBLIC_PATHS = ["/m", "/m/me", "/mobile"];
+
+/** 桌面端被拒后的落点（与 layout 改前一致） */
+export const DESKTOP_HOME = "/dashboard";
+/** 移动端被拒后的落点（与 (mobile)/layout.tsx 一致） */
+export const MOBILE_HOME = "/m";
+
+/** 被拒文案（桌面 / 移动共用，改前就是这一句，不改已有的 URL 语义） */
+export const NO_PAGE_ACCESS_MESSAGE = "当前角色无权访问该页面";
+
+/** 判定结果：allowed 或「拦住 + 该跳哪」 */
+export type PageGate =
+  | { allowed: true }
+  | {
+      allowed: false;
+      /** 拦截原因：admin_only 管理类页面 / module 模块未授权 / mobile 移动端映射 / unknown 未登记的移动页 */
+      reason: "admin_only" | "module" | "mobile" | "unknown";
+      /** 页面 GET 被拒时的落点（带 err 文案，与改前的 URL 完全一致） */
+      redirectTo: string;
+    };
+
+/** 路径归一化：去掉查询串 / 片段 / 末尾斜杠，空值视为根路径 */
+export function normalizePathname(raw: string | null | undefined): string {
+  const path = (raw ?? "").split("?")[0].split("#")[0].replace(/\/$/, "");
+  return path || "/";
+}
+
+/** 是否管理类页面（只有 admin 能进） */
+export function isAdminOnlyPath(pathname: string): boolean {
+  return ADMIN_ONLY_PATHS.some((p) => pathname === p || pathname.startsWith(p + "/"));
+}
+
+/** 是否员工移动端路径（/m、/m/**、/mobile），这些路径不能直接套桌面模块名 */
+export function isMobilePath(pathname: string): boolean {
+  return pathname === "/m" || pathname === "/mobile" || pathname.startsWith("/m/");
+}
+
+/** 移动端路径 → 桌面模块名；未登记返回 undefined（= 不放行，与 (mobile)/layout.tsx 一致） */
+export function mobileModuleOf(pathname: string): string | undefined {
+  const exact = MOBILE_MODULE_OF[pathname];
+  if (exact) return exact;
+  for (const [base, module] of Object.entries(MOBILE_MODULE_OF)) {
+    if (pathname.startsWith(base + "/")) return module;
+  }
+  return undefined;
+}
+
+/** 是不是「写请求」（Server Action 一律 POST；GET/HEAD 才是页面渲染） */
+export function isMutationMethod(method: string | null | undefined): boolean {
+  const m = (method ?? "").toUpperCase();
+  return m !== "" && m !== "GET" && m !== "HEAD";
+}
+
+/** 被拒落点 */
+function deniedRedirect(pathname: string): string {
+  const home = isMobilePath(pathname) ? MOBILE_HOME : DESKTOP_HOME;
+  return `${home}?err=${encodeURIComponent(NO_PAGE_ACCESS_MESSAGE)}`;
+}
+
+/**
+ * 页面访问判定（纯函数，与 (main)/layout.tsx 共用同一份）
+ *
+ * 判定顺序（与两个 layout 改前的行为逐条对齐）：
+ *   根路径 "/"            → 放行（layout 本来就不判 "/"）
+ *   移动端 /m、/mobile    → 公开页放行；其余按 MOBILE_MODULE_OF 换算后 canAccess
+ *   桌面非根路径          → 管理类页面只给 admin；其余 canAccess
+ *
+ * @param user     当前登录用户（只需要 role / hotelId）
+ * @param pathname 请求路径（带查询串也行，内部会归一化）
+ */
+export function pageAccessOf(
+  user: { role: string; hotelId?: number },
+  pathname: string
+): PageGate {
+  const path = normalizePathname(pathname);
+
+  /* 根路径没有页面（只是入口跳转），与 layout 一致不判权限 */
+  if (path === "/") return { allowed: true };
+
+  if (isMobilePath(path)) {
+    if (MOBILE_PUBLIC_PATHS.includes(path)) return { allowed: true };
+    const module = mobileModuleOf(path);
+    if (!module) return { allowed: false, reason: "unknown", redirectTo: deniedRedirect(path) };
+    return canAccess(user.role, module, user.hotelId)
+      ? { allowed: true }
+      : { allowed: false, reason: "mobile", redirectTo: deniedRedirect(path) };
+  }
+
+  if (user.role !== "admin" && isAdminOnlyPath(path)) {
+    return { allowed: false, reason: "admin_only", redirectTo: deniedRedirect(path) };
+  }
+
+  return canAccess(user.role, path, user.hotelId)
+    ? { allowed: true }
+    : { allowed: false, reason: "module", redirectTo: deniedRedirect(path) };
+}
+
+async function guardPageAccess(user: SessionUser, explicitPath?: string): Promise<void> {
+  let h: Awaited<ReturnType<typeof headers>>;
+  try {
+    h = await headers();
+  } catch {
+    /*
+     * 没有请求上下文（构建期预渲染、测试 harness、脚本直接 import）——
+     * 这时不存在「越权请求」这回事，跳过判定，保持原有行为。
+     */
+    return;
+  }
+
+  /* 显式传入路径 = 调用方声明自己在操作哪个页面；否则用 middleware 透传的请求路径 */
+  const pathname = normalizePathname(explicitPath ?? h.get(PATHNAME_HEADER) ?? "");
+  if (!pathname || pathname === "/") return;
+
+  const gate = pageAccessOf(user, pathname);
+  if (gate.allowed) return;
+
+  if (isMutationMethod(h.get(METHOD_HEADER))) {
+    throw new Error(
+      `FORBIDDEN: ${NO_PAGE_ACCESS_MESSAGE}（${pathname}）；` +
+        "该动作所属页面对当前角色未开放，服务端已拒绝执行"
+    );
+  }
+
+  redirect(gate.redirectTo);
+}
+
+/**
+ * 读当前登录用户（含页面级守卫）
+ *
+ * 任何页面 / Server Action 只要调用了它，就同时获得了「页面是否能进」的校验：
+ *   · 页面渲染：越权 → redirect（与 (main)/layout.tsx 同一个落点）；
+ *   · Server Action：越权 → 抛 FORBIDDEN，绝不执行到写库代码。
+ */
 export async function requireUser(): Promise<SessionUser> {
   const u = await getSession();
   if (!u) redirect("/login");
+  await guardPageAccess(u);
+  return u;
+}
+
+/**
+ * 显式页面级断言（新代码优先用它，语义比 requireUser 更清楚）
+ *
+ * 用法：
+ *   · 页面/动作里判断「我操作的页面」：`await requirePageAccess("/cashier")`
+ *   · 不传参 = 用当前请求路径（middleware 透传的 x-pathname）
+ *
+ * 与 requireUser 的关系：两者共用同一段 guardPageAccess，不存在两套口径；
+ * requireUser 已经内置了这次调用，所以**老代码不用改**。
+ */
+export async function requirePageAccess(pagePath?: string): Promise<SessionUser> {
+  const u = await getSession();
+  if (!u) redirect("/login");
+  await guardPageAccess(u, pagePath);
   return u;
 }
 

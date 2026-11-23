@@ -1,26 +1,9 @@
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import AppShell from "@/components/AppShell";
-import { canAccess, getSession } from "@/lib/session";
+import { PATHNAME_HEADER, getSession, normalizePathname, pageAccessOf } from "@/lib/session";
 import { bizToday } from "@/lib/biz-date";
 import { countPendingChannelOrders } from "@/lib/channel-orders";
-
-/**
- * 管理类页面：只有 admin 能进
- * （普通前台/收银/客房账号直接访问会被挡回工作台）
- */
-const ADMIN_ONLY = [
-  "/settings",
-  "/channels",
-  "/lock-settings",
-  "/logs",
-  "/query-logs",
-  "/wechat",
-  "/dummy-rooms",
-  "/rate-codes",
-  "/sms",
-  "/devices",
-];
 
 /**
  * 主布局
@@ -37,6 +20,13 @@ const ADMIN_ONLY = [
  *
  * 正确做法：权限判断永远执行；预取请求命中越权时不 redirect（那会让 Next 缓存一次跳转），
  * 而是返回 null 空壳 —— 客户端预取拿到空壳什么也不缓存，真正导航时仍会被拦。
+ *
+ * ⚠️ 但注意（P0 架构修复后）：这里**不再是唯一的页面守卫**
+ *   · 判定口径已抽到 `@/lib/session` 的 `pageAccessOf()`（含 ADMIN_ONLY_PATHS 与移动端映射），
+ *     本文件与 `requireUser()` 共用同一份，避免两处分叉；
+ *   · Server Action 不经过 layout，由 `requireUser()` 里的 guardPageAccess 兜住；
+ *   · GET 页面在第一行 `requireUser()` 时就会再判一次，越权时**在任何数据查询之前**
+ *     redirect —— 这样 307 响应体里不会带出受保护页面的数据（问题 2）。
  */
 export default async function MainLayout({ children }: { children: React.ReactNode }) {
   const h = await headers();
@@ -48,31 +38,18 @@ export default async function MainLayout({ children }: { children: React.ReactNo
     redirect("/login");
   }
 
-  /* ---------- 角色守卫（预取也照样判断，只是命中越权时不 redirect） ---------- */
-  const rawPath = h.get("x-pathname") ?? "";
-  const pathname = (rawPath.split("?")[0] || "").replace(/\/$/, "") || "/";
-
-  if (pathname !== "/") {
-    const blocked = (() => {
-      if (
-        user.role !== "admin" &&
-        ADMIN_ONLY.some((p) => pathname === p || pathname.startsWith(p + "/"))
-      ) {
-        return true;
-      }
-      return !canAccess(user.role, pathname, user.hotelId);
-    })();
-
-    if (blocked) {
-      /*
-       * 预取请求也 redirect（不再 return null）
-       *
-       * Next 16 的 layout 里 `return null` 并不会阻止 child 页面渲染 ——
-       * 实测带 `sec-fetch-mode: cors` 访问 /settings 仍返回 66573 字节完整页面。
-       * redirect 对预取同样是安全的：客户端拿到 307 就不缓存该路由。
-       */
-      redirect("/dashboard?err=" + encodeURIComponent("当前角色无权访问该页面"));
-    }
+  /* ---------- 角色守卫（预取也照样判断；口径见 @/lib/session 的 pageAccessOf） ---------- */
+  const pathname = normalizePathname(h.get(PATHNAME_HEADER));
+  const gate = pageAccessOf(user, pathname);
+  if (!gate.allowed) {
+    /*
+     * 预取请求也 redirect（不再 return null）
+     *
+     * Next 16 的 layout 里 `return null` 并不会阻止 child 页面渲染 ——
+     * 实测带 `sec-fetch-mode: cors` 访问 /settings 仍返回 66573 字节完整页面。
+     * redirect 对预取同样是安全的：客户端拿到 307 就不缓存该路由。
+     */
+    redirect(gate.redirectTo);
   }
 
   /*
