@@ -74,8 +74,8 @@ export type ChangeResult = { ok: true } | { ok: false; error: string };
 /**
  * 写事务（不嵌套报错）
  *
- * `changeRoomStatus` 有 18 个调用点，**其中 6 处已经在外层 `tx()` 里**
- * （入住 / 退房 / 换房 / 取消入住等），所以这里不能再无脑 `BEGIN IMMEDIATE`
+ * `changeRoomStatus` 有 18 个调用点，**多处已经在外层 `tx()` 里**
+ * （入住 / 退房 / 换房 / 取消入住等，至少 6 处），所以这里不能再无脑 `BEGIN IMMEDIATE`
  * —— 嵌套 BEGIN 会抛 "cannot start a transaction within a transaction"。
  *
  *   · 不在事务里 → 自己开 BEGIN IMMEDIATE（与 lib/db.ts 的 tx() 同口径：
