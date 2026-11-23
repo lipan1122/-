@@ -10,6 +10,7 @@
  * 用法：node scripts/test-checkout-vd.mjs
  */
 import http from "node:http";
+import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 
@@ -107,10 +108,19 @@ if (!target) {
 
 console.log(`测试目标：${target.room_no} ${target.guest_name}（当前房态 ${target.room_status}，余额 ${target.balance}）\n`);
 
-/* 校验流转表本身允许 OC→VD（静态断言） */
-const allowed = one(`SELECT 1 AS x`);
-void allowed;
-check("房态流转表允许 OC → VD（代码层）", true, "见 src/lib/status.ts ALLOWED.OC");
+/* 校验流转表本身允许 OC→VD（静态断言）
+ *
+ * 原来这里是 check("房态流转表允许 OC → VD（代码层）", true, "见 src/lib/status.ts ALLOWED.OC")
+ * —— 恒真断言，而且指向的 src/lib/status.ts 早就不存在了（真实位置 src/lib/room-status.ts）：
+ * 流转表哪怕删掉 VD，这条也照样打 ✅。现在真去读源码里的 ALLOWED.OC 数组。
+ */
+const statusSrc = readFileSync(path.join(process.cwd(), "src", "lib", "room-status.ts"), "utf8");
+const ocAllows = statusSrc.match(/\n\s*OC:\s*\[([^\]]*)\]/);
+check(
+  "房态流转表允许 OC → VD（代码层 src/lib/room-status.ts ALLOWED.OC）",
+  Boolean(ocAllows) && /["']VD["']/.test(ocAllows[1]),
+  ocAllows ? `ALLOWED.OC = [${ocAllows[1].trim()}]` : "room-status.ts 里找不到 ALLOWED.OC"
+);
 
 /* 登录 */
 const loginBody = new URLSearchParams({ username: "admin", password: "admin123" }).toString();

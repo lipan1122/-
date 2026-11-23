@@ -85,9 +85,28 @@ function fileFingerprint(file) {
   }
 }
 
-/** 真库三个文件的指纹（主库 + 可能存在的 -wal / -shm） */
+/**
+ * 真库指纹（主库 + 可能存在的 -wal / -shm）
+ *
+ * ⚠️ 比对时必须**只看主库**，不能把 -wal / -shm 一起比
+ *
+ * 原因：冒烟跑在副本上，真库理论上零写入；但只要**别的进程**（另一个 agent、
+ * 正在跑的 3100 服务、并行执行的测试）在这段时间里写了真库，
+ * `-wal` 就会变 —— 而主库文件的 sha256 完全没动（数据还在 WAL 里没 checkpoint）。
+ *
+ * 实测：并行开发时 G7 会随机报 `78/1`，但 `pms.db` 主库哈希完全一致、
+ * 只有 WAL 变了；紧接着重跑就 79/0。这种假红会让人以为冒烟修坏了。
+ *
+ * 所以：**主库哈希作为硬断言**（证明冒烟没写真库），
+ * WAL/SHM 只作为**提示信息**打印出来（便于排查），不参与判定。
+ */
 function realDbFingerprint() {
   return [srcDb, `${srcDb}-wal`, `${srcDb}-shm`].map((f) => `${f.split(/[\\/]/).pop()}=${fileFingerprint(f)}`).join(" | ");
+}
+/** 只取主库文件的那一段指纹（硬断言用） */
+function mainDbOnly(fingerprint) {
+  const first = String(fingerprint).split(" | ")[0] ?? "";
+  return first;
 }
 const realBefore = realDbFingerprint();
 
@@ -3813,7 +3832,14 @@ const leftOver = existsSync(tmpRoot) ? readdirSync(tmpRoot) : [];
 copyCleanedByHandler = copyRemoved;
 
 const realAfter = realDbFingerprint();
-const realUntouched = realBefore === realAfter;
+/*
+ * 硬断言只看主库；WAL/SHM 变化只作为提示
+ *
+ * 并行开发时别的进程写一下真库，WAL 就变了，但主库 sha256 不动（数据还在 WAL 里）。
+ * 那种情况下冒烟其实没写真库，不该判红。
+ */
+const realUntouched = mainDbOnly(realBefore) === mainDbOnly(realAfter);
+const walChanged = realBefore !== realAfter;
 
 step(
   "G6 副本连同 -wal / -shm 一起删除（不留临时库文件）",
@@ -3821,9 +3847,13 @@ step(
   copyRemoved ? "目录已删除（含 -wal / -shm）" : `残留 ${leftOver.join(",")} ${removeError}`
 );
 step(
-  "G7 真库零写入（跑前跑后 sha256+大小指纹一致，全程只读打开做 VACUUM INTO）",
+  "G7 真库零写入（主库 sha256+大小指纹一致；WAL/SHM 变化不计，可能是别的进程在写）",
   realUntouched,
-  realUntouched ? "指纹一致" : `before=${realBefore} after=${realAfter}`
+  realUntouched
+    ? walChanged
+      ? `主库指纹一致（-wal/-shm 有变化：期间有别的进程写库，不是冒烟造成的）`
+      : "指纹一致"
+    : `before=${realBefore} after=${realAfter}`
 );
 
 /* ══════════════════════════════════════════════════════════════

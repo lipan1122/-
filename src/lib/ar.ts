@@ -51,6 +51,37 @@
  * ── 事务 ──
  * 与 member-wallet.ts 一致用 SAVEPOINT：本文件会在收银台已有的 tx() 内被调用，
  * BEGIN 嵌套会抛错，SAVEPOINT 在有/无外层事务两种场景下都安全。
+ *
+ * ── 第十轮调查：真库 ar_ledgers 0 行，但它**不是废弃表** ──
+ *
+ * 独立验证发现「ar_ledgers 0 行却被其他表引用」，看上去像死表。逐项查下来：
+ *
+ *   读取 13 处（都在用）：本文件的 listArLedgers / listArAging / listCompanyOutstanding /
+ *     getCompanyOutstanding / settleCompanyLedgers / settleAr / postArCharge 幂等查询 /
+ *     resolveArAccount 的历史结转，加上
+ *     · app/(main)/finance/page.tsx   —— 财务页「协议单位应收」列表（唯一数据源）
+ *     · app/(main)/reports/page.tsx   —— AR 账报表的「历史挂账兜底」段
+ *     · app/(main)/cashier/actions.ts —— 挂账退房核对账单余额是否已被挂账覆盖
+ *     · app/(main)/companies/actions.ts —— 删协议单位前的未结台账引用检查
+ *   写入 8 处、DDL 3 处（全部在本文件）。
+ *   「只要有读取就不是废弃表」——这里是 13 处读取对 8 处写入，读比写还多。
+ *
+ *   0 行的原因是**两条写入路径在真库都没触发过**：
+ *     ① 真实挂账 chargeToCompanyAction → postArCharge：真库 folios 没有任何 CHARGED
+ *        账单、op_logs 里 0 条 AR 操作，说明从来没有真实挂账发生过；
+ *     ② 演示种子（app/(main)/ar/actions.ts 的 seedHotel）只灌 ar_accounts +
+ *        ar_transactions，**从不写 ar_ledgers**。
+ *   判据：真库 55 行 ar_transactions 的 request_id 全 NULL（seedHotel 调 recordTx
+ *   不传幂等键）、created_at 秒位全 00（isoAt(biz_date) 固定 10:00）、每账户首行都是
+ *   「期初余额结转」——三条同时成立只能是演示种子。
+ *
+ *   后果是账户总账与笔级台账从第一天起就分叉：账户 23200/13600/53800，
+ *   而 /finance 的协议单位应收列表恒为空。修法**不是删表**，而是回填：
+ *   scripts/migrate-all.mjs 第 21 段按 FIFO 把账户总账回填成台账并固化
+ *   ar_accounts.company_id（之后双写走精确绑定，不再靠名称模糊匹配猜）。
+ *
+ *   所以本文件里任何「ar_ledgers 可能没有数据」的兜底都只应表达「链路还没走通」，
+ *   而不是「这张表可以不要」。
  */
 
 import { all, get, getDb, run } from "@/lib/db";
@@ -122,6 +153,10 @@ function round2(n: number): number {
  * 懒建表 + 索引（幂等）
  * DDL 与 scripts/migrate-all.mjs 第 9 段完全一致；迁移脚本是 schema 的唯一来源，
  * 这里是「页面先跑起来」的兜底。
+ *
+ * 注意「建表 ≠ 有数据」：本函数只保证表与索引存在，不灌任何数据。
+ * 台账为空通常意味着「还没有真实挂账」，而不是调用方可以不写 —— 见文件头
+ * 「第十轮调查」那段：历史账户总账由 migrate-all.mjs 第 21 段回填一次。
  */
 export function ensureArLedgerSchema(): void {
   if (schemaReady) return;
@@ -1124,4 +1159,87 @@ export function listCompanyOutstanding(hotelId: number): { companyId: number; co
       outstanding: round2(Number(r.outstanding ?? 0)),
     }))
     .filter((r) => Math.abs(r.outstanding) > EPS);
+}
+
+/* ------------------------------------------------------------------ *
+ * 账户余额 ↔ 协议单位台账未结：偏差自检（只读）
+ * ------------------------------------------------------------------ */
+
+/** 一家协议单位的「账户总账 vs 笔级台账」对账行 */
+export type ArLedgerDriftRow = {
+  accountId: number;
+  accountCode: string;
+  accountName: string;
+  companyId: number;
+  companyName: string;
+  /** ar_accounts.balance（账户维度应收余额） */
+  accountBalance: number;
+  /** SUM(ar_ledgers.amount - settled)（笔级台账未结合计） */
+  ledgerOutstanding: number;
+  /** 偏差 = 账户余额 − 台账未结；正常应为 0 */
+  drift: number;
+};
+
+/**
+ * 已绑定协议单位的账户，逐个对账「账户余额 = 台账未结」
+ *
+ * ── 为什么要暴露这个 ──
+ * 双写（挂账 / 收款 / 转账 / 核销）本该让两边永远相等，但历史上出现过
+ * 「ar_ledgers 空表而账户有余额」的分叉，而且两个数分别显示在 /ar 与 /finance，
+ * 没有任何一处把它们摆在一起比较 —— 分叉可以无声无息地存在几个月。
+ * 报表里把这个偏差显式列出来，等于把「对账」这一步做成了自动告警：
+ *   · drift = 0           两边一致；
+ *   · |drift| > 0.005     有历史链没走通（回填前的老库）或有人绕过 lib/ar 直接改了余额。
+ *
+ * ── 为什么只查「已绑定协议单位」的账户 ──
+ * 挂账客户 / 内部往来这类纯账户本来就没有笔级台账（ar_ledgers.company_id NOT NULL），
+ * 它们的余额不进台账是设计如此，算进偏差只会制造噪音。
+ *
+ * 只读：不建表也能安全调用（表不存在时 getDb 会在 ensure 里建，但查询不会写数据）。
+ */
+export function listArLedgerDrift(hotelId: number): ArLedgerDriftRow[] {
+  ensureArLedgerSchema();
+  ensureArAccountSchema();
+  const rows = all<{
+    account_id: number;
+    code: string;
+    account_name: string;
+    balance: number | null;
+    company_id: number;
+    company_name: string | null;
+    ledger_outstanding: number | null;
+  }>(
+    `SELECT a.id AS account_id,
+            a.code,
+            a.name AS account_name,
+            a.balance,
+            a.company_id,
+            c.name AS company_name,
+            COALESCE((
+              SELECT SUM(l.amount - COALESCE(l.settled_amount, 0))
+                FROM ar_ledgers l
+               WHERE l.hotel_id = a.hotel_id
+                 AND l.company_id = a.company_id
+                 AND l.status IN ('OPEN', 'PARTIAL')
+            ), 0) AS ledger_outstanding
+       FROM ar_accounts a
+       JOIN companies c ON c.id = a.company_id AND c.hotel_id = a.hotel_id
+      WHERE a.hotel_id = ? AND a.company_id IS NOT NULL
+      ORDER BY a.id`,
+    [hotelId]
+  );
+  return rows.map((r) => {
+    const accountBalance = round2(Number(r.balance ?? 0));
+    const ledgerOutstanding = round2(Number(r.ledger_outstanding ?? 0));
+    return {
+      accountId: Number(r.account_id),
+      accountCode: String(r.code ?? ""),
+      accountName: String(r.account_name ?? ""),
+      companyId: Number(r.company_id),
+      companyName: r.company_name ?? `协议单位#${r.company_id}`,
+      accountBalance,
+      ledgerOutstanding,
+      drift: round2(accountBalance - ledgerOutstanding),
+    };
+  });
 }

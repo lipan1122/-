@@ -20,7 +20,16 @@ export const dynamic = "force-dynamic";
  */
 const MAX_DAYS = 60; // 需求：日期范围最长 60 天
 const DEFAULT_DAYS = 30; // 需求：默认今天起 30 天
-const PROMPT_LIMIT = 30; // 「引入待排房订单」弹窗最多列 30 条
+/*
+ * 「引入待排房订单」弹窗的行数上限。
+ *
+ * 弹窗从「订单级」改成「明细级」后，一张多房订单会占多行（一行 = 一个待分房单位），
+ * 所以上限要跟着放大：原来 30 是按「订单」算的，若仍卡 30 条，
+ * 一个待分房很多的日期会出现「表头写 40 间、弹窗只列 30 间」的新不一致。
+ * 这里放到 200 间（弹窗表体本来就滚动，不影响页面性能），
+ * 同时仍然保留一个上限，避免极端脏数据把弹窗渲染拖垮。
+ */
+const PROMPT_LIMIT = 200; // 「引入待排房订单」弹窗最多列 200 个待分房单位（一行一间）
 
 const FLOOR_W = 64;
 const TYPE_W = 124;
@@ -81,6 +90,11 @@ type BookingRow = {
   check_out_date: string;
   room_count: number | null;
   channel_name: string | null;
+  /* 弹窗展示用（不参与任何计数）：订单号 / 渠道订单号 / 到店 / 保留时间 */
+  booking_no: string;
+  channel_order_no: string | null;
+  arrival_time: string | null;
+  retain_time: string | null;
 };
 
 type Search = {
@@ -195,7 +209,7 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
   const roomFilter = sp.room && sp.room.trim() ? sp.room.trim() : null;
   const msg = sp.msg ?? "";
   /** 表头「待分房N间」→ 打开「引入待排房订单」弹窗，并只看覆盖该日的订单 */
-  const pendingDay = typeof sp.pending === "string" && sp.pending ? sp.pending : "";
+  const pendingDay = isYmd(sp.pending) ? sp.pending : "";
 
   /* ---------------- 3. 房间 + 房型（楼层/房型/房号三列数据源） ---------------- */
   const allRooms = all<RoomRow>(
@@ -264,7 +278,8 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
     `SELECT b.id, b.room_id, b.room_type_id, b.guest_name,
             b.check_in_date, b.check_out_date,
             COALESCE(b.room_count, 1) AS room_count,
-            COALESCE(c.name, '散客') AS channel_name
+            COALESCE(c.name, '散客') AS channel_name,
+            b.booking_no, b.channel_order_no, b.arrival_time, b.retain_time
        FROM bookings b
        LEFT JOIN channels c ON c.id = b.channel_id
       WHERE b.hotel_id = ? AND b.status IN ('PENDING','CONFIRMED')
@@ -321,37 +336,165 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
     detailsByBooking.set(det.booking_id, list);
   }
 
-  /* ---------------- 5b. 「引入待排房订单」弹窗数据源 ----------------
-   * 订单：status in (PENDING, CONFIRMED) 且 room_id 为空，按入住日期升序，最多 30 条。
-   * 候选房：同房型 + 空净 VC / 空脏 VD + 该订单入离区间内没有在住占房、没有其他订单排房。
+  /* ---------------- 5b. 「引入待排房订单」弹窗数据源（**明细级：一行 = 一个待分房单位**） ----------------
+   *
+   * ── 原来的问题：弹窗列「订单」，表头数字却按「间」 ──
+   * 原来这里只查 `AND (b.room_id IS NULL OR b.room_id = 0)` 的订单，即「主单完全没排房」才算待分房。
+   * 但表头「待分房 N 间」在第 5a / 第 7 节已经改成按 `booking_rooms` 明细逐间数了
+   * （与 room-stock.ts 的 booked 口径一致）。两者差在多房订单上：
+   *   BK-MULTI3：room_count=3、主单 room_id=8201、明细 3 行（1 已排 + 2 未排）。
+   *   → 那 2 间已经算进「待分房 2 间」，
+   *   → 但主单 room_id 非空，整单被这条 SQL 过滤掉，
+   *   → 用户点「待分房 N 间」看不到这 2 间是谁的，也就没法去排房。
+   *
+   * ── 现在：和计数用同一份数据、同一套口径 ──
+   *   · 未排房明细（br.room_id 为空）        → 一行（第 i/N 间）；
+   *   · 明细行数 < room_count 的差额          → 每间补一行「虚拟明细」，否则弹窗会少于表头；
+   *   · 完全没有明细行的老订单                → 主单兜底：已排房 → room_count−1 行，未排房 → room_count 行；
+   *   · 房型筛选（typesInView）、明细自带日期的覆盖判定、订单日期区间，全部照抄下面 dayStats 的 pending 计数，
+   *     所以「弹窗行数 = 表头待分房数」（同一视图、同一天）。
+   *
+   * ── 行里能看到什么 ──
+   *   「预订房型」列显示「房型 · 第 i/N 间（已排 8201）」，把「这间在订单里排第几、这张单已排掉哪几间」讲清楚；
+   *   渠道订单号列在渠道单号为空时回落到内部订单号，保证 BK-MULTI3 这类手工单也有单号可核对。
+   *
+   * ⚠️ 仍然不改「分配房间」的候选口径：候选房 SQL 只给「主单 room_id 为空」的订单
+   *    （assignRoomsAction 也只接受这类订单）。所以主单已排房的多房订单在弹窗里能看到、
+   *    但那几间不能在弹窗内落库 —— 硬塞候选房会让保存整批报错，反而排不了任何单。
    */
-  const pendingHeads = all<{
-    id: number;
-    booking_no: string;
-    guest_name: string | null;
-    check_in_date: string;
-    check_out_date: string;
-    room_count: number | null;
-    arrival_time: string | null;
-    retain_time: string | null;
-    channel_order_no: string | null;
-    channel_name: string | null;
-    room_type_name: string | null;
-  }>(
-    `SELECT b.id, b.booking_no, b.guest_name, b.check_in_date, b.check_out_date,
-            COALESCE(b.room_count, 1) AS room_count,
-            b.arrival_time, b.retain_time, b.channel_order_no,
-            COALESCE(c.name, '散客') AS channel_name,
-            rt.name AS room_type_name
-       FROM bookings b
-       LEFT JOIN channels c ON c.id = b.channel_id
-       LEFT JOIN room_types rt ON rt.id = b.room_type_id
-      WHERE b.hotel_id = ? AND b.status IN ('PENDING','CONFIRMED')
-        AND (b.room_id IS NULL OR b.room_id = 0)
-        AND (? = '' OR (b.check_in_date <= ? AND b.check_out_date > ?))
-      ORDER BY b.check_in_date ASC, b.id ASC
-      LIMIT ?`,
-    [hotelId, pendingDay, pendingDay, pendingDay, PROMPT_LIMIT]
+  const typeNameById = new Map<number, string>(roomTypes.map((t) => [t.id, t.name]));
+  const roomNoById = new Map<number, string>(allRooms.map((r) => [r.id, r.room_no]));
+
+  /** 当前视图涉及的房型：与 dayStats 的 pending 计数同一过滤条件 */
+  const typesInView = new Set(rows.map((r) => r.room_type_id));
+  const typeInView = (typeId: number | null) => typeId === null || typesInView.has(typeId);
+
+  /** 这张单已经排掉的房号（明细优先；没有明细才看主单那一间） */
+  function assignedRoomNos(b: BookingRow): string[] {
+    const details = detailsByBooking.get(b.id) ?? [];
+    const ids: number[] = [];
+    if (details.length > 0) {
+      for (const det of details) if (det.room_id !== null && det.room_id > 0) ids.push(det.room_id);
+    } else if (b.room_id) {
+      ids.push(b.room_id);
+    }
+    const out: string[] = [];
+    for (const id of ids) {
+      const no = roomNoById.get(id);
+      if (no && !out.includes(no)) out.push(no);
+    }
+    return out;
+  }
+
+  /** 明细自带日期时按明细判覆盖；明细缺日期 = 跟主单同区间（与 dayStats 的 continue 条件一致） */
+  function detailCovers(ci: string | null, co: string | null, day: string) {
+    if (!ci || !co) return true;
+    return ci <= day && day < co;
+  }
+
+  /** 给一条待分房单位挑一个「确实覆盖」的视图内日期：带 ?pending= 点进来时就是那一天 */
+  function pickUnitDay(ci: string | null, co: string | null, b: BookingRow): string {
+    if (pendingDay) {
+      if (!(b.check_in_date <= pendingDay && pendingDay < b.check_out_date)) return "";
+      return detailCovers(ci, co, pendingDay) ? pendingDay : "";
+    }
+    for (const d of dates) {
+      if (b.check_in_date <= d && d < b.check_out_date && detailCovers(ci, co, d)) return d;
+    }
+    return "";
+  }
+
+  type PendingUnit = {
+    booking: BookingRow;
+    /** 该单位在视图内被判定的日期（表头点进来时就是那一天） */
+    day: string;
+    /** 明细/主单自己的入离日期（弹窗展示用） */
+    checkIn: string;
+    checkOut: string;
+    roomTypeId: number | null;
+    /** 本单内第几间（1-based） */
+    index: number;
+    /** 本单共几间 */
+    total: number;
+    /** 明细表里没有对应行、由 room_count 差额补出来的虚拟条目 */
+    virtual: boolean;
+  };
+
+  const pendingUnits: PendingUnit[] = [];
+  for (const b of bookings) {
+    const details = detailsByBooking.get(b.id) ?? [];
+    const roomCount = Math.max(1, Number(b.room_count ?? 1));
+    /* 本单总间数：明细比 room_count 多时以明细为准（明细一行一间，与计数同口径） */
+    const totalUnits = Math.max(roomCount, details.length);
+
+    if (details.length === 0) {
+      /* 老数据没有明细：主单兜底（已排房按 1 间、未排房按 room_count） */
+      if (!typeInView(b.room_type_id)) continue;
+      const units = b.room_id ? Math.max(0, roomCount - 1) : roomCount;
+      let index = b.room_id ? 1 : 0; // 主单那间已排，占掉第 1 间
+      for (let k = 0; k < units; k += 1) {
+        const day = pickUnitDay(null, null, b);
+        index += 1;
+        if (!day) continue;
+        pendingUnits.push({
+          booking: b,
+          day,
+          checkIn: b.check_in_date,
+          checkOut: b.check_out_date,
+          roomTypeId: b.room_type_id,
+          index,
+          total: roomCount,
+          virtual: true,
+        });
+      }
+      continue;
+    }
+
+    /* 明细：已排房的只占「第几间」编号，未排房的才出一行 */
+    let index = 0;
+    for (const det of details) {
+      index += 1;
+      if (det.room_id !== null && det.room_id > 0) continue;
+      if (!typeInView(det.room_type_id ?? b.room_type_id)) continue;
+      const day = pickUnitDay(det.check_in_date, det.check_out_date, b);
+      if (!day) continue;
+      pendingUnits.push({
+        booking: b,
+        day,
+        checkIn: det.check_in_date ?? b.check_in_date,
+        checkOut: det.check_out_date ?? b.check_out_date,
+        roomTypeId: det.room_type_id ?? b.room_type_id,
+        index,
+        total: totalUnits,
+        virtual: false,
+      });
+    }
+    /* 明细行数少于 room_count：差额每间补一行，否则弹窗比表头少 */
+    const missing = Math.max(0, roomCount - details.length);
+    if (missing > 0 && typeInView(b.room_type_id)) {
+      for (let k = 0; k < missing; k += 1) {
+        const day = pickUnitDay(null, null, b);
+        index += 1;
+        if (!day) continue;
+        pendingUnits.push({
+          booking: b,
+          day,
+          checkIn: b.check_in_date,
+          checkOut: b.check_out_date,
+          roomTypeId: b.room_type_id,
+          index,
+          total: totalUnits,
+          virtual: true,
+        });
+      }
+    }
+  }
+  /* 与原来 SQL 的排序一致：入住日期升序、订单号升序；同一单内按第几间 */
+  pendingUnits.sort(
+    (a, b) =>
+      a.booking.check_in_date.localeCompare(b.booking.check_in_date) ||
+      a.booking.id - b.booking.id ||
+      a.index - b.index
   );
 
   const optionRows = all<{ booking_id: number; room_id: number; room_no: string; status: string; room_type_name: string; upgradable: number }>(
@@ -411,23 +554,38 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
     roomsByBooking.set(o.booking_id, list);
   }
 
-  const pendingBookings: PendingBooking[] = pendingHeads
-    .filter((b) => !pendingDay || (b.check_in_date <= pendingDay && b.check_out_date > pendingDay))
-    .map((b) => ({
-    id: b.id,
-    bookingNo: b.booking_no,
-    channelName: (b.channel_name ?? "").trim(),
-    channelOrderNo: (b.channel_order_no ?? "").trim(),
-    guestName: (b.guest_name ?? "").trim(),
-    roomTypeName: (b.room_type_name ?? "").trim(),
-    roomCount: Math.max(1, Number(b.room_count ?? 1)),
-    checkInDate: b.check_in_date,
-    checkInTime: (b.arrival_time ?? "").trim() || "12:00",
-    checkOutDate: b.check_out_date,
-    checkOutTime: "12:00",
-    latestArrival: (b.retain_time ?? "").trim(),
-    rooms: roomsByBooking.get(b.id) ?? [],
-  }));
+  /*
+   * 弹窗行 = 一个待分房单位（一间），按表头那天的待分房口径逐条铺开。
+   *
+   * · roomCount 固定 1：一行就是一间，避免「3 行 × 房间数 3 = 9 间」的误读；
+   *   这张单总共有几间写在「预订房型」列的「第 i/N 间」里。
+   * · 候选房仍然取 roomsByBooking（只覆盖主单未排房的订单）。主单已排房的多房订单
+   *   在这里没有候选房 —— 它的剩余间由订单详情排房，弹窗只负责「让人看得到是谁的」。
+   */
+  const pendingBookings: PendingBooking[] = pendingUnits.slice(0, PROMPT_LIMIT).map((u) => {
+    const b = u.booking;
+    const assigned = assignedRoomNos(b);
+    const typeName = (u.roomTypeId !== null ? typeNameById.get(u.roomTypeId) : "") ?? "";
+    const unitText = `${typeName || "未指定房型"} · 第${u.index}/${u.total}间${u.virtual ? "（剩余未生成明细）" : ""}`;
+    return {
+      id: b.id,
+      /* 行级唯一键：一张多房订单会展开成多行（共享同一个 id），弹窗靠它区分勾选/选房 */
+      rowKey: `${b.id}#${u.index}${u.virtual ? "v" : "d"}`,
+      bookingNo: b.booking_no,
+      channelName: (b.channel_name ?? "").trim(),
+      /* 渠道单号为空时回落到内部订单号：手工单 / 演示单只有 booking_no，空着就没法核对 */
+      channelOrderNo: (b.channel_order_no ?? "").trim() || b.booking_no,
+      guestName: (b.guest_name ?? "").trim(),
+      roomTypeName: assigned.length > 0 ? `${unitText}（已排 ${assigned.join("、")}）` : unitText,
+      roomCount: 1,
+      checkInDate: u.checkIn,
+      checkInTime: (b.arrival_time ?? "").trim() || "12:00",
+      checkOutDate: u.checkOut,
+      checkOutTime: "12:00",
+      latestArrival: (b.retain_time ?? "").trim(),
+      rooms: roomsByBooking.get(b.id) ?? [],
+    };
+  });
 
   /* ---------------- 6. 组装「每间房每天」的状态矩阵 ---------------- */
   const cellMap = new Map<number, Slot[]>();
@@ -543,8 +701,10 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
    *
    * 注意 total 仍是**当前视图内的房数**（受楼层/房型筛选影响），
    * 这是本页的设计（「按当前视图看未来」），不是全店口径 —— 页面上有说明。
+   *
+   * `typesInView` / `typeInView` 已在第 5b 节（弹窗数据源）定义：弹窗与这里的 pending
+   * 计数共用同一套房型过滤，否则「弹窗行数」和「表头待分房数」会再次分叉。
    */
-  const typesInView = new Set(rows.map((r) => r.room_type_id));
 
   /* 每天各自的 OOO / LOCK 房数（维修与锁房是房间属性，但可能今天维修明天正常，
      所以按月查不到当天状态时按「当前状态」兜底 —— 远期房态本来就依赖当前房态快照） */

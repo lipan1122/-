@@ -44,15 +44,35 @@ const MONEY_FIELDS = [
 ];
 
 const dirty = [];
+const missing = [];
+/*
+ * 原来这里是 try { ... } catch { continue; } —— 假通过：
+ * 表/列不存在时这条检查被静默跳过（新库缺列、列被改名、迁移漏跑都看不出来），
+ * 结果「所有金额字段都是 2 位小数」照样打 ✅，实际上少检查了几个字段。
+ * 现在：先确认字段真的存在，缺表/缺列单独判红（= schema 漂移），存在才查尾差。
+ */
 for (const [table, col] of MONEY_FIELDS) {
-  let c = 0;
+  let cols = [];
   try {
-    c = db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE ABS(ROUND(${col}, 2) - ${col}) > 0.000001`).get().c;
+    cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
   } catch {
-    continue; // 表/列不存在就跳过（新库可能还没有）
+    cols = [];
   }
+  if (cols.length === 0) {
+    if (!missing.includes(`${table}(表不存在)`)) missing.push(`${table}(表不存在)`);
+    continue;
+  }
+  if (!cols.includes(col)) { missing.push(`${table}.${col}(列不存在)`); continue; }
+  const c = db
+    .prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE ABS(ROUND(${col}, 2) - ${col}) > 0.000001`)
+    .get().c;
   if (Number(c) > 0) dirty.push(`${table}.${col}=${c}`);
 }
+check(
+  "所有金额字段都存在（缺表/缺列 = schema 漂移，不允许静默跳过）",
+  missing.length === 0,
+  missing.join(", ")
+);
 check("所有金额字段都只有 2 位小数（无浮点残留）", dirty.length === 0, dirty.join(", "));
 
 /* ---------- 2. 账单 total = 明细合计（按分比对） ---------- */
@@ -121,8 +141,9 @@ for (const f of walk("src")) {
 console.log(`\n未显式 round 的 SUM(金额) 位置：${noRound.length} 处`);
 if (noRound.length > 0 && noRound.length <= 8) noRound.forEach((x) => console.log("  " + x));
 /* 这些位置大多是「直接展示给页面」的，SQLite 的 SUM 在 REAL 上仍有尾差风险，
-   但当前数据 0 尾差（上面第 1 条已验），所以这里只做提示不判失败 */
-check("汇总出口检查完成（提示项，不阻塞）", true);
+   但当前数据 0 尾差（上面第 1 条已验），所以这里只做提示不判失败。
+   （原来这里写的是 check("汇总出口检查完成（提示项，不阻塞）", true) —— 恒真断言，
+     不校验任何东西，只会虚增通过数，本次删掉；提示信息保留在上一行日志里。） */
 
 /* 统计 */
 const stat = db.prepare(

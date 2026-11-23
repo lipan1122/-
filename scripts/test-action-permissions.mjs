@@ -121,6 +121,25 @@ const READ_ONLY = {};
 let pass = 0;
 let fail = 0;
 const failures = [];
+/** HTTP 运行时段被跳过的原因（非空 = 本次只验了静态段，汇总里必须说出来） */
+let runtimeSkipReason = "";
+/**
+ * 是否要求 HTTP 运行时段必须执行：
+ *   · 默认不要求（本地/本轮禁止 next build 时也能跑，跳过会打印原因）
+ *   · PMS_REQUIRE_HTTP=1 或 --require-http → 跳过即判红，CI / 发布前用它防「假通过」
+ */
+const REQUIRE_HTTP = process.env.PMS_REQUIRE_HTTP === "1" || process.argv.includes("--require-http");
+/** HTTP 段跳过入口：默认显式记录原因；要求在跑时直接判红 */
+function skipRuntime(reason) {
+  console.log(`  ⏭️  ${reason}`);
+  if (REQUIRE_HTTP) {
+    fail += 1;
+    failures.push(`HTTP 运行时段未执行：${reason}（--require-http / PMS_REQUIRE_HTTP=1 要求必须跑）`);
+    return;
+  }
+  runtimeSkipReason = reason;
+}
+
 const check = (ok, label, extra = "") => {
   if (ok) {
     pass += 1;
@@ -362,7 +381,7 @@ async function runtimeAudit() {
   console.log("\n=== HTTP 运行时校验（front / cashier / housekeeper 直接构造请求） ===");
 
   if (NO_HTTP) {
-    console.log("  ⏭️  已用 --no-http / PMS_NO_HTTP=1 关闭，跳过");
+    skipRuntime("已用 --no-http / PMS_NO_HTTP=1 关闭，跳过");
     return;
   }
 
@@ -379,21 +398,23 @@ async function runtimeAudit() {
     /* 服务没起 / 超时 → alive 保持 false */
   }
   if (!alive) {
-    console.log(`  ⏭️  服务未启动（${BASE}）→ 跳过运行时校验；静态校验已覆盖全部 action（服务起来后可重跑本脚本）`);
+    skipRuntime(`服务未启动（${BASE}）→ 跳过运行时校验；静态校验已覆盖全部 action（服务起来后可重跑本脚本）`);
     return;
   }
 
   // 3.2 构建是否比源码新：旧构建跑不出新代码，运行时结果无意义
   const buildIdPath = path.join(ROOT, ".next", "BUILD_ID");
   if (!fs.existsSync(buildIdPath)) {
-    console.log("  ⏭️  找不到 .next/BUILD_ID（非 next start 生产构建）→ 跳过运行时校验");
+    skipRuntime("找不到 .next/BUILD_ID（非 next start 生产构建）→ 跳过运行时校验");
     return;
   }
   const buildTime = fs.statSync(buildIdPath).mtimeMs;
   const srcTime = Math.max(...MODULES.map((m) => fs.statSync(path.join(ROOT, m.file)).mtimeMs));
   if (buildTime < srcTime) {
-    console.log(`  ⏭️  跳过：3100 上运行的是 ${fmtTime(buildTime)} 的预构建产物，早于本次源码修改（${fmtTime(srcTime)}）。`);
-    console.log("      需要重新 next build / 启动后本段才会真正执行；本次整改禁止 next build，故以静态校验为准。");
+    skipRuntime(
+      `3100 上运行的是 ${fmtTime(buildTime)} 的预构建产物，早于本次源码修改（${fmtTime(srcTime)}）；` +
+        "需要重新 next build / 启动后本段才会真正执行（本轮整改禁止 next build，故以静态校验为准）"
+    );
     return;
   }
 
@@ -413,7 +434,7 @@ async function runtimeAudit() {
   // 3.4 action id 映射
   const ids = loadActionIds();
   if (!ids) {
-    console.log("  ⚠️  找不到 .next/server/server-reference-manifest.json → 跳过运行时 action 调用");
+    skipRuntime("找不到 .next/server/server-reference-manifest.json → 跳过运行时 action 调用");
     return;
   }
 
@@ -468,6 +489,14 @@ async function main() {
   const actionTotal = MODULES.reduce((n, m) => n + Object.keys(m.actions).length, 0);
   console.log(`受检 action：${actionTotal} 个（夜审 1 / 预订 15 / 在住 8）`);
   console.log(`通过：${pass}    失败：${fail}`);
+  /*
+   * 跳过不是静默的：HTTP 段没跑时必须在最后一行说出来，避免「只看退出码 = 以为端到端过了」。
+   * 需要强制跑时用 --require-http / PMS_REQUIRE_HTTP=1（跳过会被 skipRuntime 判红）。
+   */
+  if (runtimeSkipReason) {
+    console.log(`⚠️  HTTP 运行时段未执行：${runtimeSkipReason}`);
+    console.log("    本次结果只覆盖静态源码段；端到端未验证（加 --require-http 可强制要求执行）");
+  }
   if (fail > 0) {
     console.log("\n❌ 未通过项：");
     for (const f of failures) console.log(`   - ${f}`);

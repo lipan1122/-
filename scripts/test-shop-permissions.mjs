@@ -394,15 +394,30 @@ async function main() {
       })()
     );
 
-    /* 同事务：扣库存 + 写销售流水 + 写账单，ROLLBACK 后三者都不变 */
-    const folio = db.prepare(`SELECT id, hotel_id FROM folios WHERE hotel_id = 1 ORDER BY id LIMIT 1`).get();
+    /* 同事务：扣库存 + 写销售流水 + 写账单，ROLLBACK 后三者都不变
+     *
+     * 原来副本里没有账单时只打印「⚪ 跳过账单回滚断言」—— 少一条断言还判绿（假通过）。
+     * 副本是 VACUUM INTO 拷来的真库，正常一定有账单；空库时这里自建一条测试账单，
+     * 让「回滚后账单明细没有新增」这条断言无条件执行。
+     */
+    let folio = db.prepare(`SELECT id, hotel_id FROM folios WHERE hotel_id = 1 ORDER BY id LIMIT 1`).get();
+    if (!folio) {
+      const newId = db
+        .prepare(
+          `INSERT INTO folios (hotel_id, folio_no, guest_name, total_amount, paid_amount, balance, status, created_at)
+           VALUES (1, ?, '事务回滚测试账单', 0, 0, 0, 'OPEN', ?)`
+        )
+        .run(`T-SHOP-RB-${Date.now()}`, now).lastInsertRowid;
+      folio = { id: newId, hotel_id: 1 };
+      console.log(`  （副本里没有账单，已自建测试账单 #${newId} 用于回滚断言）`);
+    }
     db.prepare(`UPDATE shop_items SET stock = 5 WHERE id = ?`).run(itemA);
     const saleBefore = Number(
       db.prepare(`SELECT COUNT(*) AS n FROM shop_sales WHERE hotel_id = 1 AND request_id = 'REQ-TX-RB'`).get()?.n ?? 0
     );
-    const folioBefore = folio
-      ? Number(db.prepare(`SELECT COUNT(*) AS n FROM folio_items WHERE hotel_id = 1 AND folio_id = ?`).get(folio.id)?.n ?? 0)
-      : 0;
+    const folioBefore = Number(
+      db.prepare(`SELECT COUNT(*) AS n FROM folio_items WHERE hotel_id = 1 AND folio_id = ?`).get(folio.id)?.n ?? 0
+    );
 
     db.exec("BEGIN IMMEDIATE");
     db.prepare(`UPDATE shop_items SET stock = stock - 2 WHERE id = ? AND hotel_id = 1 AND stock >= 2`).run(itemA);
@@ -410,12 +425,10 @@ async function main() {
       `INSERT INTO shop_sales (hotel_id, item_name, qty, amount, method, room_no, created_at, request_id)
        VALUES (?,?,?,?,?,?,?,?)`
     ).run(1, "验收商品A", 2, 6, "挂账 TEST", "TEST", now, "REQ-TX-RB");
-    if (folio) {
-      db.prepare(
-        `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, amount, qty, created_at)
-         VALUES (?,?,?,?,?,?,?)`
-      ).run(1, folio.id, "OTHER", "商超:验收商品A", 6, 2, now);
-    }
+    db.prepare(
+      `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, amount, qty, created_at)
+       VALUES (?,?,?,?,?,?,?)`
+    ).run(1, folio.id, "OTHER", "商超:验收商品A", 6, 2, now);
     db.exec("ROLLBACK");
 
     check("事务回滚后库存恢复为 5（不会「库存扣了钱没记」）", stockOf(itemA) === 5);
@@ -424,16 +437,12 @@ async function main() {
       Number(db.prepare(`SELECT COUNT(*) AS n FROM shop_sales WHERE hotel_id = 1 AND request_id = 'REQ-TX-RB'`).get()?.n ?? 0) ===
         saleBefore
     );
-    if (folio) {
-      check(
-        "事务回滚后账单明细没有新增",
-        Number(
-          db.prepare(`SELECT COUNT(*) AS n FROM folio_items WHERE hotel_id = 1 AND folio_id = ?`).get(folio.id)?.n ?? 0
-        ) === folioBefore
-      );
-    } else {
-      console.log("  ⚪ 副本里没有 folios 数据，跳过账单回滚断言（库存与流水已覆盖）");
-    }
+    check(
+      "事务回滚后账单明细没有新增",
+      Number(
+        db.prepare(`SELECT COUNT(*) AS n FROM folio_items WHERE hotel_id = 1 AND folio_id = ?`).get(folio.id)?.n ?? 0
+      ) === folioBefore
+    );
 
     /* 撤销销售：voided_at 幂等 + 库存回加 + 原因可追溯 */
     const voidableId = insSale.run(1, "验收商品A", 1, 3, "现金", null, now, "REQ-VOID-1").lastInsertRowid;

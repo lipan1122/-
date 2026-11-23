@@ -72,7 +72,16 @@ const mainPending = db.prepare(
   `SELECT COUNT(*) AS c FROM bookings WHERE hotel_id = 1 AND status = 'PENDING'`
 ).get().c;
 console.log(`\n待排明细 ${pending} 条 / 主单 PENDING ${mainPending} 单`);
-check("待排房数可从明细直接统计", true);
+/* 原来这里是 check("待排房数可从明细直接统计", true) —— 恒真断言，什么都不校验。
+   改成真断言：明细必须都能关联到主单，否则「按明细统计待排房」会漏掉孤儿明细。 */
+const orphanDetails = db
+  .prepare(
+    `SELECT COUNT(*) AS c FROM booking_rooms br
+       LEFT JOIN bookings b ON b.id = br.booking_id
+      WHERE b.id IS NULL`
+  )
+  .get().c;
+check("明细都能关联到主单（从明细统计待排房不会漏单）", Number(orphanDetails) === 0, `${orphanDetails} 条孤儿明细`);
 
 db.close();
 console.log(`\n通过 ${pass} / 失败 ${fail}`);

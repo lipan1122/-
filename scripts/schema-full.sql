@@ -444,7 +444,20 @@ CREATE TABLE ar_accounts (
         status TEXT DEFAULT 'ON',
         contact TEXT,
         phone TEXT,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        /*
+         * company_id：绑定到协议单位（companies.id）
+         *
+         * 第十轮修「AR 账户总账与协议单位台账分叉」时加的。
+         * 为空表示这个账户不对应协议单位（比如「携程预付」「内部挂账」这类往来账户），
+         * 它们不进 /finance 的「协议单位应收」，也不建笔级 ar_ledgers。
+         *
+         * ⚠️ 这一列最初只加在 migrate-all.mjs 的 addColumn 里，
+         * schema-full.sql 忘了同步 → 新建库跑「init-db + migrate-all」时
+         * test-schema-fresh-install / test-shop-schema-fresh-install 会报
+         * 「no such column: a.company_id」。这里补上。
+         */
+        company_id INTEGER
       );
 
 CREATE TABLE ar_transactions (

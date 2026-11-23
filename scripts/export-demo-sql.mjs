@@ -19,9 +19,18 @@
  *   每个表一段：
  *     DELETE FROM "表名";
  *     INSERT INTO "表名" VALUES (...),(...);   ← 分批，每批 200 行
+ *   文件末尾再追加一段「导入时日期滚动」（见 scripts/roll-demo-dates.mjs 的
+ *   buildImportBlock）——导出的入住日期是**导出那天**的绝对值，隔几天再导入就是
+ *   一堆逾期在住单，工作台 / 夜审 / 报表全部虚高。这段 SQL 在导入时以「导入当天」
+ *   为锚重新滚动，把这个问题根治在数据文件里，而不是指望谁记得手动跑脚本。
+ *
+ * 同时写出 .gz：设置页「一键导入演示数据」读的是 demo-data.sql.gz，只更新 .sql
+ * 不更新 .gz 等于改了没人用 —— 之前靠手工 gzip，漏一次就两边不一致。
  */
 import { DatabaseSync } from "node:sqlite";
 import { writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { gzipSync } from "node:zlib";
+import { buildImportBlock } from "./roll-demo-dates.mjs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -115,16 +124,34 @@ for (const t of tables) {
   chunks.push("");
 }
 
+/* ── 末尾追加「导入时日期滚动」段 ──
+ *
+ * 这一段必须是文件最后的语句：它要在所有表都插完之后，按「导入当天」重算日期。
+ * 内容与 scripts/roll-demo-dates.mjs 共用同一个生成器，不要在这里手写 SQL。
+ */
+chunks.push("--");
+chunks.push("-- ↓↓↓ 以下是导入时执行的日期滚动段（不是数据，是数据修正） ↓↓↓");
+chunks.push("--");
+chunks.push(buildImportBlock());
+
 db.close();
 
 mkdirSync(join(here, "demo-data"), { recursive: true });
 const sql = chunks.join("\n");
 writeFileSync(outFile, sql, "utf8");
 
+/*
+ * 运行时读的是 .gz（settings/demo-actions.ts），不是 .sql。
+ * 两个文件必须一起更新，否则「一键导入演示数据」导入的还是旧数据。
+ */
+const gz = gzipSync(Buffer.from(sql, "utf8"), { level: 9 });
+writeFileSync(`${outFile}.gz`, gz);
+
 console.log(`已导出：${outFile}`);
+console.log(`        ${outFile}.gz（${(gz.length / 1024).toFixed(0)} KB，设置页一键导入读这个）`);
 console.log(`  ${perTable.length} 张表 / ${totalRows} 行`);
 console.log(`  文件大小：${(Buffer.byteLength(sql) / 1024).toFixed(0)} KB`);
-console.log(`\n前 12 张：`);
+console.log("\n前 12 张：");
 perTable
   .sort((a, b) => b[1] - a[1])
   .slice(0, 12)

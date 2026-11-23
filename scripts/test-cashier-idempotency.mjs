@@ -395,6 +395,11 @@ const folioRow = (folioId) => one(`SELECT status, total_amount, paid_amount, bal
 /* ============================================================ 工作进程模式（并发用） */
 
 if (IS_WORKER) {
+  /*
+   * 合法的 exit(0)：这是**子进程 worker 模式**（主进程用 WORKER_* 环境变量把它 fork 出去发并发请求），
+   * 子进程只负责把结果 JSON 打到 stdout，断言与退出码由主进程汇总。
+   * 不是「跳过当通过」——worker 出错会在主进程的断言里变红。
+   */
   const out = await invoke(cashier.addDepositAction, {
     folio_id: process.env.WORKER_FOLIO,
     stay_id: process.env.WORKER_STAY,

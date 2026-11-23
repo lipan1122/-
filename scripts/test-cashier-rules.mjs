@@ -31,22 +31,45 @@ check("payments 有 request_id 唯一索引（幂等兜底）", hasReqIdx, JSON.
 const cols = all(`PRAGMA table_info(payments)`).map((c) => c.name);
 check("payments 有 request_id / refund_of / operator", ["request_id", "refund_of", "operator"].every((c) => cols.includes(c)), cols.join(","));
 
-/* 3. 幂等实测：同 request_id 插两次，第二次应失败 */
-const folio = one(`SELECT id, stay_id, paid_amount FROM folios WHERE status = 'OPEN' LIMIT 1`);
-if (folio) {
+/* 3. 幂等实测：同 request_id 插两次，第二次应失败
+ *
+ * 原来没有 OPEN 账单时只打印「（没有 OPEN 账单，跳过幂等写入测试）」—— 那是假通过：
+ * 少跑一条断言却不影响退出码，空库 / 全部已结账的库里这条幂等验证永远不跑。
+ * 现在：没有现成 OPEN 账单就自建一张（跑完连同流水删掉），自建失败才 exit(1)。
+ */
+let folio = one(`SELECT id, stay_id, paid_amount FROM folios WHERE status = 'OPEN' ORDER BY id LIMIT 1`);
+let syntheticFolioId = 0;
+if (!folio) {
+  const ts = Date.now();
+  try {
+    const insF = db
+      .prepare(
+        `INSERT INTO folios (hotel_id, folio_no, guest_name, total_amount, paid_amount, balance, status, created_at)
+         VALUES (1, ?, '幂等测试账单', 0, 0, 0, 'OPEN', ?)`
+      )
+      .run(`T-IDEM-${ts}`, new Date().toISOString());
+    syntheticFolioId = Number(insF.lastInsertRowid);
+  } catch (e) {
+    console.error("❌ 没有 OPEN 账单，自建测试账单也失败：", e.message);
+    process.exit(1);
+  }
+  folio = one(`SELECT id, stay_id, paid_amount FROM folios WHERE id = ?`, [syntheticFolioId]);
+  console.log(`（没有 OPEN 账单，已自建测试账单 #${syntheticFolioId} 用于幂等验证）`);
+}
+
+{
   const rid = `test-idem-${Date.now()}`;
   db.prepare(`INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, created_at, request_id, operator)
-              VALUES (1,?,?,?,?,?,?,?,?,?)`).run(folio.id, folio.stay_id, "T1", "现金", 1, "2026-11-17", "x", rid, "test");
+              VALUES (1,?,?,?,?,?,?,?,?,?)`).run(folio.id, folio.stay_id, `T1-${rid}`, "现金", 1, "2026-11-17", "x", rid, "test");
   let dupOk = false;
   try {
     db.prepare(`INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, created_at, request_id, operator)
-                VALUES (1,?,?,?,?,?,?,?,?,?)`).run(folio.id, folio.stay_id, "T2", "现金", 1, "2026-11-17", "x", rid, "test");
+                VALUES (1,?,?,?,?,?,?,?,?,?)`).run(folio.id, folio.stay_id, `T2-${rid}`, "现金", 1, "2026-11-17", "x", rid, "test");
     dupOk = true;
   } catch { /* 期望失败 */ }
   check("同一 request_id 重复插入被唯一索引拦截", !dupOk);
   db.prepare(`DELETE FROM payments WHERE request_id = ?`).run(rid);
-} else {
-  console.log("（没有 OPEN 账单，跳过幂等写入测试）");
+  if (syntheticFolioId) db.prepare(`DELETE FROM folios WHERE id = ?`).run(syntheticFolioId);
 }
 
 /* 4. 账单一致性：paid_amount vs payments 合计 */

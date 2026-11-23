@@ -81,12 +81,19 @@ function findUnscopedWrites(src) {
 
 console.log("========== A 段：静态扫描（只按 id 定位的 UPDATE/DELETE）==========\n");
 let aStatic = 0;
+const missingFiles = [];
 for (const rel of OWN_FILES) {
   let src = "";
   try {
     src = readSrc(rel);
   } catch {
-    console.log(`⚠️  文件不存在：${rel}`);
+    /*
+     * 原来这里只打一句 ⚠️ 就 continue —— 假通过：
+     * 目标文件被删除 / 改名 / 挪位置时，这个文件「0 处违规」自动算过，
+     * A 段照样打 ✅（aStatic 仍是 0）。缺文件必须判红。
+     */
+    console.log(`❌ 文件不存在：${rel}`);
+    missingFiles.push(rel);
     continue;
   }
   const hits = findUnscopedWrites(src);
@@ -99,7 +106,11 @@ for (const rel of OWN_FILES) {
     for (const h of hits) console.log(`     L${h.line} ${h.kind} ${h.table} — ${h.text}`);
   }
 }
-check("A 段：负责文件内「只按 id 定位」的 UPDATE/DELETE = 0 处", aStatic === 0, `实际 ${aStatic} 处`);
+check(
+  "A 段：负责文件内「只按 id 定位」的 UPDATE/DELETE = 0 处",
+  aStatic === 0 && missingFiles.length === 0,
+  `实际 ${aStatic} 处${missingFiles.length ? `，缺文件：${missingFiles.join(", ")}` : ""}`
+);
 
 /* ==========================================================================
  * B 段：行为验证

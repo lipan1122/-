@@ -108,7 +108,14 @@ export default function OrderListDialog({
                 </tr>
               )}
               {paged.map((e, i) => (
-                <tr key={`${e.stayId ?? e.bookingId ?? i}`} className="hover:bg-[#fafcfb]">
+                <tr
+                  /*
+                   * 行 key 必须带上行序号：多房订单在「占用」里是按明细展开的
+                   * （同一 bookingId 会占多行，一行 = 一间），只用 bookingId 会撞 key。
+                   */
+                  key={`${e.stayId ?? `b${e.bookingId ?? ""}`}-${page}-${i}`}
+                  className="hover:bg-[#fafcfb]"
+                >
                   <td className={TD}>{e.statusLabel}</td>
                   <td className={TD}>{e.channelName}</td>
                   <td className={`${TD} tabular-nums`}>{e.channelOrderNo}</td>

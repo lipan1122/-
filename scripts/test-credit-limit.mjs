@@ -39,7 +39,14 @@ const usedRows = all(
     WHERE st.hotel_id = 1 AND COALESCE(st.remark,'') LIKE '%【挂账】%'
       AND f.status <> 'SETTLED' AND f.balance > 0.01`
 );
-check("能算出各单位已挂账金额", true, `在挂 ${usedRows.length} 单，合计 ¥${usedRows.reduce((s, r) => s + Number(r.balance), 0).toFixed(2)}`);
+/* 原来这里是 check("能算出各单位已挂账金额", true) —— 恒真断言，算错/联表出 NULL 也会打 ✅。
+   改成真断言：每行余额必须是有效数字，合计才是可信的（挂账金额进信用额度校验）。 */
+const usedTotal = usedRows.reduce((s, r) => s + Number(r.balance), 0);
+check(
+  "能算出各单位已挂账金额（每行余额都是有效数字）",
+  usedRows.every((r) => Number.isFinite(Number(r.balance))) && Number.isFinite(usedTotal) && usedTotal >= 0,
+  `在挂 ${usedRows.length} 单，合计 ¥${usedTotal.toFixed(2)}`
+);
 
 /* 4. 逐单位校验未超额（除非本来就有历史超额） */
 for (const c of withLimit) {

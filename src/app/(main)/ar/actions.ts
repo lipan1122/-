@@ -347,6 +347,25 @@ const AR_SEED: SeedAccount[] = [
  *
  * 所以：只有**显式**设置环境变量 PMS_DEMO_SEED=1 时才灌演示数据，
  * 默认不灌 —— 真实上线看到的是空列表（页面有空态提示）。
+ *
+ * ── 为什么这里只灌账户总账、不灌 ar_ledgers（第十轮）──
+ * 演示种子灌完后 ar_transactions 有 55 行、ar_ledgers 是 0 行，账龄能算、
+ * 账户余额也对，但 /finance 的「协议单位应收」（唯一数据源就是 ar_ledgers）是空的，
+ * 而且 ar_accounts.company_id 全是 NULL —— 双写只能靠名称模糊匹配去猜绑定。
+ *
+ * 不在这里补台账，有两个绕不过的原因：
+ *   ① seedHotel 拿不到可靠的协议单位映射：种子账户叫「杭州云启科技」「东方航空」，
+ *      companies 是「杭州云启科技有限公司」「东方航空杭州分公司」；AR004「携程预付」、
+ *      AR005「内部挂账」在 companies 里根本没有对应行。在这里按名字猜，
+ *      等于把绑错单位固化成数据。
+ *   ② 种子可能有 10 条混合流水（POST/PAY/TRANSFER/WRITE_OFF），
+ *      要生成台账就得再实现一遍 FIFO 冲减 —— 与 lib/ar.ts 的 settleCompanyLedgers
+ *      是同一套规则的第二份实现，两份口径迟早会漂。
+ *
+ * 所以回填统一由 scripts/migrate-all.mjs 第 21 段做（互含 + 唯一命中的映射规则、
+ * 按 (biz_date, id) FIFO 冲减、回填后硬校验「台账未结 = 账户余额」、幂等）。
+ * 灌完种子后跑一次 `npm run db:migrate` 即可让台账与账户对齐；
+ * 没有对应协议单位的账户（挂账客户 / 内部往来）按设计就不建笔级台账。
  */
 function seedHotel(hotelId: number): void {
   if (process.env.PMS_DEMO_SEED !== "1") return;

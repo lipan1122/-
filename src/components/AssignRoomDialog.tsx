@@ -32,6 +32,16 @@ export type RoomOption = {
 /** 一条待排房订单（服务端已算好该订单可用的房间列表） */
 export type PendingBooking = {
   id: number;
+  /**
+   * 行级唯一键（可选）。
+   *
+   * 多房订单在弹窗里会按 `booking_rooms` 明细展开成多行（一行 = 一间待分房单位），
+   * 这些行共享同一个订单 id —— 如果直接拿 `id` 当 React key / 勾选键：
+   *   · 同一个 key 出现多次 → React 报「Encountered two children with the same key」；
+   *   · 勾一行等于勾整单、选一间房等于整单都选了那一间。
+   * 所以页面用 `rowKey`（如 `612#2`）区分行；老调用方不传时退回 String(id)，行为不变。
+   */
+  rowKey?: string;
   bookingNo: string;
   channelName: string;
   channelOrderNo: string;
@@ -46,6 +56,11 @@ export type PendingBooking = {
   latestArrival: string;
   rooms: RoomOption[];
 };
+
+/** 行级键：有 rowKey 用 rowKey，否则退回订单 id（单行/老数据） */
+function rowKeyOf(b: PendingBooking): string {
+  return b.rowKey && b.rowKey.length > 0 ? b.rowKey : String(b.id);
+}
 
 const COL_W = { check: 36, channel: 46, orderNo: 102, guest: 64, type: 68, count: 34, stay: 124, latest: 68, action: 65 };
 
@@ -66,15 +81,15 @@ export default function AssignRoomDialog({
   const [open, setOpen] = useState(defaultOpen);
   const [pending, startTransition] = useTransition();
 
-  /** 行勾选：bookingId -> 是否勾选 */
-  const [checked, setChecked] = useState<Record<number, boolean>>({});
-  /** 行分配：bookingId -> roomId | null */
-  const [roomOf, setRoomOf] = useState<Record<number, number | null>>({});
+  /** 行勾选：行级键（rowKeyOf）-> 是否勾选。多房订单展开成多行时每行独立勾选 */
+  const [checked, setChecked] = useState<Record<string, boolean>>({});
+  /** 行分配：行级键 -> roomId | null */
+  const [roomOf, setRoomOf] = useState<Record<string, number | null>>({});
   /** 批量智能排房开关 */
   const [batch, setBatch] = useState(false);
   const [error, setError] = useState("");
 
-  const selectRefs = useRef<Map<number, HTMLSelectElement | null>>(new Map());
+  const selectRefs = useRef<Map<string, HTMLSelectElement | null>>(new Map());
   const allRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -137,7 +152,7 @@ export default function AssignRoomDialog({
 
   /* ---------------- 勾选统计 ---------------- */
   const checkedCount = useMemo(
-    () => bookings.reduce((n, b) => (checked[b.id] ? n + 1 : n), 0),
+    () => bookings.reduce((n, b) => (checked[rowKeyOf(b)] ? n + 1 : n), 0),
     [bookings, checked]
   );
 
@@ -147,12 +162,15 @@ export default function AssignRoomDialog({
     }
   }, [checkedCount, bookings.length, open]);
 
-  /** 提交给 action 的行：勾选 + 已选房 */
+  /** 提交给 action 的行：勾选 + 已选房（bookingId 仍是真实订单 id，rowKey 只用于区分弹窗里的行） */
   const payload = useMemo(
     () =>
       bookings
-        .filter((b) => checked[b.id] === true && typeof roomOf[b.id] === "number")
-        .map((b) => ({ bookingId: b.id, roomId: roomOf[b.id] as number })),
+        .filter((b) => {
+          const key = rowKeyOf(b);
+          return checked[key] === true && typeof roomOf[key] === "number";
+        })
+        .map((b) => ({ bookingId: b.id, roomId: roomOf[rowKeyOf(b)] as number })),
     [bookings, checked, roomOf]
   );
 
@@ -163,19 +181,19 @@ export default function AssignRoomDialog({
       setChecked({});
       return;
     }
-    const all: Record<number, boolean> = {};
-    for (const b of bookings) all[b.id] = true;
+    const all: Record<string, boolean> = {};
+    for (const b of bookings) all[rowKeyOf(b)] = true;
     setChecked(all);
   }
 
-  function toggleRow(id: number) {
-    setChecked((prev) => ({ ...prev, [id]: !prev[id] }));
+  function toggleRow(key: string) {
+    setChecked((prev) => ({ ...prev, [key]: !prev[key] }));
   }
 
-  function setRowRoom(id: number, roomId: number | null) {
-    setRoomOf((prev) => ({ ...prev, [id]: roomId }));
+  function setRowRoom(key: string, roomId: number | null) {
+    setRoomOf((prev) => ({ ...prev, [key]: roomId }));
     // 选了房就顺带勾上，避免「选了房但没勾选」导致保存被忽略
-    if (roomId !== null) setChecked((prev) => ({ ...prev, [id]: true }));
+    if (roomId !== null) setChecked((prev) => ({ ...prev, [key]: true }));
   }
 
   /**
@@ -188,15 +206,15 @@ export default function AssignRoomDialog({
     if (!on) return;
 
     const used = new Set<number>();
-    const nextRoom: Record<number, number | null> = {};
-    const nextChecked: Record<number, boolean> = { ...checked };
+    const nextRoom: Record<string, number | null> = {};
+    const nextChecked: Record<string, boolean> = { ...checked };
 
     for (const b of bookings) {
       const pick = b.rooms.find((r) => !used.has(r.id));
       if (!pick) continue;
       used.add(pick.id);
-      nextRoom[b.id] = pick.id;
-      nextChecked[b.id] = true;
+      nextRoom[rowKeyOf(b)] = pick.id;
+      nextChecked[rowKeyOf(b)] = true;
     }
     setRoomOf(nextRoom);
     setChecked(nextChecked);
@@ -204,13 +222,14 @@ export default function AssignRoomDialog({
 
   /** 「去排房」：聚焦并展开该行的分配房间下拉 */
   function goAssign(booking: PendingBooking) {
-    const el = selectRefs.current.get(booking.id);
+    const key = rowKeyOf(booking);
+    const el = selectRefs.current.get(key);
     if (!el || el.disabled) {
       setError(`${booking.guestName || booking.bookingNo} 的 ${booking.roomTypeName} 在该日期区间没有空房，可在下拉里选其他房型（升级排房）`);
       return;
     }
     setError("");
-    setChecked((prev) => ({ ...prev, [booking.id]: true }));
+    setChecked((prev) => ({ ...prev, [key]: true }));
     el.focus();
     const picker = (el as HTMLSelectElement & { showPicker?: () => void }).showPicker;
     if (typeof picker === "function") {
@@ -348,17 +367,18 @@ export default function AssignRoomDialog({
                 )}
 
                 {bookings.map((b) => {
-                  const roomId = roomOf[b.id];
+                  const key = rowKeyOf(b);
+                  const roomId = roomOf[key];
                   const noRoom = b.rooms.length === 0;
                   return (
-                    <tr key={b.id} className="hover:bg-[#fafafa]" style={{ borderBottom: `1px solid ${LINE}` }}>
+                    <tr key={key} className="hover:bg-[#fafafa]" style={{ borderBottom: `1px solid ${LINE}` }}>
                       {/* 复选框 */}
                       <td className={tdCls} style={{ borderBottom: `1px solid ${LINE}` }}>
                         <input
                           type="checkbox"
                           aria-label={`勾选 ${b.guestName || b.bookingNo}`}
-                          checked={checked[b.id] === true}
-                          onChange={() => toggleRow(b.id)}
+                          checked={checked[key] === true}
+                          onChange={() => toggleRow(key)}
                           className="h-[13px] w-[13px] cursor-pointer accent-[#3bd943]"
                         />
                       </td>
@@ -409,10 +429,10 @@ export default function AssignRoomDialog({
                         ) : (
                           <select
                             ref={(el) => {
-                              selectRefs.current.set(b.id, el);
+                              selectRefs.current.set(key, el);
                             }}
                             value={roomId != null ? String(roomId) : ""}
-                            onChange={(e) => setRowRoom(b.id, e.target.value ? Number(e.target.value) : null)}
+                            onChange={(e) => setRowRoom(key, e.target.value ? Number(e.target.value) : null)}
                             aria-label={`为 ${b.guestName || b.bookingNo} 分配房间`}
                             className="h-6 w-full cursor-pointer rounded-[2px] border border-transparent bg-transparent px-1 text-center text-[12px] text-[#333] outline-none transition-colors hover:border-[#d9d9d9] focus:border-[#3bd943] focus:bg-white"
                           >

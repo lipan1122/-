@@ -35,6 +35,8 @@ import { pathToFileURL } from "node:url";
  * 这是本仓库唯一一处 .mjs 引 .ts：Node ≥ 22.18 原生剥离类型，实测可用。
  */
 import { encryptSecret, isEncryptedSecret } from "../src/lib/crypto.ts";
+/* 演示数据一致性修复（第 22 段）与独立脚本 scripts/fix-demo-data-issues.mjs 共用一份实现 */
+import { repairDemoDataConsistency } from "./fix-demo-data-issues.mjs";
 
 /** 数据库路径：命令行、init-db、体检脚本统一口径 */
 export function resolveDbPath() {
@@ -2688,6 +2690,371 @@ export function runMigrations(db, { checkOnly = false } = {}) {
     "idx_housekeeping_review",
     "CREATE INDEX IF NOT EXISTS idx_housekeeping_review ON housekeeping(hotel_id, room_id, review_status)"
   );
+
+  /* ---------- 21. AR 笔级台账回填（ar_ledgers 0 行 / 账户总账 ↔ 台账分叉） ----------
+   *
+   * ── 症状 ──
+   * 真库 ar_transactions 55 行、ar_accounts 余额 5 个都对得上流水合计，
+   * 但 ar_ledgers **0 行**、ar_accounts.company_id 全部 NULL、
+   * ar_write_offs.ar_ledger_id 全部 NULL。
+   *
+   * ── 根因（不是「废弃表」）──
+   * ar_ledgers 有 13 处读取（/ar 台账区、/finance 协议单位应收、/reports AR 账报表兜底、
+   * 删协议单位的引用检查、cap 退房核对、信用额度 getCompanyOutstanding），是活表。
+   * 它空的原因是**两条写入路径在真库都没触发过**：
+   *   ① 真实挂账 chargeToCompanyAction → postArCharge：真库 folios 没有任何 CHARGED 账单，
+   *      op_logs 里 0 条 AR 操作，说明从未有真实挂账；
+   *   ② 演示种子 /ar 页 ensureArSchema → seedHotel：只灌 ar_accounts + ar_transactions，
+   *      **从不写 ar_ledgers**（种子账户也无法可靠映射 companies，见 ar/actions.ts 的注释）。
+   * 判据：55 行流水 request_id 全 NULL（seedHotel 调 recordTx 不传幂等键）、
+   * created_at 秒位全 00（isoAt(biz_date) 固定 10:00）、每账户首行都是「期初余额结转」——
+   * 三条同时成立只能是演示种子。
+   *
+   * ── 后果（本段要修的）──
+   * · /finance「协议单位应收」= 查 ar_ledgers → 恒空，而 /ar 页面余额 105740，两个数；
+   * · 账户没有 company_id → 双写永远走「名称模糊匹配」猜绑定，第一次真实挂账起就可能配错；
+   * · ar_write_offs 指不回台账行，核销无法追溯。
+   *
+   * ── 回填口径（与 src/lib/ar.ts 运行时完全一致）──
+   * · 账户 → 协议单位：互含 + **唯一**命中（同 resolveArAccount 第 2 步），
+   *   命中后把 company_id 固化；之后双写走精确绑定，不再猜；
+   * · POST 正数 → kind='CHARGE' 一行；TRANSFER 正数 → kind='TRANSFER_IN' 一行；
+   *   PAY / WRITE_OFF / TRANSFER 负数 → 按 (biz_date, id) FIFO 冲减未结行（同 settleCompanyLedgers）；
+   *   TRANSFER 负数额外补一条 kind='TRANSFER_OUT' 审计行（amount=settled=转出额，SETTLED，净额 0），
+   *   与 syncAccountTransfer 的两条腿规则一致；
+   * · due_date = biz_date + 30 天（同 DEFAULT_DUE_DAYS）；
+   * · folio_id / folio_no 一律 NULL —— 种子里没有账单，不臆造；
+   * · 回填后硬校验「台账未结 = 账户余额」，不等就整账户回滚，绝不留下半截台账。
+   *
+   * ── 故意不做的事 ──
+   * · 没有对应协议单位的账户（挂账客户「携程预付」、内部「内部挂账」）不建台账：
+   *   ar_ledgers.company_id NOT NULL，这类纯往来账户按设计就没有笔级台账，
+   *   运行时 postAccountLedgerCharge / syncAccountSettlement 也是「跳过并记待核对」；
+   * · 「账户未绑定但该协议单位已有台账」不自动绑定：那说明台账来自真实挂账，
+   *   绑定会让账户余额与台账未结当场分叉，需求人工核对，这里只报 notes；
+   * · 已有台账的账户不再回填（幂等；也避免把真实业务的账户余额重复记一遍）。
+   */
+  {
+    const AR_FILL_TABLES = ["ar_ledgers", "ar_accounts", "ar_transactions", "companies"];
+    const arLacking = AR_FILL_TABLES.filter((t) => !hasTable(t));
+    if (arLacking.length > 0) {
+      skipped.push(`AR 笔级台账回填（缺表：${arLacking.join(" / ")}）`);
+    } else {
+      const r2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+      const eps = 0.001;
+      const ledgerColsNow = all(`PRAGMA table_info(ar_ledgers)`).map((c) => c.name);
+      if (!ledgerColsNow.includes("kind")) {
+        /* 第 9 段已补 kind；走到这里说明 ar_ledgers 是别处建的极老库，不硬写，如实报 */
+        skipped.push("AR 笔级台账回填（台账缺 kind 列，先跑前面的迁移段）");
+      } else {
+        /* ---- 21a. 计算回填清单 ---- */
+        const fillPlan = [];
+        const needManual = [];
+        const hotels = all(`SELECT DISTINCT hotel_id FROM ar_accounts ORDER BY hotel_id`).map((x) => Number(x.hotel_id));
+        for (const h of hotels) {
+          const unbound = all(
+            `SELECT id, code, name FROM ar_accounts WHERE hotel_id = ? AND company_id IS NULL ORDER BY id`,
+            [h]
+          );
+          if (unbound.length === 0) continue;
+          const companies = all(`SELECT id, name FROM companies WHERE hotel_id = ? ORDER BY id`, [h]);
+          for (const c of companies) {
+            const cname = String(c.name ?? "").trim();
+            if (!cname) continue;
+            /*
+             * 与 src/lib/ar.ts resolveArAccount 第 2 步同口径：账户简称与公司全称互含。
+             * 必须唯一命中 —— 宁可懒建镜像账户，也不能把「西湖旅行社」的钱挂到
+             * 「春秋旅行社」头上（两家都含「旅行社」，互含规则本身不会误配，
+             * 但同一家若有两个未绑定账户就必须放弃）。
+             */
+            const hits = unbound.filter((a) => {
+              const an = String(a.name ?? "").trim();
+              if (!an) return false;
+              return an === cname || cname.includes(an) || an.includes(cname);
+            });
+            if (hits.length > 1) {
+              needManual.push(
+                `协议单位「${cname}」命中 ${hits.length} 个未绑定账户（${hits.map((a) => a.code).join("/")}），名称匹配不唯一，未回填`
+              );
+              continue;
+            }
+            if (hits.length === 0) continue;
+            const ledgerRows = Number(
+              all(`SELECT COUNT(*) AS c FROM ar_ledgers WHERE hotel_id = ? AND company_id = ?`, [h, c.id])[0]?.c ?? 0
+            );
+            if (ledgerRows > 0) {
+              needManual.push(
+                `账户 ${hits[0].code}「${hits[0].name}」未绑定，但协议单位「${cname}」已有 ${ledgerRows} 行台账（疑似真实挂账），需人工核对`
+              );
+              continue;
+            }
+            const acc = all(`SELECT id, balance FROM ar_accounts WHERE id = ? AND hotel_id = ?`, [hits[0].id, h])[0];
+            if (!acc) continue;
+            const balance = r2(acc.balance);
+            if (Math.abs(balance) <= eps) continue; // 零余额账户没有可回填的应收
+            fillPlan.push({
+              hotelId: h,
+              accountId: Number(acc.id),
+              code: hits[0].code,
+              accountName: hits[0].name,
+              companyId: Number(c.id),
+              companyName: cname,
+              balance,
+            });
+          }
+        }
+
+        /* ---- 21b. 执行 / 报告 ---- */
+        let filled = 0;
+        if (fillPlan.length === 0) {
+          skipped.push("AR 笔级台账回填（无可回填账户）");
+        } else if (checkOnly) {
+          applied.push(`AR 笔级台账回填：${fillPlan.length} 个协议单位账户（待回填）`);
+        } else {
+          const insLedger = db.prepare(
+            `INSERT INTO ar_ledgers
+               (hotel_id, company_id, folio_id, folio_no, biz_date, amount, settled_amount,
+                due_date, status, kind, operator, remark, created_at)
+             VALUES (?, ?, NULL, NULL, ?, ?, ?, date(?, '+30 days'), ?, ?, ?, ?, ?)`
+          );
+          const updSettled = db.prepare(
+            `UPDATE ar_ledgers SET settled_amount = ?, status = ?, remark = COALESCE(remark, '') || ? WHERE id = ?`
+          );
+          const bindAccount = db.prepare(
+            `UPDATE ar_accounts SET company_id = ? WHERE id = ? AND hotel_id = ? AND company_id IS NULL`
+          );
+          const linkWo = db.prepare(`UPDATE ar_write_offs SET ar_ledger_id = ? WHERE id = ?`);
+          const tagWo = db.prepare(`UPDATE ar_write_offs SET note = ? WHERE id = ?`);
+
+          for (const p of fillPlan) {
+            const sp = `ar_fill_${p.hotelId}_${p.accountId}`;
+            db.exec(`SAVEPOINT ${sp}`);
+            try {
+              const txs = all(
+                `SELECT id, type, amount, note, operator, biz_date, created_at
+                   FROM ar_transactions
+                  WHERE hotel_id = ? AND ar_account_id = ?
+                  ORDER BY biz_date ASC, id ASC`,
+                [p.hotelId, p.accountId]
+              );
+              /** 未结台账行（FIFO 冲减用） */
+              const openRows = [];
+              /** 流水 id → 该笔冲减命中的第一条台账行（回填 ar_write_offs 用） */
+              const firstHitByTx = new Map();
+              for (const t of txs) {
+                const amt = r2(t.amount);
+                const bizDate = String(t.biz_date ?? "").slice(0, 10) || "1970-01-01";
+                const createdAt = String(t.created_at ?? "") || new Date().toISOString();
+                const operator = String(t.operator ?? "系统结转");
+                const memo = t.note ? `（${t.note}）` : "";
+                if (amt > eps && (t.type === "POST" || t.type === "TRANSFER")) {
+                  const kind = t.type === "TRANSFER" ? "TRANSFER_IN" : "CHARGE";
+                  const res = insLedger.run(
+                    p.hotelId,
+                    p.companyId,
+                    bizDate,
+                    amt,
+                    0,
+                    bizDate,
+                    "OPEN",
+                    kind,
+                    operator,
+                    `回填：账户流水 #${t.id}${memo}`,
+                    createdAt
+                  );
+                  openRows.push({ id: Number(res.lastInsertRowid), amount: amt, settled: 0 });
+                  continue;
+                }
+                if (amt >= -eps) continue; // 零额行没有账务含义
+                let left = r2(-amt);
+                const transferOut = left;
+                let firstId = null;
+                for (const row of openRows) {
+                  if (left <= eps) break;
+                  const outstanding = r2(row.amount - row.settled);
+                  if (outstanding <= eps) continue;
+                  const take = r2(Math.min(left, outstanding));
+                  row.settled = r2(row.settled + take);
+                  const status = row.settled >= row.amount - eps ? "SETTLED" : "PARTIAL";
+                  updSettled.run(row.settled, status, `；回填冲减：流水 #${t.id}`, row.id);
+                  if (firstId === null) firstId = row.id;
+                  left = r2(left - take);
+                }
+                if (left > eps) {
+                  throw new Error(`流水 #${t.id}（${t.type} ${r2(-amt)}）超过台账未结合计，差额 ${left}`);
+                }
+                firstHitByTx.set(Number(t.id), firstId);
+                if (t.type === "TRANSFER") {
+                  /* 与 syncAccountTransfer 的审计行一致：金额=已结=转出额，未结净额 0 */
+                  insLedger.run(
+                    p.hotelId,
+                    p.companyId,
+                    bizDate,
+                    transferOut,
+                    transferOut,
+                    bizDate,
+                    "SETTLED",
+                    "TRANSFER_OUT",
+                    operator,
+                    `回填：调账转出（流水 #${t.id}）${memo}`,
+                    createdAt
+                  );
+                }
+              }
+
+              /* 硬校验：台账未结必须等于账户余额，否则整账户回滚 */
+              const ledgerOut = r2(
+                Number(
+                  all(
+                    `SELECT COALESCE(SUM(amount - COALESCE(settled_amount, 0)), 0) AS s
+                       FROM ar_ledgers
+                      WHERE hotel_id = ? AND company_id = ? AND status IN ('OPEN', 'PARTIAL')`,
+                    [p.hotelId, p.companyId]
+                  )[0]?.s ?? 0
+                )
+              );
+              if (Math.abs(ledgerOut - p.balance) > 0.01) {
+                throw new Error(`回填后台账未结 ${ledgerOut} ≠ 账户余额 ${p.balance}，已回滚`);
+              }
+
+              bindAccount.run(p.companyId, p.accountId, p.hotelId);
+
+              /*
+               * 核销记录指回台账：按「同账户、同金额的 WRITE_OFF 流水」唯一匹配。
+               * 种子的 ar_write_offs.transaction_id 指向「被核销的最近一条入账」，
+               * 与 FIFO 实际冲减的台账行是两回事，所以这里用金额+类型定位流水，
+               * 再取该流水的 FIFO 首个命中行。
+               */
+              const orphanWos = all(
+                `SELECT id, amount, note FROM ar_write_offs
+                  WHERE hotel_id = ? AND ar_account_id = ? AND ar_ledger_id IS NULL`,
+                [p.hotelId, p.accountId]
+              );
+              for (const w of orphanWos) {
+                const woAmount = r2(w.amount);
+                const cands = all(
+                  `SELECT id FROM ar_transactions
+                    WHERE hotel_id = ? AND ar_account_id = ? AND type = 'WRITE_OFF' AND ABS(amount) = ?`,
+                  [p.hotelId, p.accountId, woAmount]
+                );
+                const hit = cands.length === 1 ? firstHitByTx.get(Number(cands[0].id)) : null;
+                if (hit) {
+                  linkWo.run(hit, w.id);
+                  notes.push(`核销记录 #${w.id}（${woAmount}）→ 台账行 #${hit}`);
+                } else {
+                  const oldNote = String(w.note ?? "");
+                  if (!oldNote.includes("待核对")) {
+                    tagWo.run(`${oldNote}（无逐笔台账可对应，待核对）`, w.id);
+                  }
+                }
+              }
+
+              db.exec(`RELEASE ${sp}`);
+              filled += 1;
+            } catch (e) {
+              try {
+                db.exec(`ROLLBACK TO ${sp}`);
+                db.exec(`RELEASE ${sp}`);
+              } catch {
+                /* 回滚失败保留原始异常，由 notes 报出 */
+              }
+              needManual.push(
+                `账户 ${p.code}「${p.accountName}」回填失败，已回滚：${e instanceof Error ? e.message : String(e)}`
+              );
+            }
+          }
+          if (filled > 0) {
+            applied.push(
+              `AR 笔级台账回填：${filled} 个协议单位账户（绑定 company_id + 按 FIFO 生成台账行）`
+            );
+            changed += filled;
+          }
+          if (filled < fillPlan.length) {
+            /* 失败账户已在 needManual 里报出，这里不重复 */
+          }
+        }
+
+        /* ---- 21c. 无协议单位的核销记录：标注「待核对」，不静默当已同步 ---- */
+        const unlinked = all(
+          `SELECT w.id, w.note, a.company_id
+             FROM ar_write_offs w
+             LEFT JOIN ar_accounts a ON a.id = w.ar_account_id AND a.hotel_id = w.hotel_id
+            WHERE w.ar_ledger_id IS NULL`
+        ).filter((w) => {
+          const n = String(w.note ?? "");
+          return !n.includes("待核对") && !n.includes("无逐笔台账");
+        });
+        if (unlinked.length > 0) {
+          if (checkOnly) {
+            applied.push(`AR 核销记录标注待核对：${unlinked.length} 条（待标注）`);
+          } else {
+            const tag = db.prepare(`UPDATE ar_write_offs SET note = ? WHERE id = ?`);
+            for (const w of unlinked) {
+              const suffix =
+                w.company_id === null || w.company_id === undefined
+                  ? "（账户未绑定协议单位，无逐笔台账）"
+                  : "（无逐笔台账可对应，待核对）";
+              tag.run(`${String(w.note ?? "")}${suffix}`, w.id);
+            }
+            applied.push(`AR 核销记录标注待核对：${unlinked.length} 条`);
+            changed += unlinked.length;
+          }
+        }
+
+        for (const m of needManual) notes.push(m);
+        /*
+         * 已回填 / 无需回填时给一句状态说明，避免以后有人看到「ar_ledgers 有值但
+         * 账户 company_id 还是 NULL」又猜一遍。checkOnly 下不打印 —— 那是给
+         * --check 做机器判定的，多一行噪音没有意义。
+         */
+        if (!checkOnly && fillPlan.length === 0 && unlinked.length === 0) {
+          const bound = Number(
+            all(`SELECT COUNT(*) AS c FROM ar_accounts WHERE company_id IS NOT NULL`)[0]?.c ?? 0
+          );
+          notes.push(
+            bound > 0
+              ? `AR 台账：${bound} 个协议单位账户已绑定，无需回填`
+              : "AR 台账：本店还没有绑定协议单位的 AR 账户，无笔级台账可回填（挂账客户 / 内部往来按设计不建台账）"
+          );
+        }
+      }
+    }
+  }
+
+  /* ---------- 22. 演示数据一致性修复（独立验证 agent 实测的三类问题之二、之三） ----------
+   *
+   * 这两条都不是 schema 问题，而是**历史种子数据残留**：库结构是对的，
+   * 运行时写入也是对的，只有早期种子 / 冲销留下来的行不自洽。
+   * 放进迁移而不是一次性脚本，是因为「跑一次就干净」不够 —— 换台机器导入演示库、
+   * 或者老库还在生产上跑，同一个不自洽还会回来。迁移每次启动都自查一遍，干净时零成本跳过。
+   *
+   * 实现见 scripts/fix-demo-data-issues.mjs（同一个脚本也能单独跑：
+   *   node scripts/fix-demo-data-issues.mjs            # 只体检
+   *   node scripts/fix-demo-data-issues.mjs --apply    # 备份 + 只修这两类
+   * ）两处共用一个函数，避免「迁移脚本」和「修数据脚本」各写一份然后漂移。
+   *
+   * 22.1 已结账单里的零额押金明细（amount = 0）
+   *   qty=1、price=500~800、amount=0，所属账单 SETTLED、余额 0。押金被冲销时
+   *   只把 amount 改成 0 没删行。账单总额不受影响（0 加进去还是那个数），
+   *   但它违反另一条不变量 qty × price = amount —— 明细与金额一致性检查会永远报警。
+   *   行的存在已经没有任何金额意义，所以删掉。只删 SETTLED 的：在住单（OPEN）
+   *   的 amount=0 可能另有含义（尚未实收），账单没结，删了会抹掉押金线索。
+   *
+   * 22.2 入住单 nights 与实际入离差不符（SI6000~6004：nights=2，实际 3 晚）
+   *   nights = julianday(expect_check_out) - julianday(date(check_in_time))。
+   *   这 5 张单的房费明细早已按 3 晚入账（804=268×3、1404=468×3 …），
+   *   错的是 nights 列本身，影响平均房价 / 间夜数 / RevPAR 分母。
+   *   只改「算出来 >= 1 且与现值不等」的行；算出来 < 1 说明日期缺失，不拿来覆盖；
+   *   钟点房（nights=0 且备注含「钟点」）是合法的 0 晚，排除。
+   *
+   * 两条都幂等：改完就不再满足条件，第二次执行 0 行。 */
+  {
+    const rep = repairDemoDataConsistency(db, { checkOnly });
+    for (const a of rep.applied) applied.push(a);
+    for (const sk of rep.skipped) skipped.push(sk);
+    for (const n of rep.notes) notes.push(n);
+    changed += rep.changed;
+  }
 
   return { changed, applied, skipped, notes, checkOnly };
 }

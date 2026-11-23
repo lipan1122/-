@@ -288,12 +288,15 @@ function findUnscopedWrites(src) {
 
 let unscoped = 0;
 let exemptHits = 0;
+/** 目标源码文件缺失时要判红（原来只打 ⚠️ 就 continue → 缺文件等于「0 处违规」自动算过） */
+const missingFiles = [];
 for (const rel of OWN_FILES) {
   let src = "";
   try {
     src = readSrc(rel);
   } catch {
-    console.log(`⚠️  文件不存在：${rel}`);
+    console.log(`❌ 文件不存在：${rel}`);
+    missingFiles.push(rel);
     continue;
   }
   const hits = findUnscopedWrites(src);
@@ -313,8 +316,8 @@ for (const rel of OWN_FILES) {
 }
 check(
   "A 段：负责文件内「只按 id 定位且无 hotel_id」的写操作 = 0 处（hotels 豁免 1 处）",
-  unscoped === 0 && exemptHits === 1,
-  `违规 ${unscoped} 处 / 豁免 ${exemptHits} 处`
+  unscoped === 0 && exemptHits === 1 && missingFiles.length === 0,
+  `违规 ${unscoped} 处 / 豁免 ${exemptHits} 处${missingFiles.length ? `，缺文件：${missingFiles.join(", ")}` : ""}`
 );
 
 /* ==========================================================================

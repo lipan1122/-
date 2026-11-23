@@ -55,7 +55,11 @@ const check = (name, ok, extra = "") => {
     console.log(`❌ ${name}${extra ? ` — ${extra}` : ""}`);
   }
 };
-/** 明确跳过：环境限制（本轮禁止重建 3100），不计通过也不计失败，但必须打印原因 */
+/**
+ * 明确跳过：环境限制（本轮禁止重建 3100），不计通过也不计失败，但必须打印原因。
+ * 合法跳过的判定标准：跳过数会出现在最后一行汇总「通过 X / 失败 Y / 跳过 Z」，
+ * 且断言本身出问题一律走 check(false) —— 不允许用 skip 掩盖失败。
+ */
 const skipCheck = (name, reason) => {
   skip += 1;
   console.log(`⏳ ${name} — 跳过：${reason}`);

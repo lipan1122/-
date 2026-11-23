@@ -118,20 +118,82 @@ export default async function PredictPage({ searchParams }: { searchParams: Prom
    *   · 主单 room_id 有值（无明细）  → 1 间
    *   · 主单 room_id 为空（无明细）  → room_count 间
    * 与 `src/lib/room-stock.ts` 的 booked 口径逐条一致（房态页今日可售用的是那一套）。
+   *
+   * ── 这一份数据同时是「占用 N」计数和「占用」弹窗的唯一来源 ──
+   * 弹窗原来另查一套 SQL（主单 1 行 + 主单房型），于是行数和数字对不上。
+   * 现在 unit 里多带客人 / 渠道 / 单号 / 房号等展示字段，
+   * 计数只读 room_type_id / check_in_date / check_out_date 三个字段（与改前完全一致），
+   * 弹窗读同一批 unit —— 两边不可能再分叉。
    */
-  type BookingUnit = { room_type_id: number; check_in_date: string; check_out_date: string };
+  type BookingUnit = {
+    /* ---- 计数只用这三项（字段名与改前一致） ---- */
+    room_type_id: number;
+    check_in_date: string;
+    check_out_date: string;
+    /* ---- 以下只给「占用」弹窗展示用，不参与任何计数 ---- */
+    booking_id: number;
+    booking_no: string;
+    guest_name: string | null;
+    mobile: string | null;
+    rate: number;
+    remark: string | null;
+    channel_name: string | null;
+    status: string;
+    room_id: number | null;
+    room_no: string | null;
+    /** 本单内第几间 / 共几间（弹窗说明这一行是订单里的哪一间） */
+    index: number;
+    total: number;
+    /** 主单兜底补出来的（没有有效明细行） */
+    virtual: boolean;
+  };
   const bookingUnits: BookingUnit[] = (() => {
     const units: BookingUnit[] = [];
     /* 1) 明细优先：一行 = 一间房。房型按「明细 → 房间 → 主单」依次兜底 */
-    let detailRows: { type_id: number | null; check_in_date: string | null; check_out_date: string | null }[] = [];
+    let detailRows: {
+      type_id: number | null;
+      check_in_date: string | null;
+      check_out_date: string | null;
+      booking_id: number;
+      booking_no: string;
+      guest_name: string | null;
+      mobile: string | null;
+      rate: number | null;
+      remark: string | null;
+      channel_name: string | null;
+      status: string;
+      room_id: number | null;
+      room_no: string | null;
+    }[] = [];
     try {
-      detailRows = all<{ type_id: number | null; check_in_date: string | null; check_out_date: string | null }>(
+      detailRows = all<{
+        type_id: number | null;
+        check_in_date: string | null;
+        check_out_date: string | null;
+        booking_id: number;
+        booking_no: string;
+        guest_name: string | null;
+        mobile: string | null;
+        rate: number | null;
+        remark: string | null;
+        channel_name: string | null;
+        status: string;
+        room_id: number | null;
+        room_no: string | null;
+      }>(
         `SELECT COALESCE(r.room_type_id, br.room_type_id, b.room_type_id) AS type_id,
                 COALESCE(substr(br.check_in_date, 1, 10), b.check_in_date) AS check_in_date,
-                COALESCE(substr(br.check_out_date, 1, 10), b.check_out_date) AS check_out_date
+                COALESCE(substr(br.check_out_date, 1, 10), b.check_out_date) AS check_out_date,
+                b.id AS booking_id, b.booking_no,
+                COALESCE(br.guest_name, b.guest_name) AS guest_name,
+                COALESCE(br.mobile, b.mobile) AS mobile,
+                COALESCE(br.rate, b.rate, 0) AS rate,
+                b.remark, c.name AS channel_name, b.status,
+                br.room_id, r.room_no
            FROM booking_rooms br
            JOIN bookings b ON b.id = br.booking_id AND b.hotel_id = br.hotel_id
            LEFT JOIN rooms r ON r.id = br.room_id AND r.hotel_id = br.hotel_id
+           LEFT JOIN channels c ON c.id = b.channel_id
           WHERE br.hotel_id = ?
             AND br.status IN ('PENDING','CONFIRMED')
             AND b.status IN ('PENDING','CONFIRMED')
@@ -141,9 +203,35 @@ export default async function PredictPage({ searchParams }: { searchParams: Prom
     } catch {
       /* booking_rooms 是老库的迁移表：缺表时退回只用主单 */
     }
+    /* 每张单的有效明细行数：用于「第 i/N 间」（无效行不参与，与下面的 continue 一致） */
+    const detailTotal = new Map<number, number>();
     for (const row of detailRows) {
       if (row.type_id === null || !row.check_in_date || !row.check_out_date) continue;
-      units.push({ room_type_id: Number(row.type_id), check_in_date: row.check_in_date, check_out_date: row.check_out_date });
+      detailTotal.set(row.booking_id, (detailTotal.get(row.booking_id) ?? 0) + 1);
+    }
+    const detailSeen = new Map<number, number>();
+    for (const row of detailRows) {
+      if (row.type_id === null || !row.check_in_date || !row.check_out_date) continue;
+      const index = (detailSeen.get(row.booking_id) ?? 0) + 1;
+      detailSeen.set(row.booking_id, index);
+      units.push({
+        room_type_id: Number(row.type_id),
+        check_in_date: row.check_in_date,
+        check_out_date: row.check_out_date,
+        booking_id: row.booking_id,
+        booking_no: row.booking_no,
+        guest_name: row.guest_name,
+        mobile: row.mobile,
+        rate: Number(row.rate ?? 0),
+        remark: row.remark,
+        channel_name: row.channel_name,
+        status: row.status,
+        room_id: row.room_id,
+        room_no: row.room_no,
+        index,
+        total: Math.max(1, detailTotal.get(row.booking_id) ?? 1),
+        virtual: false,
+      });
     }
     /* 2) 没有有效明细行的老预订：主单兜底 */
     const mainRows = all<{
@@ -152,12 +240,25 @@ export default async function PredictPage({ searchParams }: { searchParams: Prom
       room_count: number | null;
       check_in_date: string;
       check_out_date: string;
+      booking_id: number;
+      booking_no: string;
+      guest_name: string | null;
+      mobile: string | null;
+      rate: number | null;
+      remark: string | null;
+      channel_name: string | null;
+      status: string;
+      room_no: string | null;
     }>(
       `SELECT COALESCE(r.room_type_id, b.room_type_id) AS type_id, b.room_id,
               COALESCE(b.room_count, 1) AS room_count,
-              b.check_in_date, b.check_out_date
+              b.check_in_date, b.check_out_date,
+              b.id AS booking_id, b.booking_no, b.guest_name, b.mobile,
+              COALESCE(b.rate, 0) AS rate, b.remark, c.name AS channel_name,
+              b.status, r.room_no
          FROM bookings b
          LEFT JOIN rooms r ON r.id = b.room_id AND r.hotel_id = b.hotel_id
+         LEFT JOIN channels c ON c.id = b.channel_id
         WHERE b.hotel_id = ? AND b.status IN ('PENDING','CONFIRMED')
           AND b.check_in_date <= ? AND b.check_out_date >= ?
           AND NOT EXISTS (SELECT 1 FROM booking_rooms br
@@ -168,7 +269,24 @@ export default async function PredictPage({ searchParams }: { searchParams: Prom
       if (row.type_id === null) continue;
       const n = row.room_id ? 1 : Math.max(1, Number(row.room_count ?? 1));
       for (let k = 0; k < n; k += 1) {
-        units.push({ room_type_id: Number(row.type_id), check_in_date: row.check_in_date, check_out_date: row.check_out_date });
+        units.push({
+          room_type_id: Number(row.type_id),
+          check_in_date: row.check_in_date,
+          check_out_date: row.check_out_date,
+          booking_id: row.booking_id,
+          booking_no: row.booking_no,
+          guest_name: row.guest_name,
+          mobile: row.mobile,
+          rate: Number(row.rate ?? 0),
+          remark: row.remark,
+          channel_name: row.channel_name,
+          status: row.status,
+          room_id: row.room_id,
+          room_no: row.room_no,
+          index: k + 1,
+          total: n,
+          virtual: true,
+        });
       }
     }
     return units;
@@ -439,111 +557,115 @@ export default async function PredictPage({ searchParams }: { searchParams: Prom
     );
   }
 
-  /* 房型可售预测：点「占用」弹出当天客人订单列表（去呼呼图 2） */
+  /* 房型可售预测：点「占用」弹出当天客人订单列表（去呼呼图 2）
+   *
+   * ── 为什么这里必须和「占用 N」用同一份数据 ──
+   * 改前这里另查两套 SQL（在住 stayRows + 主单 bkRows），和上面的 matrix 各算各的，于是：
+   *   1. 在住按 `date(expect_check_out) > 当天` 过滤 —— **逾期未离店被整条滤掉**，
+   *      而 matrix 的 occupied 只看 `check_in_date <= 当天`（逾期房间照样占着，这是对的）。
+   *      实测 2026-11-25 房型1：占用 13 间，弹窗只列 1 行；
+   *   2. 预订按「主单 1 行 + 主单房型」列 —— 多房订单（BK-MULTI3 = 3 间）只显示 1 行，
+   *      跨房型订单的房型也可能和计数用的「房间实际房型」不同。
+   *
+   * 现在：
+   *   · 在住 = stayRows，判定 `check_in_date <= 当天`（与 matrix 的 occupied 一字不差）；
+   *   · 预订 = bookingUnits（matrix 计数用的那一份，已按 booking_rooms 明细展开）；
+   *   · 房型 = 同一口径的 room_type_id（房间实际房型 → 明细房型 → 主单房型兜底）；
+   *   · 一行 = 一间，所以「弹窗行数 = 占用 N」（同一房型、同一天）。
+   */
+  const stayRows = all<{
+    id: number; room_type_id: number; room_no: string; type_name: string;
+    guest_name: string; mobile: string | null; rate: number; nights: number;
+    check_in_time: string | null; check_in_date: string | null;
+    expect_check_out: string | null; remark: string | null;
+    channel_name: string | null; booking_no: string | null; link_count: number;
+  }>(
+    `SELECT s.id, rt.id AS room_type_id, r.room_no, rt.name AS type_name,
+            s.guest_name, s.mobile, s.rate, s.nights,
+            s.check_in_time, date(s.check_in_time) AS check_in_date,
+            s.expect_check_out, s.remark,
+            c.name AS channel_name, b.booking_no,
+            (SELECT COUNT(*) FROM stays ls2 WHERE ls2.status = 'INHOUSE' AND s.guest_id IS NOT NULL AND ls2.guest_id = s.guest_id) AS link_count
+       FROM stays s
+       JOIN rooms r ON r.id = s.room_id
+       JOIN room_types rt ON rt.id = r.room_type_id
+       LEFT JOIN channels c ON c.id = s.channel_id
+       LEFT JOIN bookings b ON b.id = s.booking_id
+      WHERE s.hotel_id = ? AND s.status = 'INHOUSE'
+        /*
+         * 不能再用 date(s.expect_check_out) > 起始日 过滤：
+         * 逾期未离店的客人 expect_check_out 早已过去，会被整条滤掉，
+         * 而 matrix 的 occupied 是「只要 INHOUSE 就继续占房」——
+         * 两边口径一分叉，弹窗行数就比「占用 N」少。
+         */
+        AND date(s.check_in_time) <= ?`,
+    [hotelId, endStr]
+  );
+
+  /** 房型名：unit / 在住行都只有 room_type_id，统一从 types 取（不受「房型筛选」影响） */
+  const typeNameOf = (id: number) => types.find((t) => t.id === id)?.name ?? "未分房型";
+
   const orderCells: OrderListCell[] = (() => {
     const out: OrderListCell[] = [];
-    // 覆盖查询区间内每天都在住的订单（入住日 <= 该天 < 离店日）
-    const stayRows = all<{
-      id: number; room_type_id: number; room_no: string; type_name: string;
-      guest_name: string; mobile: string | null; rate: number; nights: number;
-      check_in_time: string | null; expect_check_out: string | null; remark: string | null;
-      channel_name: string | null; booking_no: string | null; link_count: number;
-    }>(
-      `SELECT s.id, rt.id AS room_type_id, r.room_no, rt.name AS type_name,
-              s.guest_name, s.mobile, s.rate, s.nights,
-              s.check_in_time, s.expect_check_out, s.remark,
-              c.name AS channel_name, b.booking_no,
-              (SELECT COUNT(*) FROM stays ls2 WHERE ls2.status = 'INHOUSE' AND s.guest_id IS NOT NULL AND ls2.guest_id = s.guest_id) AS link_count
-         FROM stays s
-         JOIN rooms r ON r.id = s.room_id
-         JOIN room_types rt ON rt.id = r.room_type_id
-         LEFT JOIN channels c ON c.id = s.channel_id
-         LEFT JOIN bookings b ON b.id = s.booking_id
-        WHERE s.hotel_id = ? AND s.status = 'INHOUSE'
-          AND date(s.check_in_time) <= ? AND date(s.expect_check_out) > ?`,
-      [hotelId, endStr, start]
-    );
-    // 预订占用（已排房、未入住）也要出现在列表里，否则「占用」数字对不上
-    const bkRows = all<{
-      id: number; room_type_id: number; room_no: string; type_name: string;
-      guest_name: string; mobile: string | null; rate: number;
-      check_in_date: string; check_out_date: string; remark: string | null;
-      channel_name: string | null; booking_no: string; status: string;
-    }>(
-      `SELECT b.id, rt.id AS room_type_id, r.room_no, rt.name AS type_name,
-              b.guest_name, b.mobile, b.rate,
-              b.check_in_date, b.check_out_date, b.remark,
-              c.name AS channel_name, b.booking_no, b.status
-         FROM bookings b
-         LEFT JOIN rooms r ON r.id = b.room_id
-         JOIN room_types rt ON rt.id = b.room_type_id
-         LEFT JOIN channels c ON c.id = b.channel_id
-        WHERE b.hotel_id = ?
-          AND b.status IN ('PENDING','CONFIRMED')
-          AND b.check_in_date <= ? AND b.check_out_date > ?`,
-      [hotelId, endStr, start]
-    );
-
-    const typeIds = [...new Set([...stayRows, ...bkRows].map((r) => r.room_type_id))];
+    const typeIds = [
+      ...new Set<number>([...stayRows.map((r) => r.room_type_id), ...bookingUnits.map((u) => u.room_type_id)]),
+    ];
     for (const typeId of typeIds) {
       for (const day of columns) {
-        const dayRows = stayRows.filter(
-          (r) =>
-            r.room_type_id === typeId &&
-            (r.check_in_time ? r.check_in_time.slice(0, 10) <= day : true) &&
-            (r.expect_check_out ? r.expect_check_out.slice(0, 10) > day : true)
+        /* 在住：与 matrix 的 occupied 同一判定 —— 入住日 <= 当天（逾期也照样占着） */
+        const stayOfDay = stayRows.filter(
+          (r) => r.room_type_id === typeId && r.check_in_date && r.check_in_date <= day
         );
-        const bkOfDay = bkRows.filter(
-          (r) =>
-            r.room_type_id === typeId &&
-            r.check_in_date <= day &&
-            r.check_out_date > day
+        /* 预订：直接用计数那批 unit，同一判定 isBetween（退房当天不算占用） */
+        const unitOfDay = bookingUnits.filter(
+          (u) => u.room_type_id === typeId && isBetween(u.check_in_date, u.check_out_date, day)
         );
-        if (dayRows.length === 0 && bkOfDay.length === 0) continue;
+        if (stayOfDay.length === 0 && unitOfDay.length === 0) continue;
         out.push({
           typeId,
           day,
-          list: dayRows.map((r) => ({
-            status: "INHOUSE",
-            statusLabel: "现住",
-            channelName: r.channel_name ?? "散客",
-            channelOrderNo: r.booking_no ?? "-",
-            guestName: r.guest_name ?? "-",
-            mobile: r.mobile,
-            stayType: "日租房",
-            roomTypeName: r.type_name,
-            roomNo: r.room_no,
-            rate: Number(r.rate ?? 0),
-            rooms: 1,
-            checkIn: (r.check_in_time ?? "").slice(0, 16).replace("T", " "),
-            checkOut: (r.expect_check_out ?? "") + " 12:00",
-            remark: r.remark?.trim() || "如客人需要发票，请提前告知前台",
-            stayId: r.id,
-            bookingId: null,
-            linkCount: Number(r.link_count ?? 1),
-          })),
+          list: [
+            ...stayOfDay.map((r) => ({
+              status: "INHOUSE",
+              statusLabel: "现住",
+              channelName: r.channel_name ?? "散客",
+              channelOrderNo: r.booking_no ?? "-",
+              guestName: r.guest_name ?? "-",
+              mobile: r.mobile,
+              stayType: "日租房",
+              roomTypeName: r.type_name,
+              roomNo: r.room_no,
+              rate: Number(r.rate ?? 0),
+              rooms: 1,
+              checkIn: (r.check_in_time ?? "").slice(0, 16).replace("T", " "),
+              checkOut: (r.expect_check_out ?? "") + " 12:00",
+              remark: r.remark?.trim() || "如客人需要发票，请提前告知前台",
+              stayId: r.id,
+              bookingId: null,
+              linkCount: Number(r.link_count ?? 1),
+            })),
+            ...unitOfDay.map((u) => ({
+              status: u.status,
+              statusLabel: u.status === "CONFIRMED" ? "已确认" : "待排房",
+              channelName: u.channel_name ?? "散客",
+              channelOrderNo: u.booking_no,
+              guestName: u.guest_name ?? "-",
+              mobile: u.mobile,
+              stayType: "日租房",
+              /* 多房订单标明「第几间/共几间」，一张单展开成几行时不会看起来像重复行 */
+              roomTypeName: `${typeNameOf(u.room_type_id)}${u.total > 1 ? `（${u.index}/${u.total}间）` : ""}`,
+              roomNo: u.room_no || "未排房",
+              rate: Number(u.rate ?? 0),
+              rooms: 1,
+              checkIn: u.check_in_date + " 15:00",
+              checkOut: u.check_out_date + " 12:00",
+              remark: u.remark?.trim() || (u.room_no ? "预订占用，尚未入住" : "预订占用，尚未分房"),
+              stayId: null,
+              bookingId: u.booking_id,
+              linkCount: 1,
+            })),
+          ],
         });
-        for (const b of bkOfDay) {
-          out[out.length - 1].list.push({
-            status: b.status,
-            statusLabel: b.status === "CONFIRMED" ? "已确认" : "待排房",
-            channelName: b.channel_name ?? "散客",
-            channelOrderNo: b.booking_no,
-            guestName: b.guest_name ?? "-",
-            mobile: b.mobile,
-            stayType: "日租房",
-            roomTypeName: b.type_name,
-            roomNo: b.room_no || "未排房",
-            rate: Number(b.rate ?? 0),
-            rooms: 1,
-            checkIn: b.check_in_date + " 15:00",
-            checkOut: b.check_out_date + " 12:00",
-            remark: b.remark?.trim() || "预订占用，尚未入住",
-            stayId: null,
-            bookingId: b.id,
-            linkCount: 1,
-          });
-        }
       }
     }
     return out;

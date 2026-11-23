@@ -45,6 +45,11 @@ const check = (name, ok, extra = "") => {
   }
 };
 
+/*
+ * 合法的跳过：只用于「环境 / 上游未就绪」这类客观限制（渠道沙箱未配密钥等），
+ * 跳过数会打进最后一行汇总（通过 X / 失败 Y / 跳过 Z），失败数仍为 0 才退出 0。
+ * 注意：任何断言本身出问题都必须走 check(false)，不许用 skip 掩盖。
+ */
 const skip = (name, reason = "") => {
   skipped += 1;
   console.log(`⏭️ ${name}${reason ? `（跳过：${reason}）` : ""}`);

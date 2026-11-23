@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import Link from "next/link";
 import { redirect } from "next/navigation";
-import { ensureArAccountSchema } from "@/lib/ar";
+import { ensureArAccountSchema, listArLedgerDrift } from "@/lib/ar";
 import { all, get } from "@/lib/db";
 import {
   nightSeries,
@@ -1906,6 +1906,17 @@ function arAccountAgg(hotelId: number, from: string, to: string): ArAccountRow[]
    * 金额取台账未结余额，避免「明明挂着账、报表一家都看不到」。
    * 一旦该单位之后再挂账/核销，lib/ar 会把它绑定到账户，兜底行自动消失，
    * 不会与账户行重复计数。
+   *
+   * ── 第十轮：真库那条兜底行以前一直不会出现，因为 ar_ledgers 是 0 行 ──
+   * 真库的账户/流水全是演示种子（seedHotel 只灌账户总账、不写台账），
+   * 于是第一段有 5 个账户、第二段永远是空集，报表数字自洽但与 /finance 的
+   * 「协议单位应收」（唯一数据源是 ar_ledgers）对不上。
+   * 现在由 scripts/migrate-all.mjs 第 21 段把账户总账回填成台账并固化 company_id：
+   *   · 协议单位账户（AR001/2/3）→ 绑定 company_id，第一段照旧、第二段不重复；
+   *   · 挂账客户 / 内部往来（携程预付、内部挂账）没有对应协议单位，
+   *     按设计不建台账，它们只出现在第一段（账户维度）。
+   * 兜底段保留：它仍然要接住「有台账、但账户还没绑定」的老库，
+   * 而且 `NOT EXISTS (x.company_id = l.company_id)` 就是防重复计数的那个条件。
    */
   return all<ArAccountRow>(
     `SELECT a.id, a.code, a.name, a.type, a.status,
@@ -6248,6 +6259,18 @@ function ReportArAccount({ ctx }: ReportProps) {
   const post = rows.reduce((s, r) => s + num(r.post_amount), 0);
   const paid = rows.reduce((s, r) => s + num(r.paid_amount), 0);
   const credit = rows.reduce((s, r) => s + num(r.credit_limit), 0);
+  /*
+   * 台账自检（第十轮）：账户余额 vs 协议单位笔级台账未结
+   *
+   * 双写（挂账/收款/转账/核销）正常时两边恒等。不等只有三种可能：
+   *   · 老库还没跑 scripts/migrate-all.mjs 第 21 段（台账空、账户有余额）→ 显式告警；
+   *   · 有人绕过 lib/ar 直接 UPDATE ar_accounts.balance（对账必错）；
+   *   · 该账户刚绑定协议单位，历史流水尚未入台账。
+   * 报表是唯一同时看得见两个数的地方，所以把偏差摆在这里，而不是让它静默存在。
+   */
+  const drift = listArLedgerDrift(hotelId);
+  const driftBad = drift.filter((d) => Math.abs(d.drift) > 0.005);
+  const driftAmount = round2(driftBad.reduce((s, d) => s + Math.abs(d.drift), 0));
 
   return (
     <>
@@ -6324,6 +6347,24 @@ function ReportArAccount({ ctx }: ReportProps) {
         收银台「挂公司账」会在同一事务里双写账户流水（POST +800 这类），因此挂账产生的应收在本表可见；
         编号以 ARC 开头的是系统为协议单位自动建立的账户。最后几行可能来自「历史挂账兜底」：
         升级前只写了 ar_ledgers、尚未绑定 AR 账户的协议单位，按台账未结余额单独列出（金额与 /ar 页面台账一致）。
+        第十轮起，协议单位账户的笔级台账由 scripts/migrate-all.mjs 第 21 段回填并与账户绑定，
+        兜底行通常为空；挂账客户「携程预付」、内部「内部挂账」这类没有对应协议单位的账户只在本表（账户维度）出现，
+        它们不进财务页的「协议单位应收」—— 那一页只列协议单位笔级台账。
+      </NoteCard>
+
+      <NoteCard>
+        台账自检：
+        {drift.length === 0 ? (
+          "本店还没有绑定协议单位的 AR 账户，无笔级台账可对账（挂账客户 / 内部往来按设计不建笔级台账）。"
+        ) : driftBad.length === 0 ? (
+          `${drift.length} 家协议单位的「账户余额」与「笔级台账未结」全部一致（双写闭环）。`
+        ) : (
+          <span className="text-[#e2483a]">
+            ⚠️ {driftBad.length} / {drift.length} 家不一致，差额合计 {fmtMoney(driftAmount)}：
+            {driftBad.map((d) => `${d.accountCode} 账户 ${fmtMoney(d.accountBalance)} / 台账 ${fmtMoney(d.ledgerOutstanding)}`).join("；")}
+            。跑 node scripts/migrate-all.mjs 回填历史账户总账（第 21 段），或核对是否有人绕过 AR 模块直接改了账户余额。
+          </span>
+        )}
       </NoteCard>
     </>
   );
