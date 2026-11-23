@@ -8,6 +8,13 @@ import { nowIso } from "@/lib/utils";
 import { bizToday, getBizCutoff, isAfterCutoff } from "@/lib/biz-date";
 /* 第 4 轮 P1-18：夜审执行前必须跑阻断检查（原来只显示不拦截） */
 import { nightAuditPreflight } from "./preflight";
+/*
+ * 渠道库存同步（整改 4.1 缺口补线）：夜审会批量判定 NOSHOW（释放房间占用）、
+ * 补记房费、并把在住单的占用区间顺延到「明天」—— 三件事都会改变渠道可售量。
+ * 这里只落一条 channel_sync_queue 待同步记录，由 stock-queue 合并后推送，
+ * 绝不在夜审里直接打四家 OTA 接口（频控 + 夜审本身要跑得快）。
+ */
+import { markStockDirty } from "@/lib/channels/stock-trigger";
 
 /*
  * ══════════════════════════════════════════════════════════════════════════
@@ -341,6 +348,13 @@ export async function runNightAuditAction(): Promise<{ error: string } | { ok: t
       ]
     );
   });
+
+  /*
+   * 渠道库存（整改 4.1 缺口）：夜审的事务已在上面提交完成（任一步失败都会整体回滚，
+   * 走不到这里），此时 NOSHOW 释放的房间、顺延的在住占用都已落库 —— 记一条待同步，
+   * 让渠道把「昨晚起这些房能不能卖」重新对齐一次。
+   */
+  markStockDirty(hotelId, `夜审完成（营业日 ${today}）：NOSHOW / 在住占用口径变化`);
 
   revalidatePath("/night-audit");
   revalidatePath("/cashier");

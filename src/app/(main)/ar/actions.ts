@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { get, getDb, run, tx } from "@/lib/db";
 import { bizToday } from "@/lib/biz-date";
-import { requireAdmin, requirePermission, requireUser } from "@/lib/session";
+import { requireAdmin, requirePermission, requirePermissionOrRedirect } from "@/lib/session";
 import { fmtMoney, nowIso, todayStr } from "@/lib/utils";
 import { postAccountLedgerCharge, settleAr, syncAccountSettlement, syncAccountTransfer } from "@/lib/ar";
 
@@ -415,10 +415,28 @@ function seedHotel(hotelId: number): void {
 export async function ensureArSchema(hotelId: number): Promise<void> {
   /*
    * 权限边界（上线前加固）：建表 / 种子助手不该是可匿名调用的 RPC 端点。
-   * 它被 ar/page.tsx 直接 import，去掉 export 会打断页面编译，这里补登录守卫；
+   * 它被 ar/page.tsx 直接 import，去掉 export 会打断页面编译，这里必须补权限；
    * 同时酒店 id 必须与 session 一致，避免拿别家 hotelId 往别家写种子数据。
+   *
+   * 为什么是 cashier.view（整改 A 类缺口）：
+   *   只有 requireUser() 时，任何登录账号（含客房）直接 POST 这个 action 就能让
+   *   本店凭空多出种子应收账户 / 让 DDL 被执行 —— 它是写动作，必须有权限点。
+   *
+   *   选点依据是「调用方角色交集」，不是随便挑一个账务点：
+   *   · 页面：ar/page.tsx（admin / cashier）
+   *   · 本文件调用它的 4 个写动作：postArAction=cashier.charge_company(admin/cashier)、
+   *     payArAction=cashier.receive(admin/frontdesk/cashier)、
+   *     transferArAction=cashier.transfer(admin/cashier)、writeOffArAction=requireAdmin
+   *   这四类角色合计是 admin / frontdesk / cashier，正好等于 cashier.view 的角色集。
+   *   如果这里用更窄的 report.view_finance（admin/cashier），
+   *   frontdesk 调 payArAction 时会被这个**内部**助手 307 到 /no-permission ——
+   *   等于把一个明确授权给前台的收款动作弄坏，那才是真正的回归。
+   *   AR 的写权限由上面每个动作自己的权限点负责，这里只负责「不能是随便一个登录用户」。
+   *
+   * 用 OrRedirect 而非 requirePermission：生产构建会把 Server Action 抛出的错误消息
+   * 脱敏成「操作失败」，跳 /no-permission 才能让用户看到「没有该操作权限」。
    */
-  const user = await requireUser();
+  const user = await requirePermissionOrRedirect("cashier.view");
   if (Number(hotelId) !== user.hotelId) throw new Error("FORBIDDEN: 不能为其他酒店初始化应收数据");
   if (!schemaReady) {
     const db = getDb();

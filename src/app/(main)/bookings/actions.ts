@@ -9,6 +9,20 @@ import { isAssignable } from "@/lib/room-status";
 import { nightsBetween, nowIso } from "@/lib/utils";
 /* 预订号生成（按酒店隔离，多租户修复：原来这里自己算全局 MAX(id)，两家店会撞号） */
 import { nextBookingNo } from "@/lib/channels/booking-no";
+/*
+ * 渠道库存同步（整改 4.1 的缺口补线，见 src/lib/channels/stock-trigger.ts 文件头）
+ *
+ * 为什么预订侧必须调：取消 / 排房都会改变「这间房还能不能卖」，
+ * 而渠道（携程 / 美团 / 飞猪 / 抖音）那边**只认推送**，本地改了它不会自己知道。
+ * 不推的后果：客人已经取消，携程上那间房仍然挂着卖；反之排房后本地满房了，
+ * 渠道还在放量 → 超卖。这里只落一条「待同步」队列记录（不实时打渠道接口，
+ * 四家 OTA 都有频控），由 stock-queue 的 drainStockQueue 合并后推送。
+ *
+ * 位置约束：**必须放在 tx() 提交之后**。事务里调用的话，一旦后面回滚，
+ * 队列里已经记了「库存变了」，消费者就会照着一个不存在的状态去推渠道，
+ * 反而制造渠道与本地不一致。
+ */
+import { markStockDirty } from "@/lib/channels/stock-trigger";
 
 /** 读取字符串字段并去除首尾空格，非字符串一律视为空串 */
 function str(value: FormDataEntryValue | null): string {
@@ -407,6 +421,9 @@ export async function cancelBookingAction(formData: FormData) {
     );
   });
 
+  /* 取消 = 房间重新可售：事务已提交，这里记一条渠道待同步（不实时打渠道接口） */
+  markStockDirty(user.hotelId, `取消预订 #${id}，释放房间占用`);
+
   revalidateBookingPaths();
 }
 
@@ -528,6 +545,9 @@ export async function batchCancelBookingsAction(formData: FormData) {
     );
   });
 
+  /* 批量取消同样释放房间：事务提交后再记渠道待同步 */
+  markStockDirty(user.hotelId, `批量取消预订 ${ids.length} 单，释放房间占用`);
+
   revalidateBookingPaths();
 }
 
@@ -614,6 +634,9 @@ export async function batchCancelTeamRoomsAction(formData: FormData) {
       );
     }
   });
+
+  /* 团队释放房间后房间重新可售：事务提交后记渠道待同步 */
+  markStockDirty(user.hotelId, `团队 ${teams.join("、")} 取消排房，释放房间占用`);
 
   revalidateBookingPaths();
 }
@@ -1006,6 +1029,12 @@ export async function assignRoomAction(formData: FormData) {
   }
 
   if (failure) redirect(back("err", failure));
+
+  /*
+   * 排房改变「未排房预订 → 具体房间」的占用口径，渠道可售量随之变化：
+   * 事务已在上面提交成功（失败分支已 redirect 掉），这里再记渠道待同步。
+   */
+  markStockDirty(hotelId, `预订单 ${done.booking_no} 排房 → ${roomNos.join("、")}`);
 
   revalidateBookingPaths();
   revalidatePath("/rooms");

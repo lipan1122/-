@@ -22,6 +22,8 @@ import { findGuestByIdentity, findSameNameGuests } from "@/lib/guest-match";
 import { quoteHourly } from "@/lib/hourly-rate";
 /* 第 4 轮 P1-20：渠道订单状态回传（入住成功 → CHECKED_IN） */
 import { pushOrderStatusForChannelOrder } from "@/lib/channels/order-status";
+/* 渠道库存同步（整改 4.1 缺口补线）：入住后该房型的可售量变少，必须让渠道知道 */
+import { markStockDirty } from "@/lib/channels/stock-trigger";
 import { addDays, nightsBetween, nowIso, todayStr, nowLocalIso } from "@/lib/utils";
 
 /**
@@ -768,6 +770,18 @@ export async function checkInAction(
         );
       }
     });
+
+    /*
+     * 渠道库存（整改 4.1 缺口）：入住已经把房间从「可售」变成「在住」，
+     * 事务在上一步提交完成，这里再记一条待同步。
+     *
+     * 与下面 pushOrderStatusForChannelOrder 的区别：
+     *   · 那个推的是**订单状态**（待入住 → 已入住），走网络、按单推送；
+     *   · markStockDirty 记的是**库存变化**（房量少了 N 间），只落本地队列，
+     *     由 stock-queue 合并后统一推房量房价。
+     * 两件事都要做：只回传订单状态，渠道的房量仍然是入住前的旧值 → 超卖。
+     */
+    markStockDirty(hotelId, `入住 ${roomIds.length} 间（${primary.name}），在住占用增加`);
 
     /*
      * 第 4 轮 P1-20：把「已入住」回传给渠道（放在事务**提交之后**）

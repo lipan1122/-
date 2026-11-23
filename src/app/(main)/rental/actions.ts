@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { get, run, tx } from "@/lib/db";
-import { requireUser } from "@/lib/session";
+import { requirePermissionOrRedirect } from "@/lib/session";
 import { fmtMoney, nowIso } from "@/lib/utils";
 
 /** 物品租赁：新表不在 init-db.mjs 内，首次访问时懒创建 */
@@ -59,11 +59,15 @@ function back(key: "err" | "msg", message: string): never {
 /** 懒建表（幂等）+ 首次为各酒店写入五种出借物品 */
 export async function ensureRentalSchema(hotelId: number): Promise<void> {
   /*
-   * 权限边界（上线前加固）：建表 / 种子助手不该是可匿名调用的 RPC 端点。
-   * 它被 rental/page.tsx 直接 import，去掉 export 会打断页面编译，这里补登录守卫；
-   * 同时酒店 id 必须与 session 一致，避免拿别家 hotelId 往别家写种子数据。
+   * 权限边界（整改 A 类缺口）：建表 / 种子助手是**写动作**（DDL + 往 rental_items 灌种子），
+   * 原来只有 requireUser()，任何登录账号直接 POST 就能执行。
+   *
+   * 为什么是 settings.manage：/rental 在 ROLE_MODULES 里只有 admin 可见（属门店配置类页面），
+   * 物品档案 / 押金 / 库存都是配置数据，沿用本仓库「无专属权限点的管理类写操作 →
+   * settings.manage」的既有约定（goods / points 配置 / shop 停用商品同款）。
+   * 本文件 rentItemAction / returnRentalAction 也已改成同一个点，调用链一致。
    */
-  const user = await requireUser();
+  const user = await requirePermissionOrRedirect("settings.manage");
   if (Number(hotelId) !== user.hotelId) throw new Error("FORBIDDEN: 不能为其他酒店初始化租借数据");
   if (!schemaReady) {
     run(`CREATE TABLE IF NOT EXISTS rental_items (
@@ -116,7 +120,9 @@ export async function ensureRentalSchema(hotelId: number): Promise<void> {
  * 3. 写租赁记录 + 扣减库存
  */
 export async function rentItemAction(formData: FormData): Promise<void> {
-  const user = await requireUser();
+  /* 权限（整改 A 类缺口）：租出会写 rental_records 并扣库存，属物品档案类写操作，
+   * 与 ensureRentalSchema 用同一个 settings.manage（/rental 仅 admin 可见）。 */
+  const user = await requirePermissionOrRedirect("settings.manage");
   const hotelId = user.hotelId;
   await ensureRentalSchema(hotelId);
 
@@ -172,7 +178,8 @@ export async function rentItemAction(formData: FormData): Promise<void> {
 
 /** 归还物品：记录归还时间，押金对应的物品回库存 */
 export async function returnRentalAction(formData: FormData): Promise<void> {
-  const user = await requireUser();
+  /* 权限（整改 A 类缺口）：归还会改 rental_records 状态并回补库存，与租出同一把锁。 */
+  const user = await requirePermissionOrRedirect("settings.manage");
   const hotelId = user.hotelId;
   await ensureRentalSchema(hotelId);
 

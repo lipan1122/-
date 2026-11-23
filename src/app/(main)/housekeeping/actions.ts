@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { get, run } from "@/lib/db";
-import { requirePermission, requireUser } from "@/lib/session";
+import { requirePermission, requirePermissionOrRedirect } from "@/lib/session";
 import { changeRoomStatus } from "@/lib/room-status";
 import { nowIso } from "@/lib/utils";
 
@@ -76,7 +76,14 @@ const TASK_STATUS_TEXT: Record<string, string> = {
 
 /** 完成一条客房任务：任务置为已完成，对应空脏房间置为 VC 并记房态日志 */
 export async function completeTaskAction(taskId: number): Promise<void> {
-  const user = await requireUser();
+  /*
+   * 权限（整改 A 类缺口）：原来只有 requireUser()。
+   * 完成客房任务会 **改房态**（VD → VC，见下方 setRoomVacantClean）并写房态日志，
+   * 与 setRoomStatusAction 是同一类副作用，因此复用同一个权限点 room.change_status。
+   * 该点授权 admin / frontdesk / housekeeping，与 /housekeeping 页面的可见角色完全一致，
+   * 不会把执行打扫的客房账号锁在门外。
+   */
+  const user = await requirePermissionOrRedirect("room.change_status");
   if (!Number.isFinite(taskId) || taskId <= 0) back("任务完成失败：任务参数不正确，请刷新后重试");
 
   const task = get<{ room_id: number | null; status: string; task_type: string | null }>(
@@ -301,7 +308,12 @@ export async function reviewTaskFormAction(formData: FormData): Promise<void> {
 
 /** 脏房置净：房间直接改为 VC，并写房态变更日志 */
 export async function setRoomCleanAction(roomId: number): Promise<void> {
-  const user = await requireUser();
+  /*
+   * 权限（整改 A 类缺口）：原来只有 requireUser()。
+   * 「脏房置净」就是把房间状态 VD → VC，属于最典型的房态变更，
+   * 沿用 room.change_status（admin / frontdesk / housekeeping）—— 与房态页改房态同一把锁。
+   */
+  const user = await requirePermissionOrRedirect("room.change_status");
   if (!Number.isFinite(roomId) || roomId <= 0) back("置净未执行：房间参数不正确，请刷新后重试");
 
   /*

@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { all, get, getDb, run, tx } from "@/lib/db";
-import { requirePermission, requireUser } from "@/lib/session";
+import { requirePermission, requirePermissionOrRedirect } from "@/lib/session";
 import { fmtMoney, nowIso } from "@/lib/utils";
 
 /**
@@ -331,11 +331,15 @@ function seedGoodsDefaults(hotelId: number): void {
 /** 建表 + 首次种子（页面与所有写操作共用） */
 export async function ensureGoodsSchema(hotelId: number): Promise<void> {
   /*
-   * 权限边界（上线前加固）：建表 / 种子助手不该是可匿名调用的 RPC 端点。
-   * 它被 goods/page.tsx 直接 import，去掉 export 会打断页面编译，这里补登录守卫；
-   * 同时酒店 id 必须与 session 一致，避免拿别家 hotelId 往别家写种子数据。
+   * 权限边界（整改 A 类缺口）：建表 + 写种子也是**写动作**，不能只校验登录。
+   * 只有 requireUser() 时，客房 / 收银直接 POST 本 action 就能执行 DDL 并往
+   * 别家 / 本家的 goods 相关表里灌默认商品 —— 这属于系统初始化，不是日常业务。
+   *
+   * 为什么是 settings.manage：/goods 页面对其他岗位不可见（ROLE_MODULES 里只有 admin），
+   * 而本文件其余写动作（createCategory / saveGoods / toggleGoodsStatus…）已统一用
+   * settings.manage；种子写入属于同一类「系统配置」，保持一致。
    */
-  const user = await requireUser();
+  const user = await requirePermissionOrRedirect("settings.manage");
   if (Number(hotelId) !== user.hotelId) throw new Error("FORBIDDEN: 不能为其他酒店初始化商品数据");
   createTables();
   seedGoodsDefaults(hotelId);

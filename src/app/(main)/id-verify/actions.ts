@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { get, run } from "@/lib/db";
-import { requireUser } from "@/lib/session";
+import { requirePermissionOrRedirect } from "@/lib/session";
 import { nowIso } from "@/lib/utils";
 
 /** 人证核验：校验身份证号格式与校验码，并比对客史 */
@@ -37,10 +37,12 @@ function back(key: "err" | "msg", message: string): never {
 /** 懒建表（幂等）：核验记录表 */
 export async function ensureIdVerifySchema(): Promise<void> {
   /*
-   * 权限边界（上线前加固）：建表助手不该是可匿名调用的 RPC 端点。
-   * 它被 id-verify/page.tsx 直接 import，去掉 export 会打断页面编译，这里补登录守卫。
+   * 权限边界（整改 A 类缺口）：建表助手同样是可被直接 POST 的写动作。
+   * 为什么是 guest.view_sensitive：身份证核验本身就是在**读取/落库客人证件号**
+   * （敏感字段），该点授权 admin / frontdesk，与 /id-verify 页面的可见角色完全一致
+   * （ROLE_MODULES 里只有 admin / frontdesk），补守卫不会影响正常核验流程。
    */
-  await requireUser();
+  await requirePermissionOrRedirect("guest.view_sensitive");
   if (schemaReady) return;
   run(`CREATE TABLE IF NOT EXISTS id_verify_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,7 +131,12 @@ function matchGuest(hotelId: number, name: string, idNo: string): string {
  * 人证核验：写核验日志（通过 / 未通过都记录），并带着结果回到页面显示
  */
 export async function verifyIdAction(formData: FormData): Promise<void> {
-  const user = await requireUser();
+  /*
+   * 权限（整改 A 类缺口）：原来只有 requireUser()。
+   * 本动作会把客人姓名 / 证件号写进 id_verify_logs 并返回核验结果，
+   * 属「客人敏感信息」类操作，用 guest.view_sensitive（admin / frontdesk）。
+   */
+  const user = await requirePermissionOrRedirect("guest.view_sensitive");
   await ensureIdVerifySchema();
 
   const name = str(formData.get("name"));

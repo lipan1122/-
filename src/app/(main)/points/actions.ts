@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { all, get, run, tx } from "@/lib/db";
-import { requireAdmin, requirePermission, requireUser } from "@/lib/session";
+import { requireAdmin, requirePermission, requirePermissionOrRedirect } from "@/lib/session";
 import { addDays, nowIso, round2, todayStr } from "@/lib/utils";
 
 /**
@@ -114,11 +114,13 @@ function back(tab: string, key: "err" | "msg", message: string, guest?: number):
 
 export async function ensurePointsSchema(hotelId: number): Promise<void> {
   /*
-   * 权限边界（上线前加固）：建表 / 种子助手不该是可匿名调用的 RPC 端点。
-   * 它被 points/page.tsx 直接 import，去掉 export 会打断页面编译，这里补登录守卫；
-   * 同时酒店 id 必须与 session 一致，避免拿别家 hotelId 往别家写种子数据。
+   * 权限边界（整改 A 类缺口）：建表 + 种子写入是写动作，不能只校验登录。
+   * 为什么是 member.view_sensitive：积分三表（score_codes / score_goods / score_records）
+   * 直接承载会员权益数据，该点的角色集 admin / cashier / frontdesk 与 /points 页面的
+   * 可见角色完全一致；本文件调用它的写动作（settings.manage × 4、requireAdmin × 1、
+   * redeemPointsAction）的持有者都被这个点覆盖，补守卫不会锁死已有路径。
    */
-  const user = await requireUser();
+  const user = await requirePermissionOrRedirect("member.view_sensitive");
   if (Number(hotelId) !== user.hotelId) throw new Error("FORBIDDEN: 不能为其他酒店初始化积分数据");
   if (!schemaReady) {
     run(`CREATE TABLE IF NOT EXISTS score_codes (
@@ -465,7 +467,17 @@ export async function adjustPointsAction(formData: FormData): Promise<void> {
 
 /** 积分兑换：校验积分与库存 → 扣积分、减库存、写 SPEND 明细 */
 export async function redeemPointsAction(formData: FormData): Promise<void> {
-  const user = await requireUser();
+  /*
+   * 权限（整改 A 类缺口）：原来只有 requireUser()。
+   * 兑换会**扣减会员积分**并减库存 —— 直接改变会员权益，属会员权益类写操作，
+   * 用 member.manage（admin / frontdesk）。同文件的 adjustPointsAction 已经是
+   * requireAdmin（积分调整只能管理员），这里保持「改积分 = 会员权益」的同一把锁。
+   *
+   * 影响（如实说明）：/points 页面对 cashier 也可见，但改造后收银不能执行兑换
+   * （cashier 没有 member.manage）。这与它本来就不能调整积分是一致的；
+   * 若业务要求收银也能兑换，应新增 points.redeem 并授权三岗，而不是退回 requireUser()。
+   */
+  const user = await requirePermissionOrRedirect("member.manage");
   const hotelId = user.hotelId;
   await ensurePointsSchema(hotelId);
 

@@ -14,6 +14,12 @@ import { findGuestByIdentity } from "@/lib/guest-match";
 /* 第八轮业务冒烟 C6：会员充值唯一记账入口（member_wallet_ledger，member_id 维度）。
  * 禁止再往 guest_name 维度的旧表 member_wallet 写单笔充值行，否则与收银台储值卡两套账。 */
 import { rechargeWallet } from "@/lib/member-wallet";
+/*
+ * 渠道库存同步（整改 4.1 缺口补线）：房态 / 锁房 / 维修房都属于「还能不能卖」的变化，
+ * 而渠道只认推送。这里只落一条 channel_sync_queue 待同步记录，由 stock-queue 合并后推送
+ * （实时打四家 OTA 接口会触发频控）。markStockDirty 不抛异常，不影响房态动作本身。
+ */
+import { markStockDirty } from "@/lib/channels/stock-trigger";
 
 /** 统一返回：{ error } 失败提示，{ ok } 成功提示（与 cashier/actions.ts 保持一致） */
 type ActionState = { error?: string; ok?: string };
@@ -304,6 +310,13 @@ export async function setRoomStatusAction(formData: FormData) {
     source: { kind: "manual" },
   });
   if (!r.ok) return;
+
+  /*
+   * 渠道库存（整改 4.1 缺口）：房态变更里 OOO（维修）/ LOCK（锁房）直接减少可售房量，
+   * VC / VD 之类互转也会影响「可卖」口径，所以统一记一条待同步。
+   * changeRoomStatus 内部已经提交自己的写事务，这里处于提交后，不会「回滚了还推渠道」。
+   */
+  markStockDirty(user.hotelId, `改房态 房间#${roomId} → ${status}${reason ? `（${reason}）` : ""}`);
 
   revalidatePath("/rooms");
   revalidatePath("/housekeeping");

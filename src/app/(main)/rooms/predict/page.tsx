@@ -11,7 +11,6 @@ export const dynamic = "force-dynamic";
 
 type TypeRow = { id: number; name: string; code: string; total: number; ooo: number; lock: number };
 type StayRow = { room_type_id: number; check_in_date: string | null; out_date: string | null };
-type BookingRow = { room_type_id: number; check_in_date: string; check_out_date: string };
 type RevenueRow = { type_id: number; biz_date: string; revenue: number | null };
 
 type Search = {
@@ -106,12 +105,74 @@ export default async function PredictPage({ searchParams }: { searchParams: Prom
     [hotelId]
   );
 
-  const bookings = all<BookingRow>(
-    `SELECT room_type_id, check_in_date, check_out_date
-     FROM bookings
-     WHERE hotel_id = ? AND status IN ('PENDING','CONFIRMED')`,
-    [hotelId]
-  );
+  /*
+   * 预订占用：**按「间」展开，不按「单」算**
+   *
+   * 原来这里是 `for (const b of bookings) … occupied++` —— 一张订单只算 1 间。
+   * 多房订单（一张单订 3 间：room_count = 3、主单只填了首间、明细 3 行）
+   * 于是只扣 1 间 → 可售多算 2 间 → 前台按这个数字排房就会超卖。
+   * 实测 BK-MULTI3（11-25 → 11-27）改前每天只扣 1 间，正确是 3 间。
+   *
+   * 权威来源是 `booking_rooms` 明细（一行 = 一间房），没有明细的老订单才退回主单：
+   *   · 明细行                      → 每行 1 间
+   *   · 主单 room_id 有值（无明细）  → 1 间
+   *   · 主单 room_id 为空（无明细）  → room_count 间
+   * 与 `src/lib/room-stock.ts` 的 booked 口径逐条一致（房态页今日可售用的是那一套）。
+   */
+  type BookingUnit = { room_type_id: number; check_in_date: string; check_out_date: string };
+  const bookingUnits: BookingUnit[] = (() => {
+    const units: BookingUnit[] = [];
+    /* 1) 明细优先：一行 = 一间房。房型按「明细 → 房间 → 主单」依次兜底 */
+    let detailRows: { type_id: number | null; check_in_date: string | null; check_out_date: string | null }[] = [];
+    try {
+      detailRows = all<{ type_id: number | null; check_in_date: string | null; check_out_date: string | null }>(
+        `SELECT COALESCE(r.room_type_id, br.room_type_id, b.room_type_id) AS type_id,
+                COALESCE(substr(br.check_in_date, 1, 10), b.check_in_date) AS check_in_date,
+                COALESCE(substr(br.check_out_date, 1, 10), b.check_out_date) AS check_out_date
+           FROM booking_rooms br
+           JOIN bookings b ON b.id = br.booking_id AND b.hotel_id = br.hotel_id
+           LEFT JOIN rooms r ON r.id = br.room_id AND r.hotel_id = br.hotel_id
+          WHERE br.hotel_id = ?
+            AND br.status IN ('PENDING','CONFIRMED')
+            AND b.status IN ('PENDING','CONFIRMED')
+            AND b.check_in_date <= ? AND b.check_out_date >= ?`,
+        [hotelId, columns[columns.length - 1] ?? today, columns[0] ?? today]
+      );
+    } catch {
+      /* booking_rooms 是老库的迁移表：缺表时退回只用主单 */
+    }
+    for (const row of detailRows) {
+      if (row.type_id === null || !row.check_in_date || !row.check_out_date) continue;
+      units.push({ room_type_id: Number(row.type_id), check_in_date: row.check_in_date, check_out_date: row.check_out_date });
+    }
+    /* 2) 没有有效明细行的老预订：主单兜底 */
+    const mainRows = all<{
+      type_id: number | null;
+      room_id: number | null;
+      room_count: number | null;
+      check_in_date: string;
+      check_out_date: string;
+    }>(
+      `SELECT COALESCE(r.room_type_id, b.room_type_id) AS type_id, b.room_id,
+              COALESCE(b.room_count, 1) AS room_count,
+              b.check_in_date, b.check_out_date
+         FROM bookings b
+         LEFT JOIN rooms r ON r.id = b.room_id AND r.hotel_id = b.hotel_id
+        WHERE b.hotel_id = ? AND b.status IN ('PENDING','CONFIRMED')
+          AND b.check_in_date <= ? AND b.check_out_date >= ?
+          AND NOT EXISTS (SELECT 1 FROM booking_rooms br
+                           WHERE br.booking_id = b.id AND br.status IN ('PENDING','CONFIRMED'))`,
+      [hotelId, columns[columns.length - 1] ?? today, columns[0] ?? today]
+    );
+    for (const row of mainRows) {
+      if (row.type_id === null) continue;
+      const n = row.room_id ? 1 : Math.max(1, Number(row.room_count ?? 1));
+      for (let k = 0; k < n; k += 1) {
+        units.push({ room_type_id: Number(row.type_id), check_in_date: row.check_in_date, check_out_date: row.check_out_date });
+      }
+    }
+    return units;
+  })();
 
   const revenues = all<RevenueRow>(
     `SELECT r.room_type_id AS type_id, fi.biz_date AS biz_date, SUM(fi.amount) AS revenue
@@ -168,9 +229,15 @@ export default async function PredictPage({ searchParams }: { searchParams: Prom
         /* stays 查询本身就限定了 status='INHOUSE'，所以：从入住那天起一直占着（逾期也占） */
         if (s.check_in_date && s.check_in_date <= day) occupied++;
       }
-      for (const b of bookings) {
-        if (b.room_type_id !== t.id) continue;
-        if (isBetween(b.check_in_date, b.check_out_date, day)) occupied++;
+      /*
+       * 预订占用：按「间」累加（bookingUnits 已经把每张订单展开成 N 间）
+       *
+       * 原来 `for (const b of bookings) occupied++` 是「一张单算 1 间」，
+       * 多房订单（room_count = 3）只扣 1 间 → 可售多算 2 间。
+       */
+      for (const u of bookingUnits) {
+        if (u.room_type_id !== t.id) continue;
+        if (isBetween(u.check_in_date, u.check_out_date, day)) occupied++;
       }
       /*
        * 维修 / 锁房：两个都必须扣

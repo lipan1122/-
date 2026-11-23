@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { get, run } from "@/lib/db";
-import { requireUser } from "@/lib/session";
+import { requirePermissionOrRedirect } from "@/lib/session";
 import { nowIso, todayStr } from "@/lib/utils";
 
 /**
@@ -14,6 +14,18 @@ import { nowIso, todayStr } from "@/lib/utils";
  * 典型的 bug 是内联版读 `place` / `desc`、本文件读 `keeper` / `note`，
  * 表单字段一换，「拾获人」「备注」就静默存不进去了。
  * 所以字段名以页面表单为准（name / place / room_no / desc），只保留这一份实现。
+ *
+ * ── 权限（整改 A 类缺口：本文件 4 个动作原来只有 requireUser()）──
+ * 失物招领没有独立权限点（PERMISSION_CODES 里没有 lost_found.*），而它的实际操作者
+ * 正好是「前台 + 客房」——客房打扫时拾到物品要登记、前台要办理认领。
+ * 现有权限点里同时授权 admin / frontdesk / housekeeping 的**操作类**点只有
+ * room.change_status（room.view 是查看语义，不能拿来守写动作），
+ * 所以 4 个动作统一用它；它与 /lost-found 的页面可见角色完全一致，不会锁死正常作业。
+ * 若以后要单独控制（例如「删除」只给主管），需要新增 lost_found.manage 并同步
+ * session.ts 的 PERMISSIONS 与 permission_dict —— 那超出本次改造的文件范围。
+ *
+ * 用 requirePermissionOrRedirect 而不是 requirePermission：生产构建会把
+ * Server Action 抛出的错误脱敏成「操作失败」，跳 /no-permission 才能给出明确原因。
  */
 
 /** 失败 / 成功回跳：文案带在 query 上，页面顶部渲染横幅 */
@@ -30,7 +42,7 @@ function backLostFound(message: string, isError = false): never {
  * 状态写 PENDING（待认领），拾获日期在登记时写一次，之后认领不再覆盖（P1-30）。
  */
 export async function createLostItemAction(formData: FormData) {
-  const user = await requireUser();
+  const user = await requirePermissionOrRedirect("room.change_status");
   const name = String(formData.get("name") ?? "").trim();
   const keeper = String(formData.get("place") ?? "").trim();
   const roomNo = String(formData.get("room_no") ?? "").trim();
@@ -55,7 +67,7 @@ export async function createLostItemAction(formData: FormData) {
  * 现在：found_at 只在登记时写一次；认领时间写进 claimed_at（老库由页面 ALTER TABLE 兜底补列）。
  */
 export async function claimLostItemAction(formData: FormData) {
-  const user = await requireUser();
+  const user = await requirePermissionOrRedirect("room.change_status");
   const id = Number(formData.get("id") ?? 0);
   const claimant = String(formData.get("claimant") ?? "").trim();
   if (!id) return;
@@ -100,7 +112,7 @@ export async function claimLostItemAction(formData: FormData) {
  * 二次确认由页面上的 ConfirmForm 承担（要求填写删除原因），服务端再校验一次原因。
  */
 export async function deleteLostItemAction(formData: FormData) {
-  const user = await requireUser();
+  const user = await requirePermissionOrRedirect("room.change_status");
   const id = Number(formData.get("id") ?? 0);
   const reason = String(formData.get("reason") ?? "").trim();
   if (!id) return;
@@ -147,7 +159,7 @@ export async function deleteLostItemAction(formData: FormData) {
  * 保留导出，后续若补「客人未取走、由员工归还入库」的流程可直接接线。
  */
 export async function markReturnedAction(formData: FormData) {
-  const user = await requireUser();
+  const user = await requirePermissionOrRedirect("room.change_status");
   const id = Number(formData.get("id"));
   if (id) run(`UPDATE lost_items SET status = 'RETURNED' WHERE id = ? AND hotel_id = ?`, [id, user.hotelId]);
   revalidatePath("/lost-found");

@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { all, get, getDb, run } from "@/lib/db";
-import { requireAdmin, requireUser } from "@/lib/session";
+import { requireAdmin, requirePermissionOrRedirect } from "@/lib/session";
 import { nowIso, todayStr } from "@/lib/utils";
 
 /**
@@ -128,14 +128,22 @@ function upsertSetting(hotelId: number, key: string, value: string): void {
 /**
  * 懒建表 + 首次种子：模板 5 条、发送记录 20 条（SENT / FAILED 混合）、短信设置默认值。
  * 已存在数据时只补齐缺失项，不覆盖用户改动。
+ *
+ * ── 权限（整改 A 类缺口：本文件 5 个动作原来都只有 requireUser()）──
+ * 短信模块没有专属权限点，而 /sms 在 ROLE_MODULES 里对所有业务岗位都不可见
+ * （只有 admin 的 "*" 覆盖它），页面上的「保存短信设置」也已经用 requireAdmin。
+ * 所以建表种子 + 模板增删改启停 + 发送，统一用 settings.manage：
+ *   · 语义上属「系统级通道配置」，与本仓库 goods / points 配置 / 商超上下架一致；
+ *   · 角色上只放开 admin，和页面的实际可见范围完全一致，不会「看得到页面却点不动」。
+ * 若以后要让前台也能发通知短信，正确做法是新增 sms.send 并把 /sms 加进 frontdesk
+ * 的模块列表，而不是退回 requireUser()。
+ *
+ * 用 requirePermissionOrRedirect：生产构建会把 Server Action 抛出的错误脱敏成
+ * 「操作失败」，跳 /no-permission 才能让用户看到「没有该操作权限」。
+ * 这里同时保留酒店归属校验，避免拿着别家 hotelId 往别家写种子数据。
  */
 export async function ensureSmsSeed(hotelId: number): Promise<void> {
-  /*
-   * 权限边界（上线前加固）：建表 / 种子助手不该是可匿名调用的 RPC 端点。
-   * 它被 sms/page.tsx 直接 import，去掉 export 会打断页面编译，这里补登录守卫；
-   * 同时酒店 id 必须与 session 一致，避免拿着别家 hotelId 往别家写种子数据。
-   */
-  const user = await requireUser();
+  const user = await requirePermissionOrRedirect("settings.manage");
   if (Number(hotelId) !== user.hotelId) throw new Error("FORBIDDEN: 不能为其他酒店初始化短信数据");
   getDb().exec(SMS_DDL);
 
@@ -220,7 +228,7 @@ export async function ensureSmsSeed(hotelId: number): Promise<void> {
 
 /** 新增短信模板 */
 export async function createTemplateAction(formData: FormData) {
-  const user = await requireUser();
+  const user = await requirePermissionOrRedirect("settings.manage");
   await ensureSmsSeed(user.hotelId);
 
   const code = str(formData.get("code")).toUpperCase();
@@ -247,7 +255,7 @@ export async function createTemplateAction(formData: FormData) {
 
 /** 编辑短信模板（代码 / 名称 / 场景 / 内容） */
 export async function updateTemplateAction(formData: FormData) {
-  const user = await requireUser();
+  const user = await requirePermissionOrRedirect("settings.manage");
   await ensureSmsSeed(user.hotelId);
 
   const id = Number(formData.get("id") ?? 0);
@@ -286,7 +294,7 @@ export async function updateTemplateAction(formData: FormData) {
 
 /** 启用 / 停用短信模板 */
 export async function toggleTemplateAction(formData: FormData) {
-  const user = await requireUser();
+  const user = await requirePermissionOrRedirect("settings.manage");
   await ensureSmsSeed(user.hotelId);
 
   const id = Number(formData.get("id") ?? 0);
@@ -306,7 +314,7 @@ export async function toggleTemplateAction(formData: FormData) {
 
 /** 发送短信：渲染占位符后写入 sms_sends（95% 成功率模拟网关回执） */
 export async function sendSmsAction(formData: FormData) {
-  const user = await requireUser();
+  const user = await requirePermissionOrRedirect("settings.manage");
   await ensureSmsSeed(user.hotelId);
 
   const templateId = Number(formData.get("template_id") ?? 0);

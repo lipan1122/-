@@ -9,6 +9,7 @@ import { changeRoomStatus } from "@/lib/room-status";
 import { fmtMoney, nowIso, todayStr } from "@/lib/utils";
 import {
   NON_REVENUE_ITEM,
+  computeFolioBalance,
   depositHeld,
   ensurePaymentKindSchema,
   findDepositPayment,
@@ -24,6 +25,7 @@ import { consumeWallet, getWalletBalance } from "@/lib/member-wallet";
 import { pickHousekeepingAssignee } from "@/lib/housekeeping-assignee";
 /* 第 4 轮 P1-20：退房回传渠道状态（CHECKED_OUT） */
 import { pushOrderStatusForChannelOrder } from "@/lib/channels/order-status";
+import { markStockDirty } from "@/lib/channels/stock-trigger";
 
 /** 统一返回：{ error } 失败提示，{ ok } 成功提示 */
 type ActionState = { error?: string; ok?: string } | undefined;
@@ -129,6 +131,27 @@ function postedFolioItem(hotelId: number, requestId: string | null) {
   );
 }
 
+/**
+ * 该账单已进 AR 台账的应收总额（ar_ledgers.amount 合计）
+ *
+ * 用于挂账退房时核对「账单余额确实由挂账覆盖」。
+ * 表不存在 / 查询失败一律按 0 处理：核对只是留痕，绝不能让退房失败。
+ */
+function arChargedForFolio(hotelId: number, folioId: number): number {
+  try {
+    return round2(
+      Number(
+        get<{ s: number | null }>(
+          `SELECT COALESCE(SUM(amount), 0) AS s FROM ar_ledgers WHERE hotel_id = ? AND folio_id = ?`,
+          [hotelId, folioId]
+        )?.s ?? 0
+      )
+    );
+  } catch {
+    return 0;
+  }
+}
+
 function revalidateCashier() {
   revalidatePath("/cashier");
   revalidatePath("/dashboard");
@@ -163,18 +186,199 @@ type FolioContext = {
   stay_no: string;
   room_no: string;
   guest_name: string;
+  /** 入住单备注：里面可能有 chargeToCompanyAction 写的「【挂账】公司名」 */
+  remark: string | null;
 };
 
 function loadFolioContext(folioId: number, hotelId: number) {
   return get<FolioContext>(
     `SELECT f.id, f.folio_no, f.status, f.total_amount, f.paid_amount, f.balance,
-            s.id AS stay_id, s.stay_no, r.room_no, s.guest_name
+            s.id AS stay_id, s.stay_no, r.room_no, s.guest_name, s.remark
        FROM folios f
        JOIN stays s ON s.id = f.stay_id
        JOIN rooms r ON r.id = s.room_id
       WHERE f.id = ? AND f.hotel_id = ?`,
     [folioId, hotelId]
   );
+}
+
+/* ------------------------------------------------------------------ *
+ * 结账 / 补收款方式的**结构化**分支（Bug 1 / Bug 2）
+ *
+ * ── 缺陷 ──
+ * 收款方式在表单上是一串中文（现金 / 微信 / 会员储值卡 / 挂账…），
+ * 但只有 addPaymentAction 真的按方式分了支：
+ *   · 「会员储值卡」→ consumeWallet 扣卡 + 同一事务写 payments；
+ *   · 「挂账」→ 走独立的 chargeToCompanyAction 落 AR 台账。
+ * 另外三条**同样是收钱**的路径却一律当现金处理：
+ *   · partialSettleAction（部分结账）
+ *   · checkoutAction 的退房补收
+ * 后果（独立检查 agent 实测）：
+ *   ① 退房补收 / 部分结账选「会员储值卡」：余额一分没扣，paid_amount 照加 ——
+ *      等于凭空多出 500 的收款（储值卡被当成了「免单」）；
+ *   ② 退房补收选「挂账」：账单直接记成已收并 SETTLED，ar_ledgers / ar_accounts /
+ *      ar_transactions 一行没写 —— 钱既没收到、也没记成应收，凭空消失。
+ *
+ * ── 本段抽出的四个原语（三条路径共用，口径只写一份）──
+ *   walletMemberOfFolio   账单 → 入住单 → 会员（folios **没有** guest_id 列）
+ *   checkWalletPayer      储值卡付款前置校验（会员绑定 / 余额），返回可展示文案
+ *   deductWalletInTx      事务内扣卡（失败抛错 → 外层事务整体回滚）
+ *   resolveCreditCompany  挂账单位解析（表单 company_id 优先，其次入住单备注标记）
+ *   checkCreditLimit      信用额度校验（与 chargeToCompanyAction 同一口径）
+ *   postCreditInTx        事务内落 AR 台账（复用 lib/ar.postArCharge 双写）
+ * ------------------------------------------------------------------ */
+
+/** 会员 id（账单 → 入住单 → 客人）：`folios` 表没有 guest_id，必须 join stays */
+function walletMemberOfFolio(hotelId: number, folioId: number): number | null {
+  const row = get<{ guest_id: number | null }>(
+    `SELECT s.guest_id AS guest_id
+       FROM folios f
+       LEFT JOIN stays s ON s.id = f.stay_id AND s.hotel_id = f.hotel_id
+      WHERE f.id = ? AND f.hotel_id = ?`,
+    [folioId, hotelId]
+  );
+  const memberId = Math.trunc(Number(row?.guest_id ?? 0));
+  return Number.isFinite(memberId) && memberId > 0 ? memberId : null;
+}
+
+/**
+ * 储值卡付款前置校验
+ *
+ * 必须放在事务外：这样「没绑会员 / 余额不足」只返回一句可展示的提示，
+ * 不会把已经写了一半的收款/补收留在库里。
+ * 事务内仍会再查一次余额（consumeWallet 自带校验），并发下也不会扣成负数。
+ */
+function checkWalletPayer(
+  hotelId: number,
+  folioId: number,
+  amount: number
+): { error: string } | { memberId: number } {
+  const memberId = walletMemberOfFolio(hotelId, folioId);
+  if (!memberId) {
+    return {
+      error:
+        "该账单没有关联会员档案，不能用储值卡支付。请先在会员里建档并绑定客人（或确认这张账单关联的入住单有 guest_id）。",
+    };
+  }
+  const balance = getWalletBalance(hotelId, memberId);
+  if (balance + 0.001 < amount) {
+    return {
+      error: `储值余额不足：当前 ${fmtMoney(balance)}，本次需要 ${fmtMoney(amount)}。请先充值或换其他支付方式。`,
+    };
+  }
+  return { memberId };
+}
+
+/**
+ * 事务内扣储值卡
+ *
+ * consumeWallet 内部是 SAVEPOINT（可嵌在调用方的 tx() 里），扣款失败返回 error。
+ * 这里直接抛错：外层事务整体回滚，绝不会出现「钱扣了但没入账」。
+ */
+function deductWalletInTx(
+  hotelId: number,
+  memberId: number,
+  amount: number,
+  opts: { folioId: number; requestId: string | null; remark: string; operator: string }
+): number {
+  const deducted = consumeWallet(hotelId, memberId, amount, {
+    requestId: opts.requestId ?? undefined,
+    remark: opts.remark,
+    refType: "folio",
+    refId: opts.folioId,
+    operator: opts.operator,
+  });
+  if ("error" in deducted) throw new Error(`储值扣款失败：${deducted.error}`);
+  return deducted.balance;
+}
+
+type CreditCompany = { id: number; name: string; credit_limit: number };
+
+/**
+ * 解析「挂账」的协议单位
+ *
+ * 收银台的补收/部分结账表单只提交支付方式，不带单位 id，所以两级解析：
+ *   ① 表单 company_id（若前端将来补上就直接用）；
+ *   ② 入住单备注里的「【挂账】公司名」—— chargeToCompanyAction 写入的标记，
+ *      说明这张单本来就挂在这家单位名下。
+ * 都解析不到就直接拒绝：宁可让前台去「挂账」按钮走完整流程，
+ * 也不能像旧代码那样把挂账当现金记成已收（钱没到、应收也没记）。
+ */
+function resolveCreditCompany(
+  hotelId: number,
+  remark: string | null,
+  companyId: number
+): { error: string } | { company: CreditCompany } {
+  const pick = `SELECT id, name, COALESCE(credit_limit, 0) AS credit_limit FROM companies WHERE hotel_id = ?`;
+  if (companyId > 0) {
+    const byId = get<CreditCompany>(`${pick} AND id = ?`, [hotelId, companyId]);
+    if (!byId) return { error: "所选协议单位不存在，或不属于当前酒店" };
+    return { company: byId };
+  }
+  const markName = /【挂账】([^；]+)/.exec(remark ?? "")?.[1]?.trim();
+  if (!markName) {
+    return {
+      error: "该账单没有挂账单位：请先在收银台用「挂账」把余额转到协议单位，或在表单里指定协议单位",
+    };
+  }
+  const byName = get<CreditCompany>(`${pick} AND name = ? ORDER BY id LIMIT 1`, [hotelId, markName]);
+  if (!byName) {
+    return { error: `入住单备注里的协议单位「${markName}」在本店不存在，请先在「协议单位」里建档` };
+  }
+  return { company: byName };
+}
+
+/** 挂账额度校验（与 chargeToCompanyAction 完全同一口径：0 / 空 = 不限额） */
+function checkCreditLimit(
+  hotelId: number,
+  company: CreditCompany,
+  amount: number
+): { error: string } | { ok: true } {
+  const limit = round2(Number(company.credit_limit ?? 0));
+  if (limit <= 0) return { ok: true };
+  const used = getCompanyOutstanding(hotelId, company.id);
+  const available = round2(limit - used);
+  if (amount > available + 0.001) {
+    return {
+      error: `${company.name} 信用额度不足：额度 ${fmtMoney(limit)}，已挂账 ${fmtMoney(
+        used
+      )}，可用 ${fmtMoney(available)}，本次需 ${fmtMoney(amount)}`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * 事务内挂账：写 AR 台账（ar_ledgers 一笔 CHARGE + ar_transactions 一笔 POST +
+ * ar_accounts.balance 累加，都在 postArCharge 的同一个 SAVEPOINT 里双写）。
+ *
+ * **不写 payments、不加 paid_amount**：挂账是应收，钱还没收到。
+ * 返回台账 id（op_logs 里留痕用）。
+ */
+function postCreditInTx(
+  hotelId: number,
+  input: {
+    company: CreditCompany;
+    folioId: number;
+    folioNo: string;
+    amount: number;
+    stayNo: string;
+    roomNo: string;
+    operator: string;
+  }
+): number {
+  const posted = postArCharge(hotelId, {
+    companyId: input.company.id,
+    folioId: input.folioId,
+    folioNo: input.folioNo,
+    amount: input.amount,
+    bizDate: bizToday(hotelId),
+    dueDays: 30,
+    operator: input.operator,
+    remark: `入住单 ${input.stayNo} · 房间 ${input.roomNo} · 协议单位 ${input.company.name}`,
+  });
+  if (!("ok" in posted)) throw new Error(`挂账台账写入失败：${posted.error}`);
+  return posted.id;
 }
 
 /** 加收消费 / 入账：写入 folio_items 并重算账单 */
@@ -444,66 +648,35 @@ export async function addPaymentAction(formData: FormData): Promise<ActionState>
    * 酒店做「充 5000 送 800」，钱进得来花不出去，等于白送。
    *
    * 现在 method = "会员储值卡" 时，在**同一个事务内**：
-   *   ① 账单 → 客人 → 会员，校验有绑定会员档案
+   *   ① 账单 → 客人 → 会员，校验有绑定会员档案、余额够
    *   ② consumeWallet 扣余额（自带余额校验 + 流水 + 幂等）
    *   ③ 写 payments + paid_amount + recalcFolioBalance
    * 任一失败整体回滚，不会出现「钱扣了但没入账」或「入账了但没扣钱」。
+   *
+   * ⚠️ 会员 id 必须从「账单 → 入住单 → 客人」拿：`folios` 表**没有 guest_id 列**。
+   * 这段口径已抽进 walletMemberOfFolio / checkWalletPayer，
+   * 退房补收（checkoutAction）与部分结账（partialSettleAction）共用同一份实现
+   * —— 它们原来各写一套、又都没写，正是「储值卡当免单」Bug 1 的成因。
    */
   const useWallet = method === "会员储值卡";
-  /* 事务内要用的会员 id（提前查出来做友好提示，真正的校验在事务里再确认一次） */
+  /* 事务内要用的会员 id（事务外先查一次做友好提示，真正扣款时 consumeWallet 会再校验） */
   let walletMemberId: number | null = null;
   if (useWallet) {
-    /*
-     * 会员 id 从「账单 → 入住单 → 客人」拿，**不是**从 folios 拿
-     *
-     * ⚠️ 这里原来写的是 `SELECT guest_id FROM folios WHERE id = ?`，
-     *    但 `folios` 表**没有 guest_id 列**（只有 stay_id / guest_name / room_no）。
-     *    于是任何一次「会员储值卡」支付都会抛：
-     *        no such column: guest_id
-     *    → 客人充进储值的钱**一分都花不出去**（收银台收不了，只有
-     *      /members/wallet 页面的「消费」能花，而结账场景用不上）。
-     *
-     * 为什么一直没被发现：`scripts/check-round4-coverage.mjs` 对 P1-9 的两条断言
-     * 只是 `includes("会员储值卡")` / `includes("consumeWallet")` 的**字符串 grep**，
-     * 从来没有真正跑过一次储值卡支付 —— 静态自查把 100% 崩溃的路径判成了「已落地」。
-     *
-     * 修法：改用 `folios.stay_id → stays.guest_id` 的 join，不改表结构
-     * （folios 是账单，账单本身不该冗余客人 id；客人属于入住单）。
-     */
-    const g = get<{ guest_id: number | null }>(
-      `SELECT s.guest_id AS guest_id
-         FROM folios f
-         LEFT JOIN stays s ON s.id = f.stay_id AND s.hotel_id = f.hotel_id
-        WHERE f.id = ? AND f.hotel_id = ?`,
-      [folioId, user.hotelId]
-    );
-    if (!g?.guest_id) {
-      return {
-        error:
-          "该账单没有关联会员档案，不能用储值卡支付。请先在会员里建档并绑定客人（或确认这张账单关联的入住单有 guest_id）。",
-      };
-    }
-    walletMemberId = g.guest_id;
-    const bal = getWalletBalance(user.hotelId, walletMemberId);
-    if (bal + 0.001 < amount) {
-      return {
-        error: `储值余额不足：当前 ${fmtMoney(bal)}，本次需要 ${fmtMoney(amount)}。请先充值或换其他支付方式。`,
-      };
-    }
+    const payer = checkWalletPayer(user.hotelId, folioId, amount);
+    if ("error" in payer) return { error: payer.error };
+    walletMemberId = payer.memberId;
   }
 
   try {
     tx(() => {
       /* 储值扣款（在事务内，失败会连带回滚后面的收款） */
       if (useWallet && walletMemberId) {
-        const deducted = consumeWallet(user.hotelId, walletMemberId, amount, {
-          requestId: requestId ?? undefined,
+        deductWalletInTx(user.hotelId, walletMemberId, amount, {
+          folioId,
+          requestId,
           remark: `结账收款 · 账单 ${folioId}`,
-          refType: "folio",
-          refId: folioId,
           operator: user.realName ?? user.username,
         });
-        if ("error" in deducted) throw new Error(`储值扣款失败：${deducted.error}`);
       }
 
       run(
@@ -930,6 +1103,23 @@ export async function addDepositAction(formData: FormData): Promise<ActionState>
 /**
  * 部分结账：先结一部分，余额保留
  * → payments 记收款流水 + folio_items 记 ADJUST 负项（已结记录）
+ *
+ * ── Bug 1（第十一轮）：支付方式必须真的生效 ──
+ * 旧实现无论表单选什么方式，一律「写一条 payments + paid_amount 累加」：
+ *   · 选「会员储值卡」→ 卡一分没扣，paid_amount 照加（凭空多出一笔收款）；
+ *   · 选「挂账」→ 既没落 AR 台账，还把挂账记成已收（钱没到、应收也没记）。
+ * 现在按方式分三支，三条路径都在**同一个事务**里：
+ *   现金/微信/支付宝/银行卡 → payments + paid_amount（原行为）
+ *   会员储值卡            → consumeWallet 扣卡 + payments + paid_amount
+ *   挂账                  → postArCharge 落 AR（ar_ledgers / ar_transactions /
+ *                          ar_accounts.balance 双写）+ 一条**计入应收**的转出明细，
+ *                          paid_amount 不加（钱还没收到）
+ *
+ * 挂账为什么要写「计入应收」的 ADJUST（而不是像退房那样直接改 balance）：
+ * 部分结账后账单还是 OPEN，余额必须能由 recalcFolioBalance 用「明细 + 已收」推出来，
+ * 手改 balance 下一次重算就丢了。转出明细 amount = -本次挂账额、description 带【挂账】，
+ * 不属于 lib/folio 里排除的「【部分结账】」前缀，因此会真实降低这张单对客人的应收；
+ * 而营收口径（ROOM/FOOD/OTHER）不看 ADJUST，营收不会被这类内部转账影响。
  */
 export async function partialSettleAction(formData: FormData): Promise<ActionState> {
   /* 部分结账也是收款：撤销 cashier.receive 后本来应该一起被拒（原来只有 requireUser） */
@@ -940,6 +1130,7 @@ export async function partialSettleAction(formData: FormData): Promise<ActionSta
   const amount = round2(numOf(formData, "amount"));
   const method = str(formData, "method") || "现金";
   const remark = str(formData, "remark");
+  const companyId = numOf(formData, "company_id");
 
   if (!folioId) return { error: "账务单不存在" };
   if (amount <= 0) return { error: "结账金额必须大于 0" };
@@ -952,56 +1143,125 @@ export async function partialSettleAction(formData: FormData): Promise<ActionSta
   if (balance <= 0.01) return { error: "当前账单没有应收余额，无需部分结账" };
   if (amount > balance + 0.001) return { error: `结账金额不能超过应收余额 ${fmtMoney(balance)}` };
 
-  tx(() => {
-    run(
-      `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, operator, kind)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-      [
+  const useWallet = method === "会员储值卡";
+  const useCredit = method === "挂账";
+  let walletMemberId: number | null = null;
+  let credit: CreditCompany | null = null;
+  if (useWallet) {
+    const payer = checkWalletPayer(user.hotelId, folioId, amount);
+    if ("error" in payer) return { error: payer.error };
+    walletMemberId = payer.memberId;
+  }
+  if (useCredit) {
+    const resolved = resolveCreditCompany(user.hotelId, folio.remark, companyId);
+    if ("error" in resolved) return { error: resolved.error };
+    credit = resolved.company;
+    const withinLimit = checkCreditLimit(user.hotelId, credit, amount);
+    if ("error" in withinLimit) return { error: withinLimit.error };
+  }
+
+  try {
+    tx(() => {
+      if (useCredit && credit) {
+        /* 挂账：应收从客人转到协议单位，不写收款流水、不加已收 */
+        const ledgerId = postCreditInTx(user.hotelId, {
+          company: credit,
+          folioId,
+          folioNo: folio.folio_no,
+          amount,
+          stayNo: folio.stay_no,
+          roomNo: folio.room_no,
+          operator: user.realName,
+        });
+        run(
+          `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at, created_by)
+           VALUES (?,?,?,?,?,?,?,?,?,?)`,
+          [
+            user.hotelId,
+            folioId,
+            "ADJUST",
+            `【挂账】转协议单位 ${credit.name}（AR 台账 #${ledgerId}）`,
+            1,
+            -amount,
+            -amount,
+            todayStr(),
+            nowIso(),
+            user.id,
+          ]
+        );
+        run(`UPDATE stays SET remark = ? WHERE id = ? AND hotel_id = ?`, [
+          withCreditMark(folio.remark, credit.name),
+          folio.stay_id,
+          user.hotelId,
+        ]);
+      } else {
+        if (useWallet && walletMemberId) {
+          /* 储值卡：先扣卡（失败抛错，整笔回滚），再落收款 */
+          deductWalletInTx(user.hotelId, walletMemberId, amount, {
+            folioId,
+            requestId: null,
+            remark: `部分结账 · 账单 ${folioId}`,
+            operator: user.realName ?? user.username,
+          });
+        }
+        run(
+          `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, operator, kind)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            user.hotelId,
+            folioId,
+            folio.stay_id,
+            nextPayNo(),
+            method,
+            amount,
+            todayStr(),
+            remark || "部分结账",
+            nowIso(),
+            user.realName ?? user.username,
+            /* 部分结账收到的是消费款（押金已单列），性质为房费收款 */
+            "ROOM_PAYMENT",
+          ]
+        );
+        run(
+          `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at, created_by)
+           VALUES (?,?,?,?,?,?,?,?,?,?)`,
+          [
+            user.hotelId,
+            folioId,
+            "ADJUST",
+            `${PARTIAL_SETTLE_PREFIX}${method} 结账`,
+            1,
+            -amount,
+            -amount,
+            todayStr(),
+            nowIso(),
+            user.id,
+          ]
+        );
+        run(`UPDATE folios SET paid_amount = paid_amount + ? WHERE id = ? AND hotel_id = ?`, [
+          amount,
+          folioId,
+          user.hotelId,
+        ]);
+      }
+      recalcFolioBalance(user.hotelId, folioId);
+      writeLog(
         user.hotelId,
-        folioId,
-        folio.stay_id,
-        nextPayNo(),
-        method,
-        amount,
-        todayStr(),
-        remark || "部分结账",
-        nowIso(),
-        user.realName ?? user.username,
-        /* 部分结账收到的是消费款（押金已单列），性质为房费收款 */
-        "ROOM_PAYMENT",
-      ]
-    );
-    run(
-      `INSERT INTO folio_items (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at, created_by)
-       VALUES (?,?,?,?,?,?,?,?,?,?)`,
-      [
-        user.hotelId,
-        folioId,
-        "ADJUST",
-        `${PARTIAL_SETTLE_PREFIX}${method} 结账`,
-        1,
-        -amount,
-        -amount,
-        todayStr(),
-        nowIso(),
-        user.id,
-      ]
-    );
-    run(`UPDATE folios SET paid_amount = paid_amount + ? WHERE id = ? AND hotel_id = ?`, [
-      amount,
-      folioId,
-      user.hotelId,
-    ]);
-    recalcFolioBalance(user.hotelId, folioId);
-    writeLog(
-      user.hotelId,
-      user.realName,
-      "部分结账",
-      `入住单 ${folio.stay_no} · 账单 ${folio.folio_no} · 房间 ${folio.room_no} · 方式 ${method} · 金额 ${fmtMoney(amount)}`
-    );
-  });
+        user.realName,
+        "部分结账",
+        `入住单 ${folio.stay_no} · 账单 ${folio.folio_no} · 房间 ${folio.room_no} · 方式 ${method}` +
+          `${credit ? `（${credit.name}）` : ""} · 金额 ${fmtMoney(amount)}`
+      );
+    });
+  } catch (e) {
+    /* 事务内抛错（储值扣款失败 / AR 台账写入失败）→ 整笔回滚，把原因转成表单提示 */
+    const msg = e instanceof Error ? e.message : String(e);
+    return { error: msg };
+  }
   revalidateCashier();
-  return { ok: `已部分结账 ${fmtMoney(amount)}，余额保留` };
+  return useCredit
+    ? { ok: `已将 ${fmtMoney(amount)} 挂账到 ${credit?.name ?? "协议单位"}（AR 应收已登记，余额保留）` }
+    : { ok: `已部分结账 ${fmtMoney(amount)}，余额保留` };
 }
 
 /**
@@ -1483,16 +1743,36 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
     [folioId, user.hotelId]
   );
   if (!folio) return { error: "账务单不存在" };
-  if (folio.status === "SETTLED" || folio.status === "CHARGED") {
+
+  /*
+   * ── Bug 3（第十一轮）：CHARGED 不是「不能退房」，是「钱挂在协议单位」 ──
+   *
+   * 旧实现把 CHARGED 和 SETTLED 一起拦掉（「该账单已结账，无需重复退房」）。
+   * 后果（独立检查 agent 实测）：
+   *   客人挂账后账单是 CHARGED → 再点退房被拒 → 入住单永远 INHOUSE、房间永远 OC，
+   *   客人其实已经走了，房态和账务两边都对不上。
+   *
+   * 现在区分两种「钱已经不用客人付」：
+   *   SETTLED → 客人已付清，重复退房是业务错误（或同一 request_id 的幂等重放）；
+   *   CHARGED → 客账已通过挂账转成 AR 应收，**允许退房**：
+   *             · 押金照常无条件冲销（担保结束）；
+   *             · 账单状态保持 CHARGED（挂账是应收，不是已收款，不能改成 SETTLED）；
+   *             · 不再向客人补收（那笔钱已经在公司账上，再收就是同一笔欠款收两遍）。
+   */
+  const folioCharged = folio.status === "CHARGED";
+  if (folio.status === "SETTLED" || folioCharged) {
     /*
      * 双击退房：第一枪已经把账单置 SETTLED。
      * 同一 request_id 的重放按幂等返回成功（不再写第二遍补收 / 押金退款 / 日志）；
      * 换了一枚新键才说明是「真的再点一次」，那才是业务错误。
+     *
+     * CHARGED 不在这里拦：先看入住单状态 —— 已 CHECKED_OUT 就是上一枪退完了
+     * （挂账退房不会把账单改成 SETTLED，不能只靠账单状态识别重放）。
      */
     if (receivedPayment(user.hotelId, requestId)) {
       return { ok: "该笔退房已处理（重复提交已忽略）" };
     }
-    return { error: "该账单已结账，无需重复退房" };
+    if (!folioCharged) return { error: "该账单已结账，无需重复退房" };
   }
 
   const stay = get<{
@@ -1501,19 +1781,87 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
     guest_name: string | null;
     stay_no: string;
     channel_order_no: string | null;
+    remark: string | null;
   }>(
-    /* 第 4 轮 P1-20：退房要回传渠道，需要渠道单号 */
-    `SELECT id, status, guest_name, stay_no, channel_order_no FROM stays WHERE id = ? AND hotel_id = ?`,
+    /* 第 4 轮 P1-20：退房要回传渠道，需要渠道单号；挂账还要读【挂账】标记解析协议单位 */
+    `SELECT id, status, guest_name, stay_no, channel_order_no, remark FROM stays WHERE id = ? AND hotel_id = ?`,
     [stayId, user.hotelId]
   );
   if (!stay) return { error: "入住单不存在" };
-  if (stay.status !== "INHOUSE") return { error: "该客人已退房" };
+  if (stay.status !== "INHOUSE") {
+    /*
+     * 挂账退房不会把账单改成 SETTLED，所以双击的第二枪不能靠账单状态识别；
+     * 入住单已经 CHECKED_OUT + 账单 CHARGED 就是「上一枪真的退完了」，按幂等重放返回。
+     */
+    if (folioCharged && stay.status === "CHECKED_OUT") {
+      return { ok: "该笔退房已处理（重复提交已忽略）" };
+    }
+    return { error: "该客人已退房" };
+  }
 
   const room = get<{ status: string; room_no: string }>(
     `SELECT status, room_no FROM rooms WHERE id = ? AND hotel_id = ?`,
     [roomId, user.hotelId]
   );
   if (!room) return { error: "房间不存在" };
+
+  /*
+   * 已挂账的账单不能再向客人补收：那笔钱已经在协议单位账上（ar_ledgers 有应收），
+   * 再收就是同一笔欠款收两遍。放在入住单状态检查之后，
+   * 这样「双击退房（表单里还带着补收金额）」会被识别成重放，而不是误导性的报错。
+   */
+  if (folioCharged && payAmount > 0) {
+    return {
+      error:
+        `该账单已挂账到协议单位，AR 应收台账已登记，不能再向客人补收 ${fmtMoney(payAmount)}。` +
+        `如需改为现金结清，请先在「应收」里撤销这笔挂账`,
+    };
+  }
+
+  /*
+   * ── Bug 1 / Bug 2：退房补收也必须按支付方式真的记账 ──
+   *
+   * 旧实现：不管 pay_method 选什么，一律「写一条 payments + paid_amount 累加」。
+   * 于是「会员储值卡」不扣卡、「挂账」不落 AR，两者都被当成现金记成已收 ——
+   * 客人用储值卡付 500，余额仍是 1000，账单却 +500（凭空多出一笔收款）；
+   * 挂账 600 时 ar_ledgers / ar_transactions / ar_accounts 一行没写。
+   *
+   * 现在事务外先做前置校验（拿错误文案，不写库），事务内再按方式分别落账。
+   */
+  const useWallet = payAmount > 0 && payMethod === "会员储值卡";
+  const useCredit = payAmount > 0 && payMethod === "挂账";
+  let walletMemberId: number | null = null;
+  let credit: CreditCompany | null = null;
+
+  if (useWallet) {
+    const payer = checkWalletPayer(user.hotelId, folioId, payAmount);
+    if ("error" in payer) return { error: payer.error };
+    walletMemberId = payer.memberId;
+  }
+
+  if (useCredit) {
+    const resolved = resolveCreditCompany(user.hotelId, stay.remark, numOf(formData, "company_id"));
+    if ("error" in resolved) return { error: resolved.error };
+    credit = resolved.company;
+    /*
+     * 挂账必须覆盖整笔欠款：挂账是「把这张单对客人的应收整笔转到公司」，
+     * 只挂一部分会让退房后账面对不上（余额仍 >0 却已经按挂账结清退房）。
+     * 需要部分挂账请先用收银台的「挂账 / 部分结账」处理。
+     */
+    const pre = computeFolioBalance(user.hotelId, folioId);
+    if (pre.balance <= 0.01) {
+      return { error: "当前账单没有应收余额，无需挂账" };
+    }
+    if (Math.abs(pre.balance - payAmount) > 0.01) {
+      return {
+        error:
+          `挂账金额需等于当前欠款余额 ${fmtMoney(pre.balance)}（本次填 ${fmtMoney(payAmount)}）。` +
+          `如需部分挂账，请先用「挂账」把整笔余额转到协议单位`,
+      };
+    }
+    const withinLimit = checkCreditLimit(user.hotelId, credit, payAmount);
+    if ("error" in withinLimit) return { error: withinLimit.error };
+  }
 
   let result: { error: string } | { ok: string };
   /*
@@ -1524,56 +1872,122 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
   try {
     result = tx((): { error: string } | { ok: string } => {
     /*
-     * 0. 事务内再确认一次账单状态（并发双击兜底）
+     * 0. 事务内再确认一次账单 / 入住单状态（并发双击兜底）
      *
      * 预检在事务外：两个请求可能都读到 OPEN。tx() 是 BEGIN IMMEDIATE（写锁串行），
-     * 第二个请求进来时第一枪已经提交，账单已 SETTLED ——
+     * 第二个请求进来时第一枪已经提交 ——
      * 这里直接按幂等重放返回，不再写第二遍补收 / 押金退款 / 操作日志。
+     *
+     * 挂账退房不会把账单改成 SETTLED（挂账是应收，不是已收款），
+     * 所以还必须看入住单：已经 CHECKED_OUT 就是上一枪退完了。
      */
     const folioNow = get<{ status: string }>(
       `SELECT status FROM folios WHERE id = ? AND hotel_id = ?`,
       [folioId, user.hotelId]
     );
-    if (folioNow && (folioNow.status === "SETTLED" || folioNow.status === "CHARGED")) {
+    if (folioNow && folioNow.status === "SETTLED") {
       return { ok: "该笔退房已处理（重复提交已忽略）" };
+    }
+    const stayNow = get<{ status: string }>(
+      `SELECT status FROM stays WHERE id = ? AND hotel_id = ?`,
+      [stayId, user.hotelId]
+    );
+    if (!stayNow || stayNow.status !== "INHOUSE") {
+      return { ok: "该笔退房已处理（重复提交已忽略）" };
+    }
+    /* 挂账状态：进门时就是 CHARGED，或本次补收走挂账后变成 CHARGED */
+    let charged = folioCharged;
+    if (charged && payAmount > 0) {
+      return { error: "该账单已挂账到协议单位，不能再向客人补收（AR 应收已在公司账上）" };
     }
 
     // 1. 补收（第 4 轮 P0-1：只加 paid_amount，余额交给 recalcFolioBalance 统一算）
     if (payAmount > 0) {
-      run(
-        `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, request_id, operator, kind)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [
-          user.hotelId,
+      if (useCredit && credit) {
+        /*
+         * Bug 2：退房补收选「挂账」→ 必须落 AR 台账，不能记成已收
+         *
+         * 旧实现把挂账当现金：payments +600、paid_amount +600、账单 SETTLED，
+         * 而 ar_ledgers / ar_accounts / ar_transactions 一行没写 ——
+         * 钱既没收到、也没记成应收，600 凭空消失。
+         *
+         * 现在：postArCharge 双写三张 AR 表（同一 SAVEPOINT），
+         * 不写 payments、不加 paid_amount（钱还没收到），
+         * 账单对客人的余额归 0、状态置 CHARGED（来源可区分「挂账结清」与「现金结清」）。
+         */
+        const ledgerId = postCreditInTx(user.hotelId, {
+          company: credit,
           folioId,
+          folioNo: folio.folio_no,
+          amount: payAmount,
+          stayNo: stay.stay_no,
+          roomNo: room.room_no,
+          operator: user.realName,
+        });
+        run(`UPDATE stays SET remark = ? WHERE id = ? AND hotel_id = ?`, [
+          withCreditMark(stay.remark, credit.name),
           stayId,
-          nextPayNo(),
-          payMethod,
+          user.hotelId,
+        ]);
+        run(
+          `UPDATE folios
+              SET balance = 0, status = 'CHARGED', settled_at = ?
+            WHERE id = ? AND hotel_id = ?`,
+          [nowIso(), folioId, user.hotelId]
+        );
+        charged = true;
+        writeLog(
+          user.hotelId,
+          user.realName,
+          "退房挂账",
+          `入住单 ${stay.stay_no} · 账单 ${folio.folio_no} · 房间 ${room.room_no} · 协议单位 ${credit.name} · ` +
+            `挂账金额 ${fmtMoney(payAmount)} · AR 台账 #${ledgerId}`
+        );
+      } else {
+        /* 储值卡：先扣卡（失败抛错，整笔回滚），再落收款流水 */
+        if (useWallet && walletMemberId) {
+          deductWalletInTx(user.hotelId, walletMemberId, payAmount, {
+            folioId,
+            requestId,
+            remark: `退房补收 · 账单 ${folioId}`,
+            operator: user.realName ?? user.username,
+          });
+        }
+        run(
+          `INSERT INTO payments (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, request_id, operator, kind)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            user.hotelId,
+            folioId,
+            stayId,
+            nextPayNo(),
+            payMethod,
+            payAmount,
+            todayStr(),
+            "退房补收",
+            nowIso(),
+            /*
+             * 第十轮 P1：补收流水带幂等键。
+             * 押金退款流水用 `${requestId}#dep` 派生键，避免与补收撞同一个唯一索引；
+             * 补收本身用「裸键」—— 双击时第二枪能靠 payments.request_id 认出重放。
+             */
+            requestId,
+            user.realName ?? user.username,
+            /* 补收的是消费欠款，不是押金 */
+            "ROOM_PAYMENT",
+          ]
+        );
+        run(`UPDATE folios SET paid_amount = COALESCE(paid_amount,0) + ? WHERE id = ? AND hotel_id = ?`, [
           payAmount,
-          todayStr(),
-          "退房补收",
-          nowIso(),
-          /*
-           * 第十轮 P1：补收流水带幂等键。
-           * 押金退款流水用 `${requestId}#dep` 派生键，避免与补收撞同一个唯一索引；
-           * 补收本身用「裸键」—— 双击时第二枪能靠 payments.request_id 认出重放。
-           */
-          requestId,
-          user.realName ?? user.username,
-          /* 补收的是消费欠款，不是押金 */
-          "ROOM_PAYMENT",
-        ]
-      );
-      run(`UPDATE folios SET paid_amount = COALESCE(paid_amount,0) + ? WHERE id = ? AND hotel_id = ?`, [
-        payAmount,
-        folioId,
-        user.hotelId,
-      ]);
+          folioId,
+          user.hotelId,
+        ]);
+      }
     }
 
     // 2. 重算并校验余额（补收不足时已收金额保留，页面刷新后按最新余额继续补收）
     const money = recalcFolioBalance(user.hotelId, folioId);
-    if (money.balance > 0.01) {
+    if (!charged && money.balance > 0.01) {
       return { error: `仍有欠款 ${fmtMoney(money.balance)}，请补收后再结账` };
     }
 
@@ -1704,9 +2118,32 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
      * 理论上 balance 已归零（应退的钱退掉了、抵扣的部分留在 paid 里）。
      * 若仍非 0（例如现金多收、超出押金的部分退不出去），写一条日志留痕，
      * 不再静默把「已结清」的账单挂着一个非 0 余额 —— 缺陷 3 就是这种账。
+     *
+     * 挂账单例外：balance = 应收 − 已收，挂账那部分本来就没收到钱，
+     * 所以这里必然 >0 —— 由 AR 台账承接，不是「未归零的脏账」。
      */
     const settledMoney = recalcFolioBalance(user.hotelId, folioId);
-    if (Math.abs(settledMoney.balance) > 0.01) {
+    /*
+     * 挂账退房：对客人的应收已经整笔转到 AR（ar_ledgers），
+     * 这里用「应收 − 已收」反推出挂账金额，供日志 / 文案 / 缺口核对使用。
+     */
+    const chargedAmount = charged ? round2(Math.max(0, settledMoney.total - settledMoney.paid)) : 0;
+    if (charged) {
+      /*
+       * 「余额由挂账覆盖」的核对：AR 台账里这张单的应收总额应 ≥ 挂账金额。
+       * 不够时**不阻断退房**（老数据可能存在只置了 CHARGED 却没进台账的单子，
+       * 那正是这次要放出来的场景），但必须留痕，让财务去补台账。
+       */
+      const arCovered = arChargedForFolio(user.hotelId, folioId);
+      writeLog(
+        user.hotelId,
+        user.realName,
+        "退房挂账核对",
+        `入住单 ${stay.stay_no} · 账单 ${folio.folio_no} · 挂账应收 ${fmtMoney(chargedAmount)} · ` +
+          `AR 台账已登记 ${fmtMoney(arCovered)}` +
+          (arCovered + 0.01 < chargedAmount ? ` · **台账缺口 ${fmtMoney(chargedAmount - arCovered)} 需补登**` : "")
+      );
+    } else if (Math.abs(settledMoney.balance) > 0.01) {
       writeLog(
         user.hotelId,
         user.realName,
@@ -1716,12 +2153,27 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
       );
     }
 
-    // 3. 核销账单
-    run(`UPDATE folios SET status = 'SETTLED', settled_at = ? WHERE id = ? AND hotel_id = ?`, [
-      nowIso(),
-      folioId,
-      user.hotelId,
-    ]);
+    /*
+     * 3. 核销账单
+     *
+     * Bug 3：挂账单**不能**置 SETTLED。
+     *   SETTLED 在 /finance、发票、报表里代表「客人已经付清」；
+     *   挂账只是把应收转给协议单位（钱的收款对象变了），账单仍是应收状态。
+     * 所以挂账退房保持 CHARGED，balance 归 0（对客人不再是应收，
+     * 钱在公司账上，由 ar_ledgers 承接）。
+     */
+    if (charged) {
+      run(
+        `UPDATE folios SET status = 'CHARGED', balance = 0, settled_at = ? WHERE id = ? AND hotel_id = ?`,
+        [nowIso(), folioId, user.hotelId]
+      );
+    } else {
+      run(`UPDATE folios SET status = 'SETTLED', settled_at = ? WHERE id = ? AND hotel_id = ?`, [
+        nowIso(),
+        folioId,
+        user.hotelId,
+      ]);
+    }
 
     // 4. 退房
     run(`UPDATE stays SET status = 'CHECKED_OUT', actual_check_out = ? WHERE id = ? AND hotel_id = ?`, [
@@ -1761,7 +2213,13 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
       user.hotelId,
       user.realName,
       "结账退房",
-      `入住单 ${stay.stay_no} · 账单 ${folio.folio_no} · 房间 ${room.room_no} · 补收 ${fmtMoney(payAmount)}（${payMethod}）` +
+      `入住单 ${stay.stay_no} · 账单 ${folio.folio_no} · 房间 ${room.room_no} · ` +
+        (payAmount > 0
+          ? useCredit && credit
+            ? `挂账 ${fmtMoney(payAmount)}（${credit.name}）`
+            : `补收 ${fmtMoney(payAmount)}（${payMethod}）`
+          : "无补收") +
+        (charged ? ` · 账单挂账应收 ${fmtMoney(chargedAmount)}（状态 CHARGED，未改 SETTLED）` : "") +
         (refundDue > 0 ? ` · **应退押金 ${fmtMoney(refundDue)}**` : "") +
         (depositOnFolio > 0.005 || stayDeposit > 0.005
           ? ` · 押金冲销 ${fmtMoney(depositOnFolio)}（退现金 ${fmtMoney(refundCash)} / 抵扣房费 ${fmtMoney(depositOffsetToRoom)}）`
@@ -1776,12 +2234,18 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
      *   · 退了多少现金；
      *   · 有多少押金被房费吃掉了（不退现金，但账已平）；
      *   · 还有多少「没有押金可冲」的应退余额需要人工处理（例如现金多收）。
+     *
+     * 挂账退房（Bug 3）：文案要说明「账单仍是应收，钱在公司那里」，
+     * 否则前台会以为客人已经付清。
      */
     const notes: string[] = [];
+    if (charged) notes.push(`账单已挂协议单位，AR 应收 ${fmtMoney(chargedAmount)} 未收回`);
     if (refundCash > 0.005) notes.push(`已退还押金 ${fmtMoney(refundCash)}`);
     if (depositOffsetToRoom > 0.005) notes.push(`押金 ${fmtMoney(depositOffsetToRoom)} 已抵扣房费`);
     if (refundDue > refundCash + 0.005) notes.push(`另有 ${fmtMoney(refundDue - refundCash)} 无押金可冲，需人工核对`);
-    if (Math.abs(settledMoney.balance) > 0.01) notes.push(`账单余额 ${fmtMoney(settledMoney.balance)} 需人工核对`);
+    if (!charged && Math.abs(settledMoney.balance) > 0.01) {
+      notes.push(`账单余额 ${fmtMoney(settledMoney.balance)} 需人工核对`);
+    }
     return { ok: notes.length > 0 ? `退房成功，${notes.join("，")}` : "结账退房成功" };
     });
   } catch (e) {
@@ -1817,6 +2281,17 @@ export async function checkoutAction(formData: FormData): Promise<ActionState> {
       source: "cashier-checkout",
     });
   }
+
+  /*
+   * 退房后管道渠道库存要重算
+   *
+   * 房间回到可售（VD 也算可卖），但渠道那边不会自己知道 ——
+   * 不接这一行的话，退房后这间房在携程上还是一直显示「已满」，卖不出去。
+   *
+   * 必须在 `tx()` 提交之后调用（事务回滚了还推渠道会推错库存）。
+   * 这是 fix-perm-stock agent 留给我的最后一项接线。
+   */
+  markStockDirty(user.hotelId, `退房（入住单 #${stay.id}），释放房间占用`);
 
   revalidatePath("/rooms");
   revalidatePath("/inhouse");

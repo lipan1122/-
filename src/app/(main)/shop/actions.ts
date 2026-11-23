@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { recalcFolioBalance } from "@/lib/folio";
 import { redirect } from "next/navigation";
 import { all, get, getDb, run, tx } from "@/lib/db";
-import { requirePermission, requireUser } from "@/lib/session";
+import { requirePermission, requirePermissionOrRedirect } from "@/lib/session";
 import { fmtMoney, nowIso, todayStr } from "@/lib/utils";
 
 /**
@@ -365,11 +365,17 @@ function ensureShopSchema(hotelId: number): void {
 /**
  * 页面渲染前补齐表结构（旧库可能还没有 voided_at 等列）
  *
- * 与 goods 的 ensureGoodsSchema 同一手法：这种「建表 / 补列」助手不该是可匿名调的 RPC，
- * 所以补登录守卫 + 酒店归属校验。页面本身已鉴权，这里只做结构兜底。
+ * 与 goods 的 ensureGoodsSchema 同一手法：这种「建表 / 补列」助手不该是可匿名调的 RPC。
+ * 页面本身已鉴权，这里只做结构兜底。
+ *
+ * 权限（整改 A 类缺口）：原来只有 requireUser() —— 它是 DDL 写入，属写动作。
+ * 为什么是 cashier.view：/shop 的可见角色是 admin + cashier，二者都持有该点，
+ * 补守卫既能拦住客房/前台直接 POST，又不会把收银挡在自己页面之外
+ * （不能直接套销售用的 cashier.receive，否则「只是渲染页面」就要求收款权限，
+ *   语义过重；这里要的是「这个人在商超这个模块里」）。
  */
 export async function ensureShopPageSchema(hotelId: number): Promise<void> {
-  const user = await requireUser();
+  const user = await requirePermissionOrRedirect("cashier.view");
   if (Number(hotelId) !== user.hotelId) throw new Error("FORBIDDEN: 不能为其他酒店初始化商超数据");
   ensureShopSchema(hotelId);
 }

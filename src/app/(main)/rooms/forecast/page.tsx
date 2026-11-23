@@ -272,6 +272,55 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
     [hotelId, endExclusive, firstDate]
   );
 
+  /* ---------------- 5a. 多房订单明细 booking_rooms（一行 = 一间房） ----------------
+   *
+   * ── 为什么必须读明细 ──
+   * 一张订单订 3 间房时，`bookings` 主单只有 `room_count = 3` 一个数字，
+   * 具体哪几间排在 `booking_rooms` 明细里（1 行 = 1 间，`room_id` 为空 = 还没排房）。
+   * 只读主单会犯两个错（实测 BK-MULTI3：room_count=3、主单 room_id=1、明细 3 行）：
+   *   · 画块只认 `b.room_id` → 3 间只画出 1 间；
+   *   · 计数 `if (b.room_id) continue` → 剩下 2 间连「待分房」都不算
+   *     → 那天「剩 N 间」多算 2 间（11-25 显示 24、真值 22；前台按 24 卖就超卖 2 间）。
+   *
+   * 口径与 `src/lib/room-stock.ts` 保持一致（房态页今日可售就是这套）：
+   *   · 明细里排了房的 → 画块 / 算「已排房」，**一行一间**
+   *   · 明细里没排房的 → 算「待分房」
+   *   · 明细行数 < room_count → 差额也算「待分房」
+   *   · 完全没有明细行的老订单 → 退回主单：已排房按 1 间、未排房按 room_count
+   * 明细表是老库的迁移表，缺表时按「没有明细」降级，不能让整页报错。
+   */
+  type BookingDetailRow = {
+    booking_id: number;
+    room_id: number | null;
+    room_type_id: number | null;
+    check_in_date: string | null;
+    check_out_date: string | null;
+  };
+  const bookingDetails: BookingDetailRow[] = (() => {
+    try {
+      return all<BookingDetailRow>(
+        `SELECT br.booking_id, br.room_id, br.room_type_id,
+                COALESCE(substr(br.check_in_date, 1, 10), b.check_in_date) AS check_in_date,
+                COALESCE(substr(br.check_out_date, 1, 10), b.check_out_date) AS check_out_date
+           FROM booking_rooms br
+           JOIN bookings b ON b.id = br.booking_id AND b.hotel_id = br.hotel_id
+          WHERE br.hotel_id = ?
+            AND br.status IN ('PENDING','CONFIRMED')
+            AND b.status IN ('PENDING','CONFIRMED')
+            AND b.check_in_date < ? AND b.check_out_date > ?`,
+        [hotelId, endExclusive, firstDate]
+      );
+    } catch {
+      return [];
+    }
+  })();
+  const detailsByBooking = new Map<number, BookingDetailRow[]>();
+  for (const det of bookingDetails) {
+    const list = detailsByBooking.get(det.booking_id) ?? [];
+    list.push(det);
+    detailsByBooking.set(det.booking_id, list);
+  }
+
   /* ---------------- 5b. 「引入待排房订单」弹窗数据源 ----------------
    * 订单：status in (PENDING, CONFIRMED) 且 room_id 为空，按入住日期升序，最多 30 条。
    * 候选房：同房型 + 空净 VC / 空脏 VD + 该订单入离区间内没有在住占房、没有其他订单排房。
@@ -425,24 +474,55 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
     }
   }
 
-  // 未入住但已排房的预订：房间已锁定，画浅蓝色块
+  /*
+   * 未入住但已排房的预订：房间已锁定，画浅蓝色块
+   *
+   * ⚠️ 原来这里只画 `b.room_id` 那一间 —— 多房订单（room_count = 3、主单只填了首间）
+   * 就只画出 1 间，剩下 2 间既没画块、也没进「待分房」计数，那天「剩 N 间」多算 2 间。
+   *
+   * 现在按 `booking_rooms` 明细画：一行明细 = 一间房。
+   *   · 有明细 → 只画明细里排了房的那些房号（主单 room_id 不再重复画，否则一单画 4 间）
+   *   · 没明细 → 退回主单 room_id（老数据，1 间）
+   * 没排到房的那几间（明细 room_id 为空 / 明细数少于 room_count）由下面 dayStats 的
+   * pending 计数负责，与 room-stock.ts 的「未排房按 room_count」口径对齐。
+   */
+  const blockedRoomIds = new Set(
+    rows.filter((r) => r.room_status === "OOO" || r.room_status === "LOCK").map((r) => r.id)
+  );
   for (const b of bookings) {
-    if (!b.room_id) continue;
-    const slots = cellMap.get(b.room_id);
-    if (!slots) continue;
+    const details = detailsByBooking.get(b.id) ?? [];
+    /* 这一单要画块的房号：明细优先，没有明细才用主单 */
+    const targetRooms: number[] = [];
+    if (details.length > 0) {
+      for (const det of details) {
+        if (det.room_id === null || det.room_id <= 0) continue;
+        if (targetRooms.includes(det.room_id)) continue;
+        targetRooms.push(det.room_id);
+      }
+    } else if (b.room_id) {
+      targetRooms.push(b.room_id);
+    }
+    if (targetRooms.length === 0) continue;
+
     const name = (b.guest_name ?? "").trim() || "预订";
     const channel = (b.channel_name ?? "").trim() || "散客";
-    for (let i = 0; i < days; i++) {
-      const d = dates[i];
-      if (b.check_in_date <= d && d < b.check_out_date && slots[i].kind === "empty") {
-        slots[i] = {
-          kind: "booking",
-          key: `b${b.id}:${d < today ? "p" : "f"}`,
-          name,
-          channel,
-          owed: false,
-          href: `/bookings?q=${encodeURIComponent(name)}`,
-        };
+    for (const roomId of targetRooms) {
+      const slots = cellMap.get(roomId);
+      if (!slots) continue;
+      /* 维修房 / 锁房已经在「剩 N 间」里整间扣过（blocked），再按订单扣一次就是重复扣减 */
+      if (blockedRoomIds.has(roomId)) continue;
+      for (let i = 0; i < days; i++) {
+        const d = dates[i];
+        if (b.check_in_date <= d && d < b.check_out_date && slots[i].kind === "empty") {
+          slots[i] = {
+            kind: "booking",
+            key: `b${b.id}:${d < today ? "p" : "f"}`,
+            name,
+            channel,
+            owed: false,
+            href: `/bookings?q=${encodeURIComponent(name)}`,
+          };
+        }
       }
     }
   }
@@ -498,11 +578,43 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
       if (slot.kind === "inhouse") occupied += 1;
       else if (slot.kind === "booking") assigned += 1;
     }
+    /*
+     * 待分房（还没排到具体房间的占用）
+     *
+     * ⚠️ 原来是 `if (b.room_id) continue;` —— 只要主单填了一间房，整单就不再进待分房。
+     * 多房订单主单通常只填首间（BK-MULTI3：room_count=3、room_id=1），
+     * 剩下 2 间于是**既没画块也不计数**，那天「剩 N 间」多算 2 间。
+     *
+     * 现在按 `booking_rooms` 明细算，一行一间：
+     *   · 明细 room_id 为空       → 待分房 +1
+     *   · 明细数 < room_count     → 差额也算待分房（明细漏行的老数据兜底）
+     *   · 完全没有明细行          → 退回主单：已排房 → room_count − 1，未排房 → room_count
+     * 与 room-stock.ts 的 booked 口径一致（它也是「明细一行一间、主单兜底」）。
+     */
     let pending = 0;
     for (const b of bookings) {
-      if (b.room_id) continue;
-      if (b.room_type_id !== null && !typesInView.has(b.room_type_id)) continue;
-      if (b.check_in_date <= d && d < b.check_out_date) pending += Math.max(1, Number(b.room_count ?? 1));
+      if (!(b.check_in_date <= d && d < b.check_out_date)) continue;
+      const details = detailsByBooking.get(b.id) ?? [];
+      const roomCount = Math.max(1, Number(b.room_count ?? 1));
+      /** 房型筛选：null = 订单没指房型，任何视图都算 */
+      const typeInView = (typeId: number | null) => typeId === null || typesInView.has(typeId);
+      if (details.length === 0) {
+        /* 老数据没有明细：主单兜底（已排房按 1 间、未排房按 room_count） */
+        if (!typeInView(b.room_type_id)) continue;
+        pending += b.room_id ? Math.max(0, roomCount - 1) : roomCount;
+        continue;
+      }
+      /* 明细里没排房的（按明细自己的房型算，跨房型订单才不会漏） */
+      for (const det of details) {
+        /* 明细自带日期（可能分段落住），不覆盖当天的行不算 */
+        if (det.check_in_date && det.check_out_date && !(det.check_in_date <= d && d < det.check_out_date)) continue;
+        if (det.room_id !== null && det.room_id > 0) continue;
+        if (!typeInView(det.room_type_id ?? b.room_type_id)) continue;
+        pending += 1;
+      }
+      /* 明细行数少于 room_count：差额也算待分房（明细漏行的老数据兜底） */
+      const missing = roomCount - details.length;
+      if (missing > 0 && typeInView(b.room_type_id)) pending += missing;
     }
 
     /*

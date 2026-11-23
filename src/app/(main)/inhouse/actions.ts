@@ -9,7 +9,15 @@ import { quoteHourly } from "@/lib/hourly-rate";
 import { requirePermission } from "@/lib/session";
 import { changeRoomStatus } from "@/lib/room-status";
 import { addDays, fmtMoney, nowIso, todayStr } from "@/lib/utils";
-import { recalcFolioBalance } from "@/lib/folio";
+/*
+ * 第十一轮 Bug 4：取消入住审批必须真的退押金
+ *   recalcFolioBalance 统一重算账单；
+ *   depositHeld        该账单还挂着的押金明细（押金负债的权威口径）；
+ *   findDepositPayment 原押金收款（退款流水的 refund_of 要指向它）
+ */
+import { depositHeld, findDepositPayment, recalcFolioBalance } from "@/lib/folio";
+/* 第十一轮 Bug 4：冲销的营业日按本店营业日切点取，与夜审 / 报表同口径 */
+import { bizToday } from "@/lib/biz-date";
 import { conflictMessage, findRoomConflicts } from "@/lib/room-availability";
 /* 整改 P2-5：取消入住审批通过后生成的打扫任务，指派本店在岗客房人员而非写死姓名 */
 import { pickHousekeepingAssignee } from "@/lib/housekeeping-assignee";
@@ -99,6 +107,11 @@ function writeOpLog(hotelId: number, operator: string, action: string, detail: s
     detail,
     nowIso(),
   ]);
+}
+
+/** 收款单号：P + 毫秒时间戳 + 尾随随机数（与 cashier/actions.ts 的 nextPayNo 同格式） */
+function nextPayNo() {
+  return `P${Date.now()}${Math.floor(Math.random() * 900 + 100)}`;
 }
 
 /** 按账务明细重算 folios 的合计与应收余额 */
@@ -510,7 +523,37 @@ export async function requestCancelAction(formData: FormData): Promise<void> {
 
 /**
  * 批准取消入住：执行退房
- * → stays CHECKED_OUT / folios SETTLED / 房间 VD（并记房态日志与打扫任务）
+ * → 押金退还 + 未收房费冲销 → stays CHECKED_OUT / folios SETTLED / 房间 VD
+ *   （并记房态日志与打扫任务）
+ *
+ * ── Bug 4（第十一轮）：审批通过 = 押金 500 残留 + 未收 100 静默结清 ──
+ *
+ * 旧实现只有两句 UPDATE：
+ *     stays  → CHECKED_OUT
+ *     folios → SETTLED（只有 settled_at，账上一分没动）
+ * 独立检查 agent 实测（入住收押金 500、客人当天取消、审批通过）：
+ *   · 押金 500 仍然留在 `stays.deposit` 与 DEPOSIT 明细里 —— 没退给客人；
+ *   · 未收的 100 房费被 SETTLED 静默结清 —— 账单显示已结清，但从来没收到这笔钱；
+ *   · 事后收银台也修不了：账单已 SETTLED，收款 / 入账 / 退款全部拒绝。
+ *
+ * ── 现在的口径：取消入住 = 整单取消（不收钱，也不留不该留的钱）──
+ *   ① **押金必须退**：写一笔 kind='DEPOSIT_REFUND' 的负数 payments
+ *      （refund_of 指向原押金收款）+ 冲销 DEPOSIT 明细 + stays.deposit = 0。
+ *      退多少现金取三者最小值：押金明细、实收押金流水（收取−已退）、paid_amount ——
+ *      任何一项为 0 都不会凭空退钱出去。
+ *   ② **未收房费不能静默结清**：写**红字冲销明细**（item_type 与原消费一致、金额为负，
+ *      描述「【取消入住】未收房费冲销」），把 total_amount 冲减到 0。
+ *
+ *      ── 为什么不用 kind='ROOM_REFUND' ──
+ *      ROOM_REFUND 是「钱已经收过、现在退给客人」的负数收款流水。这笔房费**根本没收过**，
+ *      记一笔负数收款等于凭空造一次现金流出（refund_of 也找不到对应收款），
+ *      而且夜审的「退款冲减」会把同一笔再减一次收入 —— 重复冲减。
+ *      红字明细只改账单应收 / 对应营收桶，没有现金流动，才是「未收款直接冲销」。
+ *   ③ 如果已收 > 应收（预收多了），多出的部分写 kind='ROOM_REFUND' 的负数 payments
+ *      真金白银退回（refund_of 指向最近一笔非押金收款），退完 paid = total。
+ *   ④ ①②③ 与入住单 / 房态 / 打扫任务 / 审批状态 / 操作日志**在同一个 tx() 里**，
+ *      任一步失败整体回滚 —— 不会留下「房态已退、押金还挂着」的半截账。
+ *   ⑤ 账单 SETTLED 且 balance = 0；账务有差额（历史脏数据）时额外写一条日志留痕。
  */
 export async function approveCancelAction(formData: FormData): Promise<void> {
   /* 懒建表：首次调用时创建 cancel_requests（构建期不再写库） */
@@ -528,26 +571,330 @@ export async function approveCancelAction(formData: FormData): Promise<void> {
   if (!stay) back("入住单不存在，无法执行退房", true);
   if (stay.status !== "INHOUSE") back(`房间 ${stay.room_no ?? "-"} 已不是在住状态，无法执行退房`, true);
 
-  const folio = get<{ id: number; balance: number | null }>(
-    `SELECT id, balance FROM folios WHERE stay_id = ? AND hotel_id = ? ORDER BY id DESC LIMIT 1`,
+  /*
+   * 一张入住单可能有**多张**账单（「拆账」会生成 -B / -C 单），取消入住必须全部结清。
+   * 旧实现只取最新一张（ORDER BY id DESC LIMIT 1），拆过账的单子会把押金 / 欠款
+   * 留在没被选中的那张单上 —— 押金照样残留在 stays.deposit。
+   */
+  const folios = all<{ id: number; status: string }>(
+    `SELECT id, status FROM folios WHERE stay_id = ? AND hotel_id = ? ORDER BY id`,
     [stay.id, user.hotelId]
   );
+  /*
+   * 已挂账（CHARGED）的单子不能直接取消：
+   * 挂账已经把应收转到协议单位（ar_ledgers 有记录），若这里再把账单结掉，
+   * 就会出现「账单已结 + AR 仍挂应收」的双份账。必须先撤挂账 / 核销。
+   */
+  if (folios.some((f) => f.status === "CHARGED")) {
+    back(`房间 ${stay.room_no ?? "-"} 的账单已挂账到协议单位（AR 应收未结），请先在「应收」里撤销挂账后再审批取消`, true);
+  }
+
   const now = nowIso();
   const today = todayStr();
+  const bizDate = bizToday(user.hotelId);
+  const operator = user.realName ?? user.username;
+  /* 金额处理结果：写操作日志与成功提示用（多张账单累加） */
+  let depositRefund = 0; // 真实退回的押金现金
+  let waived = 0; // 未收房费冲销额
+  let extraRefund = 0; // 已收 > 应收时退回的多收款
+  let settleResidual = 0; // 最终仍有的差额（历史脏数据，写日志留痕）
+
+  /**
+   * 把一张账单的金额清干净（**必须在 tx() 内调用**）
+   *
+   * ① 押金必须退：负数 payments（kind=DEPOSIT_REFUND，refund_of 指向原押金）
+   *    + 冲销 DEPOSIT 明细 + stays.deposit = 0；
+   * ② 未收房费不能静默结清：按原消费类型红字冲销，把 total_amount 冲减到 0；
+   * ③ 已收 > 应收：多收的钱写 ROOM_REFUND 真金白银退回；
+   * ④ balance 归 0 之后账单才能 SETTLED。
+   */
+  const settleOneFolio = (folio: { id: number; status: string }) => {
+    let folioDepositRefund = 0;
+    let folioWaived = 0;
+    let folioExtraRefund = 0;
+    let folioResidual = 0;
+
+    const moneyBefore = recalcFolioBalance(user.hotelId, folio.id);
+    const paidBefore = round2(Math.max(0, moneyBefore.paid));
+
+    /* ① 押金：该账单还挂着的押金明细（押金负债的权威口径） */
+    const depositOnFolio = round2(Math.max(0, depositHeld(user.hotelId, folio.id)));
+    /* 实收押金流水：收取 − 已退。两项取小，绝不会退出没收到过的钱 */
+    const depositCashHeld = round2(
+      Math.max(
+        0,
+        Number(
+          get<{ s: number | null }>(
+            `SELECT COALESCE(SUM(amount), 0) AS s FROM payments
+              WHERE hotel_id = ? AND folio_id = ? AND amount > 0 AND kind = 'DEPOSIT'`,
+            [user.hotelId, folio.id]
+          )?.s ?? 0
+        ) -
+          Number(
+            get<{ s: number | null }>(
+              `SELECT COALESCE(SUM(ABS(amount)), 0) AS s FROM payments
+                WHERE hotel_id = ? AND folio_id = ? AND amount < 0 AND kind = 'DEPOSIT_REFUND'`,
+              [user.hotelId, folio.id]
+            )?.s ?? 0
+          )
+      )
+    );
+    folioDepositRefund = round2(Math.min(depositOnFolio, paidBefore, depositCashHeld));
+
+    if (folioDepositRefund > 0.005) {
+      /* refund_of 指向原押金收款：押金报表按 kind 归类，退得回去、对得上 */
+      const depositPay = findDepositPayment(user.hotelId, folio.id);
+      run(
+        `INSERT INTO payments
+           (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, refund_of, operator, kind)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          user.hotelId,
+          folio.id,
+          stay.id,
+          nextPayNo(),
+          depositPay?.method ?? "现金",
+          -Math.abs(folioDepositRefund),
+          bizDate,
+          "取消入住退还押金",
+          now,
+          depositPay?.id ?? null,
+          operator,
+          "DEPOSIT_REFUND",
+        ]
+      );
+      run(`UPDATE folios SET paid_amount = COALESCE(paid_amount, 0) - ? WHERE id = ? AND hotel_id = ?`, [
+        folioDepositRefund,
+        folio.id,
+        user.hotelId,
+      ]);
+    }
+
+    /*
+     * 押金明细无条件清零、stays.deposit 归零：担保结束。
+     * 即使现金没退成（明细与实收流水对不上，属历史脏数据），负债口径也必须归零，
+     * 否则「在住押金」报表会永远虚高 —— 与退房 checkoutAction 同一处理。
+     */
+    const depositLines = all<{ id: number; amount: number | null }>(
+      `SELECT id, amount FROM folio_items
+        WHERE folio_id = ? AND hotel_id = ? AND item_type = 'DEPOSIT' AND COALESCE(amount, 0) > 0.005
+        ORDER BY id DESC`,
+      [folio.id, user.hotelId]
+    );
+    for (const line of depositLines) {
+      run(
+        `UPDATE folio_items SET amount = 0
+          WHERE id = ? AND folio_id = ? AND hotel_id = ? AND item_type = 'DEPOSIT'`,
+        [line.id, folio.id, user.hotelId]
+      );
+    }
+    run(`UPDATE stays SET deposit = 0 WHERE id = ? AND hotel_id = ?`, [stay.id, user.hotelId]);
+
+    /*
+     * ② 未收房费：红字冲销（按原消费类型分摊，三个营收桶一起归零）
+     *
+     * 为什么不用 kind='ROOM_REFUND'：那是「钱已经收过、现在退给客人」的负数收款流水。
+     * 这笔房费**根本没收过**，记负数收款等于凭空造一次现金流出（refund_of 也找不到
+     * 对应收款），而且夜审的「退款冲减」会把同一笔再减一次收入 —— 重复冲减。
+     * 红字明细只改账单应收 / 对应营收桶，没有现金流动，才是「未收款直接冲销」。
+     *
+     * 为什么按 item_type 分摊而不是拍一条 ADJUST：报表/夜审按 ROOM / FOOD / OTHER
+     * 分桶，拍成 ADJUST 会让营收一分不减（ADJUST 不计收入），客人没住却算了房费。
+     */
+    const moneyAfterDeposit = recalcFolioBalance(user.hotelId, folio.id);
+    if (moneyAfterDeposit.balance > 0.01) {
+      folioWaived = round2(moneyAfterDeposit.balance);
+      const groups = all<{ item_type: string; amount: number | null }>(
+        `SELECT item_type, COALESCE(SUM(amount), 0) AS amount
+           FROM folio_items
+          WHERE folio_id = ? AND hotel_id = ? AND item_type IN ('ROOM', 'FOOD', 'OTHER')
+          GROUP BY item_type
+         HAVING COALESCE(SUM(amount), 0) > 0.005
+          ORDER BY item_type`,
+        [folio.id, user.hotelId]
+      );
+      const chargeTotal = round2(groups.reduce((s, g) => s + Number(g.amount ?? 0), 0));
+      let left = folioWaived;
+      groups.forEach((g, idx) => {
+        if (left <= 0.005) return;
+        const groupAmount = round2(Number(g.amount ?? 0));
+        const proportional = chargeTotal > 0 ? round2((folioWaived * groupAmount) / chargeTotal) : 0;
+        /* 最后一组兜住四舍五入的零头，保证分摊合计严等于冲销额 */
+        const take =
+          idx === groups.length - 1
+            ? round2(Math.min(left, groupAmount))
+            : round2(Math.min(left, proportional, groupAmount));
+        if (take <= 0.005) return;
+        run(
+          `INSERT INTO folio_items
+             (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at, created_by)
+           VALUES (?,?,?,?,?,?,?,?,?,?)`,
+          [
+            user.hotelId,
+            folio.id,
+            String(g.item_type),
+            "【取消入住】未收房费冲销（取消入住审批通过）",
+            1,
+            -take,
+            -take,
+            bizDate,
+            now,
+            user.id,
+          ]
+        );
+        left = round2(left - take);
+      });
+      /* 兜底：没有正向消费明细 / 分摊后仍有零头 → 用 ADJUST 把余额补齐 */
+      if (left > 0.005) {
+        run(
+          `INSERT INTO folio_items
+             (hotel_id, folio_id, item_type, description, qty, price, amount, biz_date, created_at, created_by)
+           VALUES (?,?,?,?,?,?,?,?,?,?)`,
+          [
+            user.hotelId,
+            folio.id,
+            "ADJUST",
+            "【取消入住】未收房费冲销（尾差）",
+            1,
+            -left,
+            -left,
+            bizDate,
+            now,
+            user.id,
+          ]
+        );
+      }
+      writeOpLog(
+        user.hotelId,
+        operator,
+        "取消入住冲销未收款",
+        `入住单 ${stay.stay_no} · 账单 #${folio.id} · 未收 ${fmtMoney(
+          folioWaived
+        )} 以红字冲销（不计现金、不计营收）`
+      );
+    }
+
+    /*
+     * ③ 已收 > 应收：多收的钱要真退回（负数收款 + refund_of 指向最近一笔非押金收款）
+     *
+     * 走到这里说明押金退完后仍多收，来源只可能是现金/转账预收，
+     * 所以退款的 kind 是 ROOM_REFUND（营收口径的退款冲减，与退款函数一致）。
+     */
+    const moneyAfterWaive = recalcFolioBalance(user.hotelId, folio.id);
+    if (moneyAfterWaive.balance < -0.01) {
+      folioExtraRefund = round2(-moneyAfterWaive.balance);
+      const originPay = get<{ id: number; method: string | null }>(
+        `SELECT id, method FROM payments
+          WHERE hotel_id = ? AND folio_id = ? AND amount > 0 AND COALESCE(kind, '') <> 'DEPOSIT'
+          ORDER BY id DESC LIMIT 1`,
+        [user.hotelId, folio.id]
+      );
+      run(
+        `INSERT INTO payments
+           (hotel_id, folio_id, stay_id, pay_no, method, amount, biz_date, remark, created_at, refund_of, operator, kind)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          user.hotelId,
+          folio.id,
+          stay.id,
+          nextPayNo(),
+          originPay?.method ?? "现金",
+          -Math.abs(folioExtraRefund),
+          bizDate,
+          "取消入住退还多收款",
+          now,
+          originPay?.id ?? null,
+          operator,
+          "ROOM_REFUND",
+        ]
+      );
+      run(`UPDATE folios SET paid_amount = COALESCE(paid_amount, 0) - ? WHERE id = ? AND hotel_id = ?`, [
+        folioExtraRefund,
+        folio.id,
+        user.hotelId,
+      ]);
+    }
+
+    /* ④ 结清：balance 归 0 之后账单才能 SETTLED */
+    const moneyFinal = recalcFolioBalance(user.hotelId, folio.id);
+    folioResidual = round2(moneyFinal.balance);
+    run(`UPDATE folios SET status = 'SETTLED', settled_at = ?, balance = 0 WHERE id = ? AND hotel_id = ?`, [
+      now,
+      folio.id,
+      user.hotelId,
+    ]);
+    if (Math.abs(folioResidual) > 0.01) {
+      writeOpLog(
+        user.hotelId,
+        operator,
+        "取消入住账务差额",
+        `入住单 ${stay.stay_no} · 账单 #${folio.id} · 应收 ${fmtMoney(
+          moneyFinal.total
+        )} · 已收 ${fmtMoney(moneyFinal.paid)} · 差额 ${fmtMoney(folioResidual)} 已按 0 结清，请核对`
+      );
+    }
+
+    return {
+      depositRefund: folioDepositRefund,
+      waived: folioWaived,
+      extraRefund: folioExtraRefund,
+      residual: folioResidual,
+    };
+  };
 
   tx(() => {
+    /* ---------- 一、账务：每张单都退押金 → 冲销未收款 → 退多收款 ---------- */
+    for (const folio of folios) {
+      if (folio.status === "SETTLED") {
+        /* 审批前就已结清：金额不动，只补一个 settled_at（历史数据可能为空） */
+        run(`UPDATE folios SET settled_at = COALESCE(settled_at, ?) WHERE id = ? AND hotel_id = ?`, [
+          now,
+          folio.id,
+          user.hotelId,
+        ]);
+        continue;
+      }
+      const r = settleOneFolio(folio);
+      depositRefund = round2(depositRefund + r.depositRefund);
+      waived = round2(waived + r.waived);
+      extraRefund = round2(extraRefund + r.extraRefund);
+      settleResidual = round2(settleResidual + r.residual);
+    }
+
+    /*
+     * 入住单押金无条件归零（担保结束）
+     *
+     * 有账单时 settleOneFolio 已经清零；这里兜住「入住单有押金但没有账单」的历史脏数据 ——
+     * 与 checkoutAction 的「④ 入住单押金无条件归零」同一处理。
+     * 没有账单就退不了现金，只能留痕让财务核对，绝不能继续把押金挂在在住列表上。
+     */
+    const stayDepositLeft = round2(
+      Math.max(
+        0,
+        Number(
+          get<{ d: number | null }>(
+            `SELECT COALESCE(deposit, 0) AS d FROM stays WHERE id = ? AND hotel_id = ?`,
+            [stay.id, user.hotelId]
+          )?.d ?? 0
+        )
+      )
+    );
+    if (stayDepositLeft > 0.005) {
+      writeOpLog(
+        user.hotelId,
+        operator,
+        "取消入住押金冲销",
+        `入住单 ${stay.stay_no} · 押金 ${fmtMoney(stayDepositLeft)} 无账单可退，已清零，请核对是否已线下退还`
+      );
+    }
+    run(`UPDATE stays SET deposit = 0 WHERE id = ? AND hotel_id = ?`, [stay.id, user.hotelId]);
+
+    /* ---------- 二、入住单 / 房态 / 打扫 / 审批状态 ---------- */
     run(`UPDATE stays SET status = 'CHECKED_OUT', actual_check_out = ? WHERE id = ? AND hotel_id = ?`, [
       today,
       stay.id,
       user.hotelId,
     ]);
-    if (folio) {
-      run(`UPDATE folios SET status = 'SETTLED', settled_at = ? WHERE id = ? AND hotel_id = ?`, [
-        now,
-        folio.id,
-        user.hotelId,
-      ]);
-    }
     if (stay.room_id) {
       changeRoomStatus({
         hotelId: user.hotelId,
@@ -584,12 +931,26 @@ export async function approveCancelAction(formData: FormData): Promise<void> {
       "取消入住审批通过",
       `入住单 ${stay.stay_no} · 房间 ${stay.room_no ?? "-"} · ${stay.guest_name ?? "-"} · 原因：${
         req.reason ?? "-"
-      } · 已执行退房${folio ? `（账单 SETTLED，余额 ${fmtMoney(folio.balance)}）` : "（无账单）"}`
+      } · 已执行退房` +
+        (folios.length > 0
+          ? `（账单 ${folios.length} 张已全部 SETTLED · 退还押金 ${fmtMoney(depositRefund)}` +
+            ` · 冲销未收款 ${fmtMoney(waived)}` +
+            (extraRefund > 0.005 ? ` · 退还多收款 ${fmtMoney(extraRefund)}` : "") +
+            "）"
+          : "（无账单）")
     );
   });
 
   revalidateAll();
-  back(`已批准取消入住并执行退房：${stay.room_no ?? "-"} ${stay.guest_name ?? ""}`);
+  const moneyNote =
+    folios.length > 0
+      ? `；账单已结清：退还押金 ${fmtMoney(depositRefund)}${
+          waived > 0.005 ? `，冲销未收房费 ${fmtMoney(waived)}` : ""
+        }${extraRefund > 0.005 ? `，退还多收款 ${fmtMoney(extraRefund)}` : ""}${
+          Math.abs(settleResidual) > 0.01 ? `（差额 ${fmtMoney(settleResidual)} 已留痕，请核对）` : ""
+        }`
+      : "";
+  back(`已批准取消入住并执行退房：${stay.room_no ?? "-"} ${stay.guest_name ?? ""}${moneyNote}`);
 }
 
 /** 拒绝取消入住：只改审批状态，不动入住单与房态 */
