@@ -4,6 +4,7 @@ import { redirect } from "next/navigation";
 import { ensureArAccountSchema, listArAgingDetail, listArLedgerDrift } from "@/lib/ar";
 import { all, get } from "@/lib/db";
 import {
+  dayCount,
   nightSeries,
   occupancyMetrics,
   occupancyOfDay,
@@ -9075,11 +9076,54 @@ type RoomBizRow = {
   sellable: number;
 };
 
+/**
+ * 本表一次最多统计的天数（92 天 ≈ 一个季度）
+ *
+ * ── 为什么要有上限 ──
+ * 「房间 × 营业日」明细是笛卡尔展开：行数 ≈ 房间数 × 天数。
+ * 实测 2 年区间（730 天）响应 3.6 MB / 346 ms，而 78 条 SQL 合计只有约 12 ms
+ * —— 瓶颈在 HTML / RSC 的序列化与传输，不在查询，所以加索引解决不了。
+ * 按 200 房量线性外推约 1.8 s，等于一张报表把页面拖死。
+ *
+ * ── 为什么是「截断 + 折叠明细」，而不是分页 / 只出汇总 ──
+ *   · 只截断天数不够：行数由「有数据的房间 × 天数」决定，数据只覆盖最近两个月时，
+ *     2 年窗口和 92 天窗口的行数几乎一样（实测只从 4.23 MB 降到 3.39 MB）。
+ *   · 只折叠明细也不够：2 年区间的逐日合计本身就有 730 行。
+ *   · 分页要把 server component 改成 client 状态 + URL 同步，回归面大；
+ *     且服务端仍要查全区间才能算合计，省不掉 SQL。
+ *   · 所以宽区间 → 截断到最近 92 天 + 逐房间明细折叠：页面只剩指标卡和逐日合计
+ *     （92 行），实测 4.23 MB → 0.28 MB；想看逐房间明细就把营业日缩到 92 天以内。
+ *   正常区间（默认上月 = 30/31 天）完全走原路径，数据与改动前完全一致。
+ *
+ * ── 截断方向：保留区间内「最近」的 92 天，不是「前」92 天 ──
+ * 宽区间查询几乎都是想看最近的经营情况（与默认「上月」区间同一方向）；
+ * 而「前 92 天」在数据只覆盖近期时会把报表截成整屏 0（实测演示库数据只有
+ * 最近两个月，2025-01-01~2026-12-31 的前 92 天一条没有），用户会以为报表坏了。
+ * 两种截断都不影响正常区间（<= 92 天时根本不触发）。
+ */
+const ROOM_BIZ_MAX_DAYS = 92;
+
 function ReportRoomBizDaily({ ctx }: ReportProps) {
-  const { hotelId, from, to, days, sellableRooms } = ctx;
-  const cur = categoryAgg(hotelId, from, to, ctx.occupancy.roomNights);
+  const { hotelId, from, to } = ctx;
+  /*
+   * 宽区间保护：超过上限只算最近 92 天。
+   *
+   * 区间指标（间夜 / 出租率 / ADR / 净收入合计）必须跟着截断重算：
+   * 直接用页面级 ctx.occupancy 会出现「明细只有 92 天、合计却是 2 年」，
+   * 那比截断本身更容易让人拿错数。未截断时仍是同一个 ctx.occupancy（不重复查库）。
+   */
+  const rangeDays = dayCount(from, to);
+  const clipped = rangeDays > ROOM_BIZ_MAX_DAYS;
+  /* rangeDays > 92 ⇒ to−91 一定晚于 from，不需要再夹一层 max() */
+  const fromEff = clipped ? dayShift(to, -(ROOM_BIZ_MAX_DAYS - 1)) : from;
+  const occ = clipped ? occupancyMetrics(hotelId, fromEff, to) : ctx.occupancy;
+  const days = clipped ? ROOM_BIZ_MAX_DAYS : rangeDays;
+  const sellableRooms = occ.sellableRooms;
+  const rangeLabel = fromEff === to ? fromEff : `${fromEff} ~ ${to}`;
+
+  const cur = categoryAgg(hotelId, fromEff, to, occ.roomNights);
   /* 间夜：住宿占用明细按「房间 × 营业日」展开（不是数房费明细行） */
-  const slices = stayNightSlices(hotelId, from, to);
+  const slices = stayNightSlices(hotelId, fromEff, to);
   const nightByRoomDay = new Map<string, number>();
   for (const s of slices) {
     for (let i = 0; i < s.nights; i += 1) {
@@ -9090,9 +9134,9 @@ function ReportRoomBizDaily({ ctx }: ReportProps) {
     }
   }
 
-  const finance = roomDayFinanceRows(hotelId, from, to);
+  const finance = roomDayFinanceRows(hotelId, fromEff, to);
   /* 退款一次查出来，既按「房间 × 日」入明细，也按日汇总到逐日表（含未关联房的退款） */
-  const refundRows = refundRoomDayRows(hotelId, from, to);
+  const refundRows = refundRoomDayRows(hotelId, fromEff, to);
   const refundByRoomDay = new Map<string, number>();
   const refundByDay = new Map<string, number>();
   for (const r of refundRows) {
@@ -9134,17 +9178,17 @@ function ReportRoomBizDaily({ ctx }: ReportProps) {
   rows.sort((a, b) => a.roomNo.localeCompare(b.roomNo, "zh") || a.day.localeCompare(b.day));
 
   /* 逐日合计：间夜取 metrics 的 nightSeries（与上面明细同源），金额取 dailyAgg 的四项 */
-  const nightMap = nightSeries(hotelId, from, to);
-  const daily = dailyAgg(hotelId, from, to, nightMap);
+  const nightMap = nightSeries(hotelId, fromEff, to);
+  const daily = dailyAgg(hotelId, fromEff, to, nightMap);
   const dailyMap = new Map<string, DailyRow>();
   for (const r of daily) dailyMap.set(r.biz_date, r);
-  const dates = dayList(from, to);
+  const dates = dayList(fromEff, to);
   const refundTotal = round2(
     [...refundByDay.values()].reduce((s, v) => s + v, 0)
   );
   /* 明细求和必须等于区间指标：不等就是口径又分叉了，页面上直接标红 */
   const detailNights = rows.reduce((s, r) => s + r.nights, 0);
-  const nightsMatch = detailNights === ctx.occupancy.roomNights;
+  const nightsMatch = detailNights === occ.roomNights;
   const detailRoom = round2(rows.reduce((s, r) => s + r.room, 0));
   const roomMatch = Math.abs(detailRoom - cur.room) < 0.02;
   const netIncome = round2(cur.room + cur.food + cur.otherTotal - refundTotal);
@@ -9154,18 +9198,37 @@ function ReportRoomBizDaily({ ctx }: ReportProps) {
 
   return (
     <>
+      {clipped && (
+        /*
+         * 明确告知「被截断了」，不静默
+         *
+         * 静默截断最危险：合计行看起来正常，用户却以为 2 年数据就这么多，
+         * 拿它去对账会差出一大截。所以这里连「原区间本该有多少」一起写出来，
+         * 让用户一眼看出少了什么、该缩范围还是该分批查。
+         */
+        <div className="rounded-[4px] border border-[#f0c36d] bg-[#fff8e6] px-3 py-2 text-[12px] leading-relaxed text-[#8a5a00]">
+          <b>已限制为最近 {ROOM_BIZ_MAX_DAYS} 天</b>：本表一次最多统计 {ROOM_BIZ_MAX_DAYS} 天（约一个季度），
+          当前查询跨 {rangeDays} 天（{from} ~ {to}，原区间合计 {fmtInt(ctx.occupancy.roomNights)} 间夜 · 出租率{" "}
+          {fmtPct(ctx.occupancy.occupancy)} · ADR {fmtMoney(ctx.occupancy.adr)} · 房费 {fmtMoney(ctx.occupancy.roomRevenue)}）。
+          为避免页面卡死，本表只统计区间末尾的 <b>{rangeLabel}</b>（逐日合计 + 4 个指标卡），
+          逐房间明细已折叠，<b>不是全区间数据</b> ——
+          请把营业日缩到 {ROOM_BIZ_MAX_DAYS} 天以内查看完整明细，或按季度分批查询后汇总；
+          页面下方「导出 Excel」仍按完整区间导出流水明细。
+        </div>
+      )}
+
       <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
           label="售出间夜"
-          value={fmtInt(ctx.occupancy.roomNights)}
+          value={fmtInt(occ.roomNights)}
           hint="住宿占用口径（在住 + 已退房晚数，排除钟点房）；= 房态间夜 = 工作台 = 夜审 rooms_sold"
         />
         <StatCard label="房费" value={fmtMoney(cur.room)} hint="ROOM 明细按营业日归集" />
         <StatCard label="净收入" value={fmtMoney(netIncome)} hint={`房费 ${fmtMoney(cur.room)} + 餐饮 ${fmtMoney(cur.food)} + 其他 ${fmtMoney(cur.otherTotal)} − 退款 ${fmtMoney(refundTotal)}`} />
         <StatCard
           label="出租率"
-          value={fmtPct(ctx.occupancy.occupancy)}
-          hint={`${fmtInt(ctx.occupancy.roomNights)} 间夜 ÷ 可售房晚 ${fmtInt(sellableNights)}（可售 ${sellableRooms} 间 × ${days} 天）`}
+          value={fmtPct(occ.occupancy)}
+          hint={`${fmtInt(occ.roomNights)} 间夜 ÷ 可售房晚 ${fmtInt(sellableNights)}（可售 ${sellableRooms} 间 × ${days} 天）`}
         />
       </div>
 
@@ -9174,8 +9237,8 @@ function ReportRoomBizDaily({ ctx }: ReportProps) {
         right={
           <span className={nightsMatch && roomMatch ? "text-[#2a9d3a]" : "text-[#e2483a]"}>
             {nightsMatch && roomMatch
-              ? `间夜 / 房费与区间指标一致（${fmtInt(ctx.occupancy.roomNights)} 间夜）`
-              : `对账不平：间夜 ${detailNights} vs ${ctx.occupancy.roomNights}，房费 ${detailRoom} vs ${cur.room}`}
+              ? `间夜 / 房费与区间指标一致（${fmtInt(occ.roomNights)} 间夜）`
+              : `对账不平：间夜 ${detailNights} vs ${occ.roomNights}，房费 ${detailRoom} vs ${cur.room}`}
           </span>
         }
       >
@@ -9235,23 +9298,43 @@ function ReportRoomBizDaily({ ctx }: ReportProps) {
                 })}
               <TotalRow>
                 <td className="td font-medium text-gray-800">合计</td>
-                <td className={SUM_TD}>{fmtInt(ctx.occupancy.roomNights)}</td>
+                <td className={SUM_TD}>{fmtInt(occ.roomNights)}</td>
                 <td className={SUM_TD}>{fmtMoney(cur.room)}</td>
                 <td className={SUM_TD}>{fmtMoney(cur.food)}</td>
                 <td className={SUM_TD}>{fmtMoney(cur.otherTotal)}</td>
                 <td className={SUM_TD}>{fmtMoney(refundTotal)}</td>
                 <td className={SUM_TD}>{fmtMoney(netIncome)}</td>
                 <td className={SUM_TD}>{fmtInt(sellableNights)}</td>
-                <td className={SUM_TD}>{fmtPct(ctx.occupancy.occupancy)}</td>
-                <td className={SUM_TD}>{fmtMoney(ctx.occupancy.adr)}</td>
+                <td className={SUM_TD}>{fmtPct(occ.occupancy)}</td>
+                <td className={SUM_TD}>{fmtMoney(occ.adr)}</td>
               </TotalRow>
             </tbody>
           </table>
         </div>
       </SectionCard>
 
-      <SectionCard title="房间 × 营业日明细" right={`${rows.length} 行 · 只列有间夜或有金额的组合`}>
-        <div className="max-h-[460px] overflow-auto">
+      <SectionCard
+        title="房间 × 营业日明细"
+        right={clipped ? "区间过宽 · 明细已折叠" : `${rows.length} 行 · 只列有间夜或有金额的组合`}
+      >
+        {clipped ? (
+          /*
+           * 宽区间折叠明细 —— 这才是 3.6 MB 的大头
+           *
+           * 明细行数 ≈「有数据的房间 × 天数」：2 年区间实测 3.6 MB / 346 ms，
+           * 而 78 条 SQL 只有约 12 ms。只截断天数不够（数据密度不变时行数几乎不变），
+           * 必须把逐房间明细折叠掉，页面只剩逐日合计（92 行）+ 指标卡。
+           */
+          <div className="px-3.5 py-5 text-[12px] leading-relaxed text-[#8a5a00]">
+            <b>明细已折叠</b>：当前区间跨 {rangeDays} 天，超过本表 {ROOM_BIZ_MAX_DAYS} 天的明细上限。
+            逐房间逐日的明细行数 ≈「有数据的房间数 × 天数」，2 年区间实测 3.6 MB HTML / 346 ms
+            （SQL 只有约 12 ms，瓶颈是渲染与传输，按 200 房量外推约 1.8 s）。
+            本表只统计区间末尾的 <b>{rangeLabel}</b>，并把明细折叠 —— 上方「逐日合计」与 4 个指标卡已按这段区间算好。
+            把营业日缩小到 {ROOM_BIZ_MAX_DAYS} 天以内即可查看逐房间明细；
+            页面下方「导出 Excel」仍按完整区间导出流水明细。
+          </div>
+        ) : (
+          <div className="max-h-[460px] overflow-auto">
           <table className="w-full">
             <thead>
               <tr>
@@ -9293,20 +9376,21 @@ function ReportRoomBizDaily({ ctx }: ReportProps) {
               ))}
               <TotalRow>
                 <td className="td font-medium text-gray-800">合计</td>
-                <td className="td text-gray-500">{rangeText(ctx)}</td>
-                <td className={SUM_TD}>{fmtInt(ctx.occupancy.roomNights)}</td>
+                <td className="td text-gray-500">{rangeLabel}</td>
+                <td className={SUM_TD}>{fmtInt(occ.roomNights)}</td>
                 <td className={SUM_TD}>{fmtMoney(cur.room)}</td>
                 <td className={SUM_TD}>{fmtMoney(cur.food)}</td>
                 <td className={SUM_TD}>{fmtMoney(cur.otherTotal)}</td>
                 <td className={SUM_TD}>{fmtMoney(refundTotal)}</td>
                 <td className={SUM_TD}>{fmtMoney(netIncome)}</td>
                 <td className="td" />
-                <td className={SUM_TD}>{fmtPct(ctx.occupancy.occupancy)}</td>
-                <td className={SUM_TD}>{fmtMoney(ctx.occupancy.adr)}</td>
+                <td className={SUM_TD}>{fmtPct(occ.occupancy)}</td>
+                <td className={SUM_TD}>{fmtMoney(occ.adr)}</td>
               </TotalRow>
             </tbody>
           </table>
-        </div>
+          </div>
+        )}
       </SectionCard>
 
       <NoteCard>

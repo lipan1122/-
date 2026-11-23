@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import OrderListDialog, { type OrderListCell } from "@/components/OrderListDialog";
 
 export type PredictRow = {
@@ -103,7 +103,7 @@ export function PredictTable({
                   /* 真实页：今天列淡紫底、过去日期列淡绿底 */
                   const dayBg = d === today ? "bg-[#f7f2ff]" : d < today ? "bg-[#f4faf4]" : "";
                   return (
-                    <>
+                    <Fragment key={d}>
                       <td
                         key={`${d}-s`}
                         className={`border-b border-r border-[#eee] px-1 py-1.5 text-center text-[12px] tabular-nums ${dayBg} ${
@@ -124,7 +124,7 @@ export function PredictTable({
                       >
                         {showOcc ? occupied : "—"}
                       </td>
-                    </>
+                    </Fragment>
                   );
                 })}
               </tr>
@@ -143,14 +143,14 @@ export function PredictTable({
               {dates.map((d) => {
                 const t = totals.find((x) => x.day === d);
                 return (
-                  <>
+                  <Fragment key={d}>
                     <td key={`${d}-ts`} className="border-b border-r border-[#eee] px-1 py-1.5 text-center text-[12px] tabular-nums text-[#2a9d3c]">
                       {t?.sellable ?? 0}
                     </td>
                     <td key={`${d}-to`} className="border-b border-r border-[#eee] px-1 py-1.5 text-center text-[12px] tabular-nums text-[#333]">
                       {showOcc ? t?.occupied ?? 0 : "—"}
                     </td>
-                  </>
+                  </Fragment>
                 );
               })}
             </tr>
