@@ -44,3 +44,6 @@ Thumbs.db
 .vps-creds
 backups/
 *.pull-backup.log
+
+# 临时日志
+log
