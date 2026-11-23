@@ -1,0 +1,39 @@
+{
+  "generatedAt": "2026-11-23T14:26:29+08:00",
+  "generatedAtUtc": "2026-11-23T06:26:29.847Z",
+  "file": "pms.2026-11-23T14-26-29.db",
+  "path": "D:\\dsh-home\\downloads\\pms酒管系统\\pms\\data\\backup\\pms.2026-11-23T14-26-29.db",
+  "sizeBytes": 2113536,
+  "sizeHuman": "2.0 MB",
+  "sha256": "13cdf6265fb4772fa1d6884c20f314ec1b1f2fdddac1e94d44102a2166d8052c",
+  "tableCount": 93,
+  "indexCount": 96,
+  "counts": {
+    "users": 4,
+    "rooms": 46,
+    "stays": 384,
+    "folios": 384,
+    "folio_items": 671,
+    "payments": 397,
+    "guests": 53,
+    "bookings": 831,
+    "room_types": 7,
+    "booking_rooms": 670,
+    "members": null,
+    "ar_accounts": 5,
+    "housekeeping_tasks": null,
+    "op_logs": 1802
+  },
+  "integrity": "ok",
+  "foreignKeyViolations": 0,
+  "sqliteVersion": "3.54.1",
+  "source": {
+    "path": "D:\\dsh-home\\downloads\\pms酒管系统\\pms\\data\\pms.db",
+    "tableCount": 93,
+    "sizeBytes": 2756608
+  },
+  "keep": 10,
+  "durationMs": 28,
+  "node": "v24.22.3",
+  "warnings": []
+}
