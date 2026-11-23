@@ -3071,6 +3071,95 @@ export function runMigrations(db, { checkOnly = false } = {}) {
     changed += rep.changed;
   }
 
+  /*
+   * ── 第 23 段：押金残留「安全子集」自动修复 ──
+   *
+   * 背景：`load-demo` 用的是演示 SQL 快照，里面本来就带「已退房单还压着押金」
+   * 「SETTLED 账单还挂 DEPOSIT 明细」这类残留。完整的修复要写 DEPOSIT_REFUND 退款流水、
+   * 逐行冲销明细、重算账单余额 —— 那套逻辑在 `scripts/fix-deposit-residual.mjs`（554 行，
+   * 独立 CLI，跑就会 exit，不能直接 import）。
+   *
+   * 所以这里只做**确定无害**的两件事，保证「跑一次 migrate 之后体检不会红」：
+   *
+   *   1. `SETTLED` 账单上金额 > 0 的 DEPOSIT 明细 → 逐行置 0
+   *      （账单已经结清，那笔押金明细没有金额意义；置 0 后 SUM(明细) 仍等于 total）
+   *   2. `CHECKED_OUT` 且 deposit > 0、但**整张单下没有任何押金收款流水**的
+   *      → `deposit = 0`（没有真钱可退，只是字段没清）
+   *
+   * **有押金收款流水的单不动** —— 那种要真退钱，交给 `fix-deposit-residual.mjs`，
+   * 由 `scripts/post-deploy.mjs` 在部署后统一跑。
+   *
+   * 两条都幂等：改完就不再满足条件，第二次 0 行。
+   */
+  {
+    if (!hasTable("folios") || !hasTable("folio_items") || !hasTable("stays")) {
+      skipped.push("押金残留安全子集（缺表）");
+    } else {
+      /* 1. SETTLED 账单的零额化押金明细 */
+      const zeroDepositLines = all(
+        `SELECT fi.id, f.folio_no, fi.item_type, fi.amount
+           FROM folio_items fi
+           JOIN folios f ON f.id = fi.folio_id
+          WHERE fi.item_type = 'DEPOSIT' AND COALESCE(fi.amount, 0) > 0.005
+            AND f.status = 'SETTLED'`
+      );
+      if (zeroDepositLines.length === 0) {
+        skipped.push("押金残留：SETTLED 账单押金明细");
+      } else if (checkOnly) {
+        applied.push(`押金残留：${zeroDepositLines.length} 行 SETTLED 账单押金明细待置 0`);
+        changed += 0;
+      } else {
+        for (const line of zeroDepositLines) {
+          db.prepare(`UPDATE folio_items SET amount = 0 WHERE id = ?`).run(line.id);
+          db.prepare(`UPDATE folio_items SET price = 0, qty = 1 WHERE id = ?`).run(line.id);
+        }
+        applied.push(`押金残留：${zeroDepositLines.length} 行 SETTLED 账单押金明细已置 0`);
+        changed += zeroDepositLines.length;
+      }
+
+      /* 2. 没有任何押金收款流水的已退房单 → deposit 归零 */
+      const orphanDeposits = all(
+        `SELECT s.id, s.stay_no, s.deposit
+           FROM stays s
+          WHERE s.status = 'CHECKED_OUT' AND COALESCE(s.deposit, 0) > 0.005
+            AND NOT EXISTS (
+              SELECT 1 FROM payments p
+               WHERE p.stay_id = s.id
+                 AND (p.kind = 'DEPOSIT' OR (p.kind IS NULL AND (p.remark LIKE '%押金%' OR p.remark LIKE '%预收%')))
+            )`
+      );
+      if (orphanDeposits.length === 0) {
+        skipped.push("押金残留：无流水的已退房单");
+      } else if (checkOnly) {
+        applied.push(`押金残留：${orphanDeposits.length} 张已退房单有 deposit 但无押金流水，待归零`);
+      } else {
+        for (const s of orphanDeposits) {
+          db.prepare(`UPDATE stays SET deposit = 0 WHERE id = ?`).run(s.id);
+        }
+        applied.push(`押金残留：${orphanDeposits.length} 张已退房单 deposit 已归零（无押金流水可退）`);
+        changed += orphanDeposits.length;
+      }
+
+      /* 3. 有押金流水的残留 → 只报告，交给 fix-deposit-residual.mjs */
+      const needsRealRefund = all(
+        `SELECT COUNT(*) AS c
+           FROM stays s
+          WHERE s.status = 'CHECKED_OUT' AND COALESCE(s.deposit, 0) > 0.005
+            AND EXISTS (
+              SELECT 1 FROM payments p
+               WHERE p.stay_id = s.id
+                 AND (p.kind = 'DEPOSIT' OR (p.kind IS NULL AND (p.remark LIKE '%押金%' OR p.remark LIKE '%预收%')))
+            )`
+      )[0]?.c ?? 0;
+      if (Number(needsRealRefund) > 0) {
+        notes.push(
+          `押金残留：${needsRealRefund} 张已退房单有押金流水需真退钱 —— 请跑 ` +
+            `node scripts/fix-deposit-residual.mjs --apply（或 scripts/post-deploy.mjs）`
+        );
+      }
+    }
+  }
+
   return { changed, applied, skipped, notes, checkOnly };
 }
 
