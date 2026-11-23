@@ -2740,6 +2740,21 @@ export function runMigrations(db, { checkOnly = false } = {}) {
     if (arLacking.length > 0) {
       skipped.push(`AR 笔级台账回填（缺表：${arLacking.join(" / ")}）`);
     } else {
+      /*
+       * ⚠️ 先确保 ar_accounts.company_id 存在，再做回填
+       *
+       * 这一段（第 21 段）的设计假设是「第 9 段已经补过 company_id」，
+       * 但那是**本地库**的情况 —— VPS / 老库上这列可能根本不存在，
+       * 于是后面 `SELECT ... WHERE company_id IS NULL` 直接抛
+       * 「no such column: company_id」，把整个 migrate-all 打断
+       * （实测：VPS 部署时就是这样，迁移一条都没跑完）。
+       *
+       * 所以这里自己兜一次，不依赖别的段的执行顺序。
+       */
+      if (!hasColumn("ar_accounts", "company_id")) {
+        addColumn("ar_accounts", "company_id", "INTEGER");
+      }
+
       const r2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
       const eps = 0.001;
       const ledgerColsNow = all(`PRAGMA table_info(ar_ledgers)`).map((c) => c.name);
