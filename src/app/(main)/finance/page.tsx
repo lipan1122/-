@@ -69,7 +69,15 @@ export default async function FinancePage() {
    */
   const rows = all<ArRow>(
     `SELECT l.id,
-            COALESCE(l.folio_no, '#' || l.folio_id) AS folio_no,
+            /*
+             * 台账单号：folio_no 为空时按 folio_id 兜底，两者都空就显示「台账#id」
+             *
+             * 后台回填的台账（第十轮 AR 台账回填）**刻意不臆造账单号** —— 演示种子里
+             * 没有对应账单，folio_id / folio_no 都是 NULL。原来写的是
+             * COALESCE(folio_no, '#' || folio_id)，两边都 NULL 时得到 NULL，
+             * 于是页面「账单号」列全空、下拉框 aria-label 渲染成「null 收款方式」。
+             */
+            COALESCE(l.folio_no, CASE WHEN l.folio_id IS NOT NULL THEN '#' || l.folio_id END, '台账#' || l.id) AS folio_no,
             COALESCE(c.name, '协议单位#' || l.company_id) AS guest_name,
             '' AS room_no,
             l.amount AS total_amount,

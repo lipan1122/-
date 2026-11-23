@@ -245,12 +245,16 @@ function readLatest() {
  * 为什么不只看 systemctl：
  *   演练时我们把库放到 /tmp 另起一个 next 实例，systemd 里没有它；
  *   反过来，systemd 显示 active 但服务可能早就关了库句柄。
- * 所以两条证据都要看，任一条命中都算「在用」。
+ * 所以两条证据都要看，但它们**只对号入座**：
+ *   · systemd 的 pms 单元工作目录是 /opt/pms，它只会打开 /opt/pms/data/pms.db。
+ *     所以「systemd active」只有在目标库就是那个库时才算占用 ——
+ *     否则在 /tmp 副本上演练会一直误报「服务在跑」，把安全提示变成噪音。
+ *   · 进程持有则是按路径精确匹配的，任何路径都算数。
  *
  * /proc 扫描在非 Linux 上直接返回空（Windows 开发机跑演练时不会误报）。
  */
 function detectHolders(dbFile) {
-  const result = { systemd: null, pids: [], detail: [] };
+  const result = { systemd: null, pids: [] };
 
   // 证据 1：systemd 单元 pms 是否 active
   try {
@@ -293,6 +297,15 @@ function detectHolders(dbFile) {
         } catch {
           continue; // fd 已关闭 / 权限不足
         }
+        /*
+         * 去掉内核加的 " (deleted)" 后缀。
+         *
+         * 恢复过一次之后，旧的服务进程还开着**已被替换掉的那个 inode**，
+         * readlink 会返回 "/tmp/.../pms.db (deleted)"。如果不剥掉后缀，
+         * 路径比对失败 → 漏判「服务在跑」→ 第二次恢复可能在服务写入时把库搞坏。
+         * 这类 sudo/服务进程的 fd 探测必须做这个归一化。
+         */
+        if (link.endsWith(" (deleted)")) link = link.slice(0, -" (deleted)".length);
         if (targets.has(link)) {
           found.add(pid);
           break;
@@ -303,19 +316,32 @@ function detectHolders(dbFile) {
   } catch {
     /* 非 Linux（无 /proc）：跳过 */
   }
-
-  if (result.systemd === "active") result.detail.push("systemd 单元 pms 处于 active");
-  if (result.pids.length > 0) result.detail.push(`进程 ${result.pids.join(",")} 打开了该库文件`);
   return result;
 }
 
-/** 目标库是不是「生产库」：默认 cwd/data/pms.db，或 VPS 上的固定部署路径 */
+/**
+ * 目标库是不是 systemd 里 pms 服务正在用的那个库。
+ *
+ * 部署脚本把 WorkingDirectory 固定成 /opt/pms，所以服务只可能打开这一个路径。
+ * 比对绝对路径即可，不要去猜进程。
+ */
+function isServiceDb(dbFile) {
+  return dbFile === path.resolve("/opt/pms/data/pms.db");
+}
+
+/**
+ * 目标库是不是「生产部署」，用来决定恢复后打印哪一组后续命令。
+ *
+ * 注意不能只看 dbFile === cwd/data/pms.db：
+ * 演练时我们会把整个项目复制到 /tmp/pms-restore-test 再在那里跑脚本，
+ * 此时 cwd/data/pms.db 恰好就是**副本库**，按老判据会误报「生产库路径」，
+ * 让人以为要停生产服务。所以 /tmp 下的 cwd 一律按演练处理。
+ */
 function isProductionPath(dbFile) {
-  const prodCandidates = [
-    path.resolve(process.cwd(), "data", "pms.db"),
-    path.resolve("/opt/pms/data/pms.db"),
-  ];
-  return prodCandidates.includes(dbFile);
+  if (isServiceDb(dbFile)) return true;
+  if (dbFile !== path.resolve(process.cwd(), "data", "pms.db")) return false;
+  const cwd = process.cwd().replace(/\\/g, "/");
+  return !/^\/(tmp|var\/tmp)\//.test(cwd);
 }
 
 /** 列备份目录里所有可恢复的文件（含历史快照，标注来源以便挑对的） */
@@ -488,17 +514,33 @@ async function main() {
   /* ══════════════ 目标库 / 服务占用检查 ══════════════ */
   const targetExists = existsSync(DB_PATH);
   const prod = isProductionPath(DB_PATH);
+  const serviceDb = isServiceDb(DB_PATH);
   const holders = detectHolders(DB_PATH);
-  const holderBlocked = holders.detail.length > 0;
+
+  /*
+   * systemd 只对「它自己那个库」构成占用；在 /tmp 副本上演练时，
+   * 生产的 pms 服务照样 active，但它根本没碰这个副本库 —— 不能算阻断。
+   * 进程持有是按路径精确匹配的，任何路径都算。
+   */
+  const systemdBlocks = serviceDb && holders.systemd === "active";
+  const blockerDetail = [
+    ...(systemdBlocks ? ["systemd 单元 pms 处于 active（它正打开这个库）"] : []),
+    ...(holders.pids.length ? [`进程 ${holders.pids.join(",")} 打开了该库文件`] : []),
+  ];
+  const holderBlocked = blockerDetail.length > 0;
 
   console.log("");
   console.log(`目标库现状：${targetExists ? `${humanSize(statSync(DB_PATH).size)}（存在）` : "不存在（将新建）"}`);
   console.log(`路径判定：${prod ? "生产库路径" : "非生产路径（演练/副本模式）"}`);
-  console.log(`服务检测：systemd=${holders.systemd}${holders.pids.length ? `，持有进程 ${holders.pids.join(",")}` : ""}`);
+  console.log(
+    `服务检测：systemd=${holders.systemd}` +
+      (serviceDb ? "" : "（该服务用的不是本库，不计入占用）") +
+      (holders.pids.length ? `，持有进程 ${holders.pids.join(",")}` : "")
+  );
 
   if (holderBlocked) {
     console.log("");
-    console.log(`⚠ 目标库正被使用：${holders.detail.join("；")}`);
+    console.log(`⚠ 目标库正被使用：${blockerDetail.join("；")}`);
     if (prod) {
       console.log("  生产环境必须**先停服务再恢复**，否则恢复出来的库会立刻被服务写脏：");
       console.log("    sudo systemctl stop pms");

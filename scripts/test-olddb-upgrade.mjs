@@ -290,7 +290,8 @@ try {
     ["housekeeping", "reviewed_by"],
     ["housekeeping", "reviewed_at"],
     ["stays", "self_use"],
-    ["booking_rooms", "guest_id"],
+    /* 第 4 轮的 ar_ledgers 建表语句里还没有 kind（第九轮才加） */
+    ["ar_ledgers", "kind"],
     ["bookings", "mini_request_id"],
     ["room_types", "images"],
     ["room_types", "facilities"],
@@ -391,7 +392,13 @@ try {
 
   const dbA2 = openDb(builtA.dbFile);
 
-  /** 必须补上的列（第 5~13 轮陆续加的，老库上一个都没有） */
+  /**
+   * 必须补上的列（第 5~13 轮陆续加的，老库上一个都没有）
+   *
+   * 注意 ar_write_offs：它属于「页面首次访问时懒建」的表（第 4 轮库 A 里没有这张表），
+   * addColumn 遇到表不存在会如实跳过 —— 所以这里只检查「老库本来就有的表」，
+   * 懒建表的列在库 B（AR 页面已经用过）里单独验证。
+   */
   const REQUIRED_COLUMNS = [
     ["payments", "kind"],
     ["payments", "request_id"],
@@ -414,7 +421,6 @@ try {
     ["room_types", "check_out_time"],
     ["room_types", "deposit_note"],
     ["ar_ledgers", "kind"],
-    ["ar_write_offs", "ar_ledger_id"],
     ["users", "password_hash"],
     ["users", "must_change_password"],
     ["users", "position_id"],
@@ -578,8 +584,6 @@ try {
   check("第二次升级 0 处变更（幂等）", changed2 === 0, `解析到 changed=${changed2}\n${upgrade2Out.slice(-600)}`);
   check("第二次升级输出「没有需要变更的项目」", upgrade2Out.includes("没有需要变更的项目"));
 
-  const checkRun = execNode(migrateScript, { cwd: ROOT, env: { PMS_DB_PATH: builtA.dbFile, ...{} } });
-  /* --check 需要额外参数，用 spawn 语义补：直接再跑一次 execFileSync 带 --check */
   const checkOnly = (() => {
     try {
       const out = execFileSync(process.execPath, [migrateScript, "--check"], {
@@ -593,7 +597,6 @@ try {
       return { status: e?.status ?? -1, out: `${e?.stdout ?? ""}${e?.stderr ?? ""}` };
     }
   })();
-  void checkRun;
   check(
     "migrate-all --check 在升级后的老库上报 0 处待处理",
     checkOnly.status === 0 && checkOnly.out.includes("没有需要变更的项目"),
@@ -669,6 +672,15 @@ try {
 
   const dbB2 = openDb(builtB.dbFile);
   check("升级后 ar_accounts.company_id 列被补上（第 21 段自己兜底，不靠第 9 段顺序）", hasColumn(dbB2, "ar_accounts", "company_id"));
+  /**
+   * 懒建表补列：库 A 里没有 ar_write_offs，addColumn 会如实跳过；
+   * 库 B 是「AR 页面已经用过」的库，这张表存在，就必须被补上 ar_ledger_id。
+   */
+  check(
+    "懒建表 ar_write_offs 在老库里存在时也会被补上 ar_ledger_id",
+    hasColumn(dbB2, "ar_write_offs", "ar_ledger_id"),
+    `列：${tableCols(dbB2, "ar_write_offs").join(",")}`
+  );
 
   const accountAfterB = one(dbB2, `SELECT id, code, company_id, balance FROM ar_accounts WHERE hotel_id = 1 AND code = 'AR-OLD-1'`);
   check(

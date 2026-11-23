@@ -369,7 +369,18 @@ export default async function PredictPage({ searchParams }: { searchParams: Prom
        */
       const maintenance = Number(t.ooo ?? 0) + Number(t.lock ?? 0);
       /* 物理可售：总房量 − 维修 − 锁房 − 占用（occupied 已含在住与预订） */
-      const physicalSellable = Math.max(0, Number(t.total ?? 0) - maintenance - occupied);
+      /*
+       * 物理可售 = 总房量 − 维修 − 锁房 − 占用，**允许负数**
+       *
+       * ⚠️ 不能 `Math.max(0, ...)`：
+       *   超卖时（占用 > 总房量），夹成 0 会让「可卖 0 + 占用 42 = 48 > 46」这种
+       *   算术矛盾出现在合计行（实测 11-24 就是）。
+       *   用户看「可卖 −2」一眼就知道超卖了 2 间；看「可卖 0」只会以为刚好住满。
+       *
+       * 与 `lib/room-stock.ts` 的 `oversold` / `stock-trigger.ts` 的负数保留同一口径：
+       * 房态页需要夹 0（页面不显示负库存），但**预测表要显示真实缺口**。
+       */
+      const physicalSellable = Number(t.total ?? 0) - maintenance - occupied;
       /* 手工房量是「剩余可卖」，只做一次 min，不再从里面扣占用 */
       const allot = allotmentOf(t.id, day);
       const sellable = allot === null ? physicalSellable : Math.min(physicalSellable, Math.max(0, allot));

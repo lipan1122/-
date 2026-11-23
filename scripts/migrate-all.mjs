@@ -37,6 +37,16 @@ import { pathToFileURL } from "node:url";
 import { encryptSecret, isEncryptedSecret } from "../src/lib/crypto.ts";
 /* 演示数据一致性修复（第 22 段）与独立脚本 scripts/fix-demo-data-issues.mjs 共用一份实现 */
 import { repairDemoDataConsistency } from "./fix-demo-data-issues.mjs";
+/*
+ * 押金残留完整修复（第 24 段）与独立脚本 scripts/fix-deposit-residual.mjs 共用一份实现。
+ *
+ * 为什么能静态 import 一个「自己会跑 CLI」的脚本：fix-deposit-residual.mjs 的入口
+ * 用 `import.meta.url === process.argv[1]` 守卫，被 import 时只导出 repairDepositResidual。
+ * 那个文件顶层的 `await import(src/lib/folio.ts)` 也不会变成异步传染：Node 会先把
+ * 依赖的顶层 await 跑完再执行本文件的模块体，所以 runMigrations 仍然是同步函数
+ * （init-db.mjs 在同步调用它，不能改成 async）。
+ */
+import { repairDepositResidual } from "./fix-deposit-residual.mjs";
 
 /** 数据库路径：命令行、init-db、体检脚本统一口径 */
 export function resolveDbPath() {
@@ -3157,6 +3167,89 @@ export function runMigrations(db, { checkOnly = false } = {}) {
             `node scripts/fix-deposit-residual.mjs --apply（或 scripts/post-deploy.mjs）`
         );
       }
+    }
+  }
+
+  /*
+   * ── 第 24 段：押金残留「完整口径」修复（接进迁移，不再靠人记得单独跑）──
+   *
+   * 第 23 段只做「确定无害」的安全子集：SETTLED 账单上的押金明细置 0、
+   * 没有押金流水的已退房单 deposit 置 0。**它不动钱** —— 有押金流水的单要写
+   * DEPOSIT_REFUND 退款流水、冲销明细、重算余额，那是 `scripts/fix-deposit-residual.mjs`
+   * 的事，而那个脚本是独立 CLI，只能靠人记得单独跑。
+   *
+   * 结果就是：每次在 VPS 上跑 `load-demo.mjs`（演示快照覆盖库）之后，押金残留就回来了
+   * （真库实测：SETTLED 余额非 0 → 3 张、已退房单残留押金 → 11 张），
+   * 而漏跑它已经发生过两次。**「必须记得多跑一条命令」的流程一定会漏**，
+   * 所以这里把完整修复并进迁移：跑 schema 迁移 = 顺手把押金残留修干净。
+   *
+   * 两段的分工（同一次迁移里，23 在前、24 在后）：
+   *   · 23 → 明细置 0 / 无流水的 deposit 归零（不写钱）；
+   *   · 24 → 真退现金（DEPOSIT_REFUND）、有流水的 deposit 归零、已退房却 OPEN 的账单置
+   *          SETTLED、SETTLED 余额用统一口径重算归零。**幂等**：干净时 0 变更。
+   *
+   * ⚠️ 为什么传 zeroedDepositFallback（而不是照抄 CLI 的默认参数）：
+   *   23 段在本段之前已经把 SETTLED 账单的 DEPOSIT 明细置 0，而完整修复原本靠
+   *   「明细余额」封顶退款额（min(−balance, 明细)）——明细没了就退不出钱，
+   *   账单会永远停在「已结账、余额 −44」，C 段只能报「需人工核对」。
+   *   兜底口径（未冲销押金流水）只在「明细确实已为 0 且还在欠钱」时介入，
+   *   有明细时的算法一个字节都不变；CLI 不传这个开关，行为保持原样。
+   *
+   * --check 只报告（报告里会写明「待修复 N 处」，且不写库）；init-db 的全新库上
+   * 这张表里没有数据，本段 0 变更直接跳过。
+   */
+  {
+    if (!hasTable("folios") || !hasTable("folio_items") || !hasTable("stays") || !hasTable("payments")) {
+      skipped.push("押金残留（第 24 段：缺表）");
+    } else {
+      const hotelIds = hasTable("hotels") ? all(`SELECT id FROM hotels ORDER BY id`).map((r) => Number(r.id)) : [1];
+      let plannedTotal = 0;
+      let changedTotal = 0;
+      let refundTotal = 0;
+      const detail = [];
+      const needManual = [];
+
+      for (const hid of hotelIds) {
+        const r = repairDepositResidual(db, hid, {
+          apply: !checkOnly,
+          settleOpen: true,
+          zeroedDepositFallback: true,
+        });
+        plannedTotal += r.planned;
+        changedTotal += r.changed;
+        refundTotal += Number(r.totals?.refundCash ?? 0);
+        if (r.planned > 0) {
+          const c = r.checked;
+          detail.push(
+            `#${hid} ${r.planned} 处（退房押金 ${c.folioDeposit} 张 / 仅入住单 ${c.stayOnly} 张 / ` +
+              `OPEN→SETTLED ${c.openSettled} 张 / 余额归零 ${c.balanceRecalc} 张）`
+          );
+        }
+        for (const n of r.notes) needManual.push(`#${hid} ${n}`);
+      }
+
+      if (plannedTotal === 0) {
+        /* 干净库的常态：只占一行 skipped，changed 不加 —— 幂等的证据 */
+        skipped.push("押金残留（第 24 段完整口径）");
+      } else if (checkOnly) {
+        applied.push(
+          `押金残留（第 24 段）：${plannedTotal} 处待修复（退现金 ${refundTotal.toFixed(2)}）—— ${detail.join("；")}`
+        );
+        notes.push(
+          `押金残留：第 23 段提示「需单独跑 node scripts/fix-deposit-residual.mjs --apply」的 ${plannedTotal} 处，` +
+            `第 24 段已接管（本次是 --check，只报告；直接跑 node scripts/migrate-all.mjs 或 ` +
+            `node scripts/post-deploy.mjs --apply 即清零，不用再单独跑那个脚本）`
+        );
+      } else {
+        applied.push(
+          `押金残留（第 24 段）：已修复 ${changedTotal} 处（退现金 ${refundTotal.toFixed(2)}）—— ${detail.join("；")}`
+        );
+        changed += changedTotal;
+        notes.push(
+          `押金残留：第 24 段已自动处理 ${changedTotal} 处，无需再单独跑 scripts/fix-deposit-residual.mjs`
+        );
+      }
+      for (const n of needManual) notes.push(n);
     }
   }
 
