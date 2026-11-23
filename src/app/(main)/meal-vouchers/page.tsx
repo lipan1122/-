@@ -1,5 +1,5 @@
 import { all, get, run } from "@/lib/db";
-import { requireUser } from "@/lib/session";
+import { requirePermissionOrRedirect, requireUser } from "@/lib/session";
 import { revalidatePath } from "next/cache";
 import { todayStr } from "@/lib/utils";
 import { BreakfastBoard } from "@/components/BreakfastBoard";
@@ -43,6 +43,12 @@ export default async function MealVouchersPage({ searchParams }: { searchParams:
   /** 核销今日早餐 */
   async function verifyBreakfast(roomNo: string) {
     "use server";
+    /*
+     * 早餐核销会写 breakfast_records（对客权益 + 营收口径）
+     * 原来只有 requireUser() —— 实测 housekeeping 账号能核销任意房间的早餐。
+     * 归到 cashier.receive（与「餐券核销」页其它核销同口径）。
+     */
+    await requirePermissionOrRedirect("cashier.receive");
     const me = await requireUser();
     const stay = get<{ id: number; guest_name: string | null; breakfast: number | null }>(
       `SELECT s.id, s.guest_name, s.breakfast FROM stays s JOIN rooms r ON r.id = s.room_id
@@ -74,6 +80,8 @@ export default async function MealVouchersPage({ searchParams }: { searchParams:
   /** 购买早餐（给房间加份数） */
   async function buyBreakfast(roomNo: string, qty: number) {
     "use server";
+    /* 加早餐份数会改 stays.breakfast + 写 breakfast_records，同样归收款类权限 */
+    await requirePermissionOrRedirect("cashier.receive");
     const me = await requireUser();
     const stay = get<{ id: number }>(
       `SELECT s.id FROM stays s JOIN rooms r ON r.id = s.room_id

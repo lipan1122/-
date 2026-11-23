@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { all, get, run } from "@/lib/db";
-import { requireUser } from "@/lib/session";
+import { requirePermissionOrRedirect, requireUser } from "@/lib/session";
 import { nowIso } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
@@ -18,6 +18,8 @@ const SIDE_MENU = [
 
 async function saveUpgradeAction(formData: FormData) {
   "use server";
+  /* 房型升级配置（免费升级规则）属门店配置 */
+  await requirePermissionOrRedirect("settings.manage");
   const user = await requireUser();
   const hotelId = user.hotelId;
   const fromType = Number(formData.get("from_type"));
@@ -42,6 +44,7 @@ async function saveUpgradeAction(formData: FormData) {
 
 async function deleteUpgradeAction(formData: FormData) {
   "use server";
+  await requirePermissionOrRedirect("settings.manage");
   const user = await requireUser();
   const id = Number(formData.get("id"));
   if (!id) return;

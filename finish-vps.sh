@@ -114,6 +114,31 @@ fi
 log "数据库概况"
 sqlite3 data/pms.db "SELECT '房间 ' || COUNT(*) || ' 间' FROM rooms; SELECT '用户 ' || COUNT(*) || ' 个' FROM users;" 2>/dev/null || true
 
+# ── 数据收尾：一条命令跑完「修 + 验」 ──
+#
+# 上面三步只解决**结构**。真正让系统能对外服务的是后面这串**数据修复**，
+# 而它们以前全靠部署完手动一条条敲（押金残留 → 房态复位 → 日期滚动 →
+# 超卖修复 → 客史回填 → 体检）。每一步漏掉都是这个项目真实踩过的故障，
+# 详见 deploy-vps.sh 里同一段注释。
+#
+# 退出码：0 全通过 / 1 有残留 / 2 有失败。都不中断部署（服务要能起来），
+# 但 1 和 2 都会打警告，需要人看报告。
+if [ -f scripts/post-deploy.mjs ]; then
+  log "数据收尾：押金/房态/日期/超卖/客史 + 体检（scripts/post-deploy.mjs）"
+  if node scripts/post-deploy.mjs; then
+    log "数据收尾全部通过"
+  else
+    RC=$?
+    if [ "$RC" -ge 2 ]; then
+      warn "收尾有失败项（退出码 $RC），部署继续，但请立刻看上面报告排查"
+    else
+      warn "收尾有数据残留（退出码 $RC），部署继续，数据可能需要人工核对"
+    fi
+  fi
+else
+  warn "scripts/post-deploy.mjs 不存在（老代码？），跳过数据收尾"
+fi
+
 chown -R "$APP_USER":"$APP_USER" "$APP_DIR"
 
 # 数据目录归属必须回到服务用户

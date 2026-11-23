@@ -157,6 +157,43 @@ else
   log "跳过演示数据（需要的话设 PMS_LOAD_DEMO=1 重跑）"
 fi
 
+# ── 数据收尾：一条命令跑完「修 + 验」 ──
+#
+# 上面三步只解决**结构**。真正让系统能对外服务的是后面这串**数据修复**，
+# 而它们以前全靠部署完手动一条条敲，顺序还是口口相传的：
+#
+#   押金残留 → 房态复位 → 演示日期滚动 → 超卖修复 → 客史回填 → 体检
+#
+# 漏哪一步出事，这个项目全都真实发生过：
+#   漏押金修复 → 退房单还挂着押金，在住押金虚高 6800 元
+#   漏日期滚动 → 演示库隔一周，21 张在住单全部「逾期 7~11 天」
+#   漏超卖修复 → /rooms/predict 显示占用 47 > 总房量 46，出租率 102%
+#   漏客史回填 → 在住单没有 guest_id，会员/积分/历史入住全关联不上
+#
+# scripts/post-deploy.mjs 把这串收成固定顺序 + 每步幂等 + 失败不中断 + 最后自体检。
+# 重复执行是安全的：第二次跑应该看到「变更 0 处」。
+#
+# 退出码不能直接交给 set -e 中断部署：
+#   0 = 全通过           → 继续
+#   1 = 有数据残留/脚本缺失 → 继续部署，但要人看一眼（例如演示库的欠费积压本来就该留着）
+#   2 = 有步骤失败/体检严重 → 继续部署（服务能起），但必须立刻排查
+if [ -f scripts/post-deploy.mjs ]; then
+  log "数据收尾：押金/房态/日期/超卖/客史 + 体检（scripts/post-deploy.mjs）"
+  if node scripts/post-deploy.mjs; then
+    log "数据收尾全部通过"
+  else
+    RC=$?
+    if [ "$RC" -ge 2 ]; then
+      warn "收尾有失败项（退出码 $RC），部署继续，但请立刻看上面报告排查"
+    else
+      warn "收尾有数据残留（退出码 $RC），部署继续，数据可能需要人工核对"
+    fi
+  fi
+else
+  warn "scripts/post-deploy.mjs 不存在（老代码？），跳过数据收尾"
+  warn "手动补跑：node scripts/fix-deposit-residual.mjs --apply && node scripts/fix-room-status.mjs --apply"
+fi
+
 # 权限：服务以 $APP_USER 运行，data 目录要可写
 chown -R "$APP_USER":"$APP_USER" "$APP_DIR"
 

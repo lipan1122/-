@@ -1,5 +1,5 @@
 import { all, get, run } from "@/lib/db";
-import { requireUser } from "@/lib/session";
+import { requirePermissionOrRedirect, requireUser } from "@/lib/session";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import ConfirmForm from "@/components/ConfirmForm";
@@ -19,6 +19,8 @@ function backLease(key: "err" | "msg", message: string): never {
 
 async function saveItemAction(formData: FormData) {
   "use server";
+  /* 租借物品的增删改/借出/归还：物品档案属门店配置，与 goods/rental 同口径 */
+  await requirePermissionOrRedirect("settings.manage");
   const user = await requireUser();
   const id = Number(formData.get("id") ?? 0);
   const name = String(formData.get("name") ?? "").trim();
@@ -48,6 +50,8 @@ async function saveItemAction(formData: FormData) {
  */
 async function deleteItemAction(formData: FormData) {
   "use server";
+  /* 租借物品的增删改/借出/归还：物品档案属门店配置，与 goods/rental 同口径 */
+  await requirePermissionOrRedirect("settings.manage");
   const user = await requireUser();
   const id = Number(formData.get("id") ?? 0);
   const reason = String(formData.get("reason") ?? "").trim();
@@ -95,7 +99,8 @@ async function deleteItemAction(formData: FormData) {
 }
 
 async function leaseOutAction(formData: FormData) {
-  "use server";
+  /* 租借物品的增删改/借出/归还：物品档案属门店配置，与 goods/rental 同口径 */
+  await requirePermissionOrRedirect("settings.manage");
   const user = await requireUser();
   const itemId = Number(formData.get("item_id") ?? 0);
   const roomNo = String(formData.get("room_no") ?? "").trim();
@@ -117,6 +122,8 @@ async function leaseOutAction(formData: FormData) {
 
 async function returnAction(formData: FormData) {
   "use server";
+  /* 租借物品的增删改/借出/归还：物品档案属门店配置，与 goods/rental 同口径 */
+  await requirePermissionOrRedirect("settings.manage");
   const user = await requireUser();
   const id = Number(formData.get("id") ?? 0);
   if (!id) return;

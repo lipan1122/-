@@ -110,7 +110,13 @@ type GuestDraft = {
   breakfast: number;
 };
 
-type BookingRow = { id: number; status: string; room_id: number | null };
+type BookingRow = {
+  id: number;
+  status: string;
+  room_id: number | null;
+  /* 预订单价（协议价/会员价/促销价都在这里）—— 入住时必须沿用它，不能换成门市价 */
+  rate: number | null;
+};
 
 export async function checkInAction(
   prevStateOrFormData: CheckInState | FormData,
@@ -361,7 +367,7 @@ export async function checkInAction(
     let booking: BookingRow | undefined;
     if (bookingId) {
       booking = get<BookingRow>(
-        `SELECT id, status, room_id FROM bookings WHERE id = ? AND hotel_id = ?`,
+        `SELECT id, status, room_id, rate FROM bookings WHERE id = ? AND hotel_id = ?`,
         [bookingId, hotelId]
       );
       if (!booking) return { error: "来源预订不存在，请重新进入入住办理" };
@@ -550,7 +556,61 @@ export async function checkInAction(
         const nextStayId =
           get<{ m: number | null }>(`SELECT COALESCE(MAX(id), 0) AS m FROM stays`)?.m ?? 0;
         const stayNo = `SI${nextStayId + 1 + 1000}`;
-        const rate = rateOf(room.base_price, room.room_type_id ?? null);
+        /*
+         * 房价：**优先沿用预订价**，不能静默换成房型门市价
+         *
+         * 原来这里写死 `rateOf(room.base_price, …)` —— 也就是永远用房间的房型基价，
+         * `bookings.rate` 在入住流程里从头到尾没被读过。
+         *
+         * 后果（chk-vps-flow 实测）：建预订 rate=200（房型基价 328）→ 入住后
+         * `stays.rate=328`、加房费 `ROOM 328.00` → 押金 300 时提示「仍有欠款 28，请补收」。
+         * 协议价 / 会员价 / 促销价 / 手工改价在入住那一瞬间全部被抹掉，对客报价与账单不一致。
+         *
+         * 取值顺序：
+         *   1. 该房间的预订明细价（`booking_rooms.rate`，多房订单每间可能不同价）
+         *   2. 预订单价（`bookings.rate`）
+         *   3. 房型门市价（`rateOf(base_price)`，散客步入没有预订时走这条）
+         */
+        const bookingRate =
+          booking?.rate != null && Number(booking.rate) > 0
+            ? Number(booking.rate)
+            : null;
+        const detailRate = (() => {
+          if (!booking) return null;
+          try {
+            /*
+             * 明细价：按「本次入住的这间房」找 booking_rooms 那一行。
+             * 先按 room_id 精确匹配；没排房的明细（room_id 为空）按顺序取一条未使用的。
+             */
+            const byRoom = get<{ rate: number | null }>(
+              `SELECT rate FROM booking_rooms
+                WHERE hotel_id = ? AND booking_id = ? AND room_id = ?
+                  AND status IN ('PENDING','CONFIRMED')
+                ORDER BY id LIMIT 1`,
+              [hotelId, booking.id, room.id]
+            );
+            if (byRoom?.rate != null && Number(byRoom.rate) > 0) return Number(byRoom.rate);
+            const anyDetail = get<{ rate: number | null }>(
+              `SELECT rate FROM booking_rooms
+                WHERE hotel_id = ? AND booking_id = ?
+                  AND status IN ('PENDING','CONFIRMED')
+                  AND (room_id IS NULL OR room_id = 0)
+                  AND rate IS NOT NULL AND rate > 0
+                ORDER BY id LIMIT 1`,
+              [hotelId, booking.id]
+            );
+            return anyDetail?.rate != null && Number(anyDetail.rate) > 0 ? Number(anyDetail.rate) : null;
+          } catch {
+            /* 老库没有 rate 列：回退到主单价 */
+            return null;
+          }
+        })();
+        const rate =
+          detailRate != null
+            ? round2(detailRate)
+            : bookingRate != null
+              ? round2(bookingRate)
+              : rateOf(room.base_price, room.room_type_id ?? null);
 
         const stayId = run(
           `INSERT INTO stays
