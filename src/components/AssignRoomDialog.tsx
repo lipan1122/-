@@ -24,6 +24,12 @@ export type RoomOption = {
   id: number;
   roomNo: string;
   status: string;
+  /**
+   * 房间的**实际**房型 id。
+   * 明细级排房要求「候选房房型 == 该明细预订的房型」（action 会拒绝跨房型），
+   * 所以明细行要用它过滤候选房；主单级仍可跨房型（升级排房）。
+   */
+  roomTypeId?: number;
   /** 房型名 + 是否属于升级房型（同房型为空时才能选） */
   roomTypeName?: string;
   upgradable?: boolean;
@@ -42,6 +48,17 @@ export type PendingBooking = {
    * 所以页面用 `rowKey`（如 `612#2`）区分行；老调用方不传时退回 String(id)，行为不变。
    */
   rowKey?: string;
+  /**
+   * 明细级排房的定位键：`booking_rooms.id`。
+   *
+   * 有值 → 提交时带上 bookingRoomId，服务端只把房间写到这一行明细上
+   *        （多房订单的「第 2 间」「第 3 间」各自落各自的明细）；
+   * 空   → 这一行没有对应明细（room_count 差额补出来的虚拟行 / 迁移前的老订单），
+   *        提交时不带定位键，服务端按主单级老行为处理。
+   */
+  detailId?: number | null;
+  /** 该行预订的房型 id：明细行据此只列同房型候选房 */
+  roomTypeId?: number | null;
   bookingNo: string;
   channelName: string;
   channelOrderNo: string;
@@ -60,6 +77,23 @@ export type PendingBooking = {
 /** 行级键：有 rowKey 用 rowKey，否则退回订单 id（单行/老数据） */
 function rowKeyOf(b: PendingBooking): string {
   return b.rowKey && b.rowKey.length > 0 ? b.rowKey : String(b.id);
+}
+
+/** 这一行是不是「明细级」（能指名到 booking_rooms 的某一行） */
+function isDetailRow(b: PendingBooking): boolean {
+  return typeof b.detailId === "number" && b.detailId > 0;
+}
+
+/**
+ * 该行可选的候选房。
+ *
+ * 明细级：只留同房型。服务端对明细级排房**不放过跨房型**（房型必须与明细一致），
+ *        把升级房列出来只会让人选中后保存报错，所以这里直接不列。
+ * 主单级：沿用老口径 —— 跨房型视为升级排房，允许选（下拉里标「升级 xx」）。
+ */
+function roomOptionsFor(b: PendingBooking): RoomOption[] {
+  if (!isDetailRow(b) || !b.roomTypeId) return b.rooms;
+  return b.rooms.filter((r) => r.roomTypeId === undefined || r.roomTypeId === b.roomTypeId);
 }
 
 const COL_W = { check: 36, channel: 46, orderNo: 102, guest: 64, type: 68, count: 34, stay: 124, latest: 68, action: 65 };
@@ -162,7 +196,14 @@ export default function AssignRoomDialog({
     }
   }, [checkedCount, bookings.length, open]);
 
-  /** 提交给 action 的行：勾选 + 已选房（bookingId 仍是真实订单 id，rowKey 只用于区分弹窗里的行） */
+  /**
+   * 提交给 action 的行：勾选 + 已选房。
+   *
+   * 「主单级」和「明细级」的区别就在这一行 payload 上：
+   *   · 明细行（有 detailId）：带上 bookingRoomId → 服务端只写这一行明细；
+   *   · 虚拟行 / 老数据（无 detailId）：只带 bookingId + roomId → 服务端按主单级老行为处理。
+   * 注意 bookingId 仍然是真实订单 id（多行共享），rowKey 只用于区分弹窗里的行。
+   */
   const payload = useMemo(
     () =>
       bookings
@@ -170,7 +211,14 @@ export default function AssignRoomDialog({
           const key = rowKeyOf(b);
           return checked[key] === true && typeof roomOf[key] === "number";
         })
-        .map((b) => ({ bookingId: b.id, roomId: roomOf[rowKeyOf(b)] as number })),
+        .map((b) => {
+          const row: { bookingId: number; roomId: number; bookingRoomId?: number } = {
+            bookingId: b.id,
+            roomId: roomOf[rowKeyOf(b)] as number,
+          };
+          if (isDetailRow(b)) row.bookingRoomId = b.detailId as number;
+          return row;
+        }),
     [bookings, checked, roomOf]
   );
 
@@ -210,7 +258,7 @@ export default function AssignRoomDialog({
     const nextChecked: Record<string, boolean> = { ...checked };
 
     for (const b of bookings) {
-      const pick = b.rooms.find((r) => !used.has(r.id));
+      const pick = roomOptionsFor(b).find((r) => !used.has(r.id));
       if (!pick) continue;
       used.add(pick.id);
       nextRoom[rowKeyOf(b)] = pick.id;
@@ -225,7 +273,11 @@ export default function AssignRoomDialog({
     const key = rowKeyOf(booking);
     const el = selectRefs.current.get(key);
     if (!el || el.disabled) {
-      setError(`${booking.guestName || booking.bookingNo} 的 ${booking.roomTypeName} 在该日期区间没有空房，可在下拉里选其他房型（升级排房）`);
+      setError(
+        isDetailRow(booking)
+          ? `${booking.guestName || booking.bookingNo}（${booking.roomTypeName}）在该日期区间没有同房型的空房 —— 逐间排房不允许跨房型，要升级房型请到预订里排房`
+          : `${booking.guestName || booking.bookingNo} 的 ${booking.roomTypeName} 在该日期区间没有空房，可在下拉里选其他房型（升级排房）`
+      );
       return;
     }
     setError("");
@@ -369,7 +421,12 @@ export default function AssignRoomDialog({
                 {bookings.map((b) => {
                   const key = rowKeyOf(b);
                   const roomId = roomOf[key];
-                  const noRoom = b.rooms.length === 0;
+                  /*
+                   * 候选房按行取：明细行只留同房型，主单级沿用「升级房也可选」的老口径。
+                   * 空列表 = 该行在本区间没有可分房（明细行还多一条「不跨房型」的限制）。
+                   */
+                  const options = roomOptionsFor(b);
+                  const noRoom = options.length === 0;
                   return (
                     <tr key={key} className="hover:bg-[#fafafa]" style={{ borderBottom: `1px solid ${LINE}` }}>
                       {/* 复选框 */}
@@ -422,7 +479,11 @@ export default function AssignRoomDialog({
                         {noRoom ? (
                           <span
                             className="text-[12px] text-[#999]"
-                            title={`${b.roomTypeName} 在该日期区间没有空净/空脏房可分`}
+                            title={
+                              isDetailRow(b)
+                                ? `${b.roomTypeName} 在该日期区间没有同房型的空净/空脏房（逐间排房不允许跨房型）`
+                                : `${b.roomTypeName} 在该日期区间没有空净/空脏房可分`
+                            }
                           >
                             -
                           </span>
@@ -437,7 +498,7 @@ export default function AssignRoomDialog({
                             className="h-6 w-full cursor-pointer rounded-[2px] border border-transparent bg-transparent px-1 text-center text-[12px] text-[#333] outline-none transition-colors hover:border-[#d9d9d9] focus:border-[#3bd943] focus:bg-white"
                           >
                             <option value="">-</option>
-                            {b.rooms.map((r) => (
+                            {options.map((r) => (
                               <option key={r.id} value={r.id}>
                                 {r.roomNo}
                                 {r.status === "VD" ? "（脏）" : ""}

@@ -8,9 +8,29 @@
  *
  * ── 演示数据包含什么 ──
  *   46 间客房（8 个房型，含 2 间维修房）
- *   588 条预订（PENDING / CONFIRMED / CHECKED_IN / CHECKED_OUT / CANCELLED / NOSHOW）
- *   200 张入住单、200 张账单、205 条收款流水
- *   45 个客人档案、会员储值、AR 应收、68 张报表都有数据
+ *   831 条预订、384 张入住单、384 张账单、397 条收款流水、45 个客人档案
+ *   25 张在住单（今日应退 1 + 未到期 24）、会员储值、AR 应收 23 行、报表都有数据
+ *
+ * ── 这个包怎么来的（别手工 gzip）──
+ *   `node scripts/build-demo-db.mjs`
+ *     1. 从当前真库 VACUUM INTO 一致性快照
+ *     2. 清掉「DEMO 前缀」的冒烟 / 均匀补数据单（口径见 scripts/demo-data-filter.mjs）
+ *     3. 用 seed-uniform-demo.mjs 按**打包当天**重新补近 61 天的均匀数据
+ *     4. VACUUM INTO 单文件成品 → gzip 覆盖 scripts/demo-data/pms-demo.db.gz
+ *     5. 自检四条硬指标（逾期 0 / nights 不符 0 / 零额押金 0 / ar_ledgers 23），
+ *        任何一条不过就不写盘
+ *   验收：`node scripts/verify-demo-data.mjs --db scripts/demo-data/pms-demo.db.gz`
+ *
+ *   ⚠ 整库包里的日期是**打包当天**的绝对日期（.db 不像 SQL 那样能在导入时滚动）。
+ *     包放久了，在住单会逐天变成「逾期未离店」，报表/夜审跟着虚高 —— 这是包放旧了，
+ *     不是数据坏了，重新跑一次 build-demo-db.mjs 即可把日期锚点刷到当天。
+ *     只想刷新日期而不重新打包，也可以直接 `node scripts/roll-demo-dates.mjs --apply`
+ *     （只滚种子入住单）＋ `node scripts/seed-uniform-demo.mjs`（补均匀数据）。
+ *
+ * ── 导入后不需要再跑迁移 ──
+ *   包本身是当前 schema 的完整快照（93 张表，含所有索引/触发器/视图），
+ *   解压覆盖即可直接用：不用 `npm run db:migrate`，也不用 `npm run db:seed`。
+ *   本脚本只做三件事：备份旧库 → 解压覆盖 → 把 4 个演示账号密码重置成已知口令。
  *
  * ── 安全说明 ──
  * 包里所有客人姓名/手机号/证件号都是**虚构的**（张伟 13800001111 这类）。

@@ -305,6 +305,8 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
    * 明细表是老库的迁移表，缺表时按「没有明细」降级，不能让整页报错。
    */
   type BookingDetailRow = {
+    /** booking_rooms.id：弹窗按「明细级」排房时要指名到这一行 */
+    id: number;
     booking_id: number;
     room_id: number | null;
     room_type_id: number | null;
@@ -314,7 +316,7 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
   const bookingDetails: BookingDetailRow[] = (() => {
     try {
       return all<BookingDetailRow>(
-        `SELECT br.booking_id, br.room_id, br.room_type_id,
+        `SELECT br.id, br.booking_id, br.room_id, br.room_type_id,
                 COALESCE(substr(br.check_in_date, 1, 10), b.check_in_date) AS check_in_date,
                 COALESCE(substr(br.check_out_date, 1, 10), b.check_out_date) AS check_out_date
            FROM booking_rooms br
@@ -358,9 +360,11 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
    *   「预订房型」列显示「房型 · 第 i/N 间（已排 8201）」，把「这间在订单里排第几、这张单已排掉哪几间」讲清楚；
    *   渠道订单号列在渠道单号为空时回落到内部订单号，保证 BK-MULTI3 这类手工单也有单号可核对。
    *
-   * ⚠️ 仍然不改「分配房间」的候选口径：候选房 SQL 只给「主单 room_id 为空」的订单
-   *    （assignRoomsAction 也只接受这类订单）。所以主单已排房的多房订单在弹窗里能看到、
-   *    但那几间不能在弹窗内落库 —— 硬塞候选房会让保存整批报错，反而排不了任何单。
+   * ── 能不能直接落库（本次已补齐）──
+   *   原来「分配房间」的候选房 SQL 只给「主单 room_id 为空」的订单，assignRoomsAction 也只认这类订单，
+   *   所以主单已填首间的多房订单在弹窗里「看得到、排不了」。
+   *   现在：候选房按「还有未排明细」出（见下面的 optionRows），
+   *   每行带上 detailId，提交时走 assignRoomsAction 的**明细级**分支 —— 只写指定的那一行明细。
    */
   const typeNameById = new Map<number, string>(roomTypes.map((t) => [t.id, t.name]));
   const roomNoById = new Map<number, string>(allRooms.map((r) => [r.id, r.room_no]));
@@ -412,6 +416,13 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
     checkIn: string;
     checkOut: string;
     roomTypeId: number | null;
+    /**
+     * 明细行 id（booking_rooms.id）。
+     *
+     * 有值 = 弹窗这一行能按「明细级」落库（assignRoomsAction 的 bookingRoomId）；
+     * 空 = 由 room_count 差额补出来的虚拟行 / 迁移前没有明细的老单 —— 只能走主单级老行为。
+     */
+    detailId: number | null;
     /** 本单内第几间（1-based） */
     index: number;
     /** 本单共几间 */
@@ -442,6 +453,7 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
           checkIn: b.check_in_date,
           checkOut: b.check_out_date,
           roomTypeId: b.room_type_id,
+          detailId: null, // 没有明细行：只能主单级排房
           index,
           total: roomCount,
           virtual: true,
@@ -464,6 +476,8 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
         checkIn: det.check_in_date ?? b.check_in_date,
         checkOut: det.check_out_date ?? b.check_out_date,
         roomTypeId: det.room_type_id ?? b.room_type_id,
+        /* 真明细行：这一行是「可以按明细级落库」的那一间 */
+        detailId: det.id,
         index,
         total: totalUnits,
         virtual: false,
@@ -482,6 +496,7 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
           checkIn: b.check_in_date,
           checkOut: b.check_out_date,
           roomTypeId: b.room_type_id,
+          detailId: null, // 差额补出来的虚拟间：只能主单级（action 会补一条明细）
           index,
           total: totalUnits,
           virtual: true,
@@ -497,8 +512,35 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
       a.index - b.index
   );
 
-  const optionRows = all<{ booking_id: number; room_id: number; room_no: string; status: string; room_type_name: string; upgradable: number }>(
-    `SELECT b.id AS booking_id, r.id AS room_id, r.room_no, r.status,
+  /*
+   * 候选房（每张订单一份，弹窗里按行取用）
+   *
+   * ── 本次修复：多房订单也要有候选房 ──
+   * 原来这里写死 `AND (b.room_id IS NULL OR b.room_id = 0)`，只给「主单完全没排房」的订单出候选房。
+   * BK-MULTI3（room_count=3、主单 room_id=8201、明细 1 已排 + 2 待排）因此候选房为空：
+   * 弹窗里「分配房间」列显示「-」，「去排房」只会提示「该日期区间没有空房」——
+   * 而实际上 11-25~11-27 有 11 间同房型的空净/空脏房。
+   *
+   * 现在改成「还有待分房单位的订单都出候选房」：
+   *   · 有未排房的明细（PENDING/CONFIRMED 且 room_id 为空）→ 是
+   *   · 完全没明细的老订单                                     → 是（主单级兜底）
+   *   · 明细已排满的订单                                       → 否（没有什么可排的了）
+   *
+   * 另外把「明细占用」这一段的 JOIN bookings ob + ob.status 条件去掉了：
+   * 必须连**本订单自己**已排掉的房一起排除。BK-MULTI3 是 PENDING 状态，
+   * 它自己那条 CONFIRMED 明细（8201）在原来的条件下不算占用，
+   * 于是 8201 会出现在自己的候选列表里 —— 选了就会撞占房唯一索引，整批回滚。
+   */
+  const optionRows = all<{
+    booking_id: number;
+    room_id: number;
+    room_no: string;
+    status: string;
+    room_type_id: number;
+    room_type_name: string;
+    upgradable: number;
+  }>(
+    `SELECT b.id AS booking_id, r.id AS room_id, r.room_no, r.status, r.room_type_id,
             rt.name AS room_type_name,
             CASE WHEN r.room_type_id = b.room_type_id THEN 0 ELSE 1 END AS upgradable
        FROM bookings b
@@ -506,8 +548,20 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
        JOIN room_types rt ON rt.id = r.room_type_id
       WHERE b.hotel_id = ?
         AND b.status IN ('PENDING','CONFIRMED')
-        AND (b.room_id IS NULL OR b.room_id = 0)
         AND r.status IN ('VC','VD')
+        /* 只给「还有待分房单位」的订单出候选房（明细未排 / 老单根本没有明细） */
+        AND (
+          EXISTS (
+            SELECT 1 FROM booking_rooms pd
+             WHERE pd.hotel_id = b.hotel_id AND pd.booking_id = b.id
+               AND pd.status IN ('PENDING','CONFIRMED')
+               AND (pd.room_id IS NULL OR pd.room_id = 0)
+          )
+          OR NOT EXISTS (
+            SELECT 1 FROM booking_rooms pa
+             WHERE pa.hotel_id = b.hotel_id AND pa.booking_id = b.id
+          )
+        )
         AND NOT EXISTS (
           SELECT 1 FROM stays s
            WHERE s.hotel_id = b.hotel_id AND s.room_id = r.id AND s.status = 'INHOUSE'
@@ -524,15 +578,17 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
          * 第 4 轮 P1-38：还要查 booking_rooms 明细
          * 多房订单主单 room_id 通常只指一间，其余房间在明细表里；
          * 不查明细会让已被占用的房间出现在候选列表里，选了才报冲突。
-         * 同时把 PENDING（未排房、物理没占）从上面的判断里去掉了。
+         * 注意这里**不排除本订单**（也不看对方主单状态）：
+         *   · 本单已排的那几间（哪怕主单还是 PENDING）不能再分给自己；
+         *   · CHECKED_IN 明细在退房后仍挂着 room_id，但它的日期区间已过去，
+         *     区间条件 br.check_in_date < b.check_out_date AND br.check_out_date > b.check_in_date
+         *     保证只排除真正重叠的那段。
          */
         AND NOT EXISTS (
           SELECT 1 FROM booking_rooms br
-            JOIN bookings ob ON ob.id = br.booking_id AND ob.hotel_id = br.hotel_id
            WHERE br.hotel_id = b.hotel_id AND br.room_id = r.id
              AND br.status IN ('CONFIRMED','CHECKED_IN')
-             AND ob.status IN ('CONFIRMED','CHECKED_IN')
-             AND ob.check_in_date < b.check_out_date AND ob.check_out_date > b.check_in_date
+             AND br.check_in_date < b.check_out_date AND br.check_out_date > b.check_in_date
         )
       ORDER BY upgradable, r.room_no`,
     [hotelId]
@@ -540,7 +596,14 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
 
   const roomsByBooking = new Map<
     number,
-    { id: number; roomNo: string; status: string; roomTypeName?: string; upgradable?: boolean }[]
+    {
+      id: number;
+      roomNo: string;
+      status: string;
+      roomTypeId: number;
+      roomTypeName?: string;
+      upgradable?: boolean;
+    }[]
   >();
   for (const o of optionRows) {
     const list = roomsByBooking.get(o.booking_id) ?? [];
@@ -548,6 +611,8 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
       id: o.room_id,
       roomNo: o.room_no,
       status: o.status,
+      /* 房间实际房型：明细级排房要求与明细房型一致（弹窗按它筛同房型候选房） */
+      roomTypeId: o.room_type_id,
       roomTypeName: o.room_type_name,
       upgradable: Number(o.upgradable) === 1,
     });
@@ -559,8 +624,9 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
    *
    * · roomCount 固定 1：一行就是一间，避免「3 行 × 房间数 3 = 9 间」的误读；
    *   这张单总共有几间写在「预订房型」列的「第 i/N 间」里。
-   * · 候选房仍然取 roomsByBooking（只覆盖主单未排房的订单）。主单已排房的多房订单
-   *   在这里没有候选房 —— 它的剩余间由订单详情排房，弹窗只负责「让人看得到是谁的」。
+   * · 候选房取 roomsByBooking（已覆盖「主单填了首间、但还有未排明细」的多房订单）。
+   * · 每行带上 detailId：有真明细行 → 按明细级落库（只排这一间）；
+   *   虚拟行（room_count 差额补出来的）没有 detailId → 按主单级老行为落库。
    */
   const pendingBookings: PendingBooking[] = pendingUnits.slice(0, PROMPT_LIMIT).map((u) => {
     const b = u.booking;
@@ -571,6 +637,10 @@ export default async function ForecastPage({ searchParams }: { searchParams: Pro
       id: b.id,
       /* 行级唯一键：一张多房订单会展开成多行（共享同一个 id），弹窗靠它区分勾选/选房 */
       rowKey: `${b.id}#${u.index}${u.virtual ? "v" : "d"}`,
+      /* 明细级排房的定位键（空 = 这一行没有明细，走主单级） */
+      detailId: u.detailId,
+      /* 该行预订房型：明细行据此只列同房型候选房 */
+      roomTypeId: u.roomTypeId,
       bookingNo: b.booking_no,
       channelName: (b.channel_name ?? "").trim(),
       /* 渠道单号为空时回落到内部订单号：手工单 / 演示单只有 booking_no，空着就没法核对 */

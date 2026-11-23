@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { nonCompanyArTotal } from "@/lib/ar";
 import { all } from "@/lib/db";
 import { requireUser } from "@/lib/session";
 import { csvNumberCell, csvTextCell, fmtMoney, round2, todayStr } from "@/lib/utils";
@@ -114,6 +115,28 @@ export default async function FinancePage() {
   const guestDebtTotal = round2(guestDebtRows.reduce((sum, r) => sum + Number(r.balance ?? 0), 0));
 
   /*
+   * 口径差说明（财务必问的那一个问题：本页 ¥90,600，/ar 却是 ¥105,740）
+   *
+   * 两个数都不是错，覆盖范围不同：
+   *   · 本页「应收总额」← ar_ledgers 笔级台账，ar_ledgers.company_id NOT NULL，
+   *     所以只覆盖**协议单位**；每一笔都能对应到 unit + 账单 + 到期日。
+   *   · /ar「账户总账」← SUM(ar_accounts.balance)，还包含没有绑定 company_id 的
+   *     往来账户（携程预付 / 内部挂账这类），它们在笔级台账里没有行 —— 是设计如此。
+   * 差额就是下面这个非协议单位余额合计。原来页面上不作任何说明，财务只能自己猜；
+   * 现在动态算出来写在卡片下面，并链到 /ar，让人一眼看到「差在哪、去哪看」。
+   *
+   * 动态计算（不硬编码）：数据一变说明行跟着变；非协议单位没有余额时整行不渲染。
+   */
+  const nonCompany = nonCompanyArTotal(user.hotelId);
+  const nonCompanyNames =
+    nonCompany.accounts.length <= 3
+      ? nonCompany.accounts.map((a) => a.name).join(" / ")
+      : `${nonCompany.accounts
+          .slice(0, 3)
+          .map((a) => a.name)
+          .join(" / ")} 等 ${nonCompany.accounts.length} 个账户`;
+
+  /*
    * 导出：服务端生成 CSV，通过 data URL 直接下载，无需额外路由
    *
    * 整改清单 P1-25：CSV 公式注入——序列化细节见 @/lib/utils 的 csvTextCell /
@@ -184,6 +207,23 @@ export default async function FinancePage() {
           </div>
         ))}
       </div>
+
+      {/*
+        卡片下方的口径说明：本页只算协议单位（ar_ledgers），
+        非协议单位往来账户（无 company_id）在 /ar 账户总账里，显式说明差额并给出入口。
+        数据驱动：没有非协议单位余额时整行不显示，不留一条「¥0」的噪音。
+      */}
+      {nonCompany.accounts.length > 0 && nonCompany.total > 0.005 && (
+        <p className="text-[11px] leading-5 text-gray-400">
+          另有非协议单位往来账户{" "}
+          <b className="tabular-nums text-gray-500">{fmtMoney(nonCompany.total)}</b>
+          （{nonCompanyNames}），不计入本表 —— 见「
+          <Link href="/ar" className="text-brand-600 hover:underline">
+            应收管理
+          </Link>
+          」
+        </p>
+      )}
 
       <div className="card overflow-x-auto">
         <div className="flex items-center justify-between border-b border-gray-100 px-4 py-2.5">

@@ -1243,3 +1243,151 @@ export function listArLedgerDrift(hotelId: number): ArLedgerDriftRow[] {
     };
   });
 }
+
+/* ------------------------------------------------------------------ *
+ * 两个口径差：非协议单位往来账户（只读）
+ *
+ * ── 为什么需要这个 ──
+ * 页面上有两个不同的「应收」数字，差出来的那一块必须在页面上讲清楚：
+ *   · /finance「协议单位应收」← ar_ledgers 笔级台账（company_id NOT NULL，只覆盖协议单位）
+ *   · /ar 账户总账           ← SUM(ar_accounts.balance)（含无 company_id 的往来账户）
+ * ar_ledgers.company_id 是 NOT NULL，所以挂账客户 / 内部往来这类没有协议单位的账户
+ * 天然不会进笔级台账 —— 不是漏记，是两个概念的覆盖范围不同。
+ *
+ * 差值 = 未绑定协议单位的账户余额合计，正是下面 nonCompanyArTotal 的口径。
+ * 只读：不建表、不写数据；ar_accounts 尚不存在（全新库）时返回空。
+ * ------------------------------------------------------------------ */
+
+/** 非协议单位往来账户的余额合计与明细 */
+export type ArNonCompanyTotal = {
+  /** 未绑定协议单位的账户余额合计（与 /ar 账户总账同口径，含负数，可能为负） */
+  total: number;
+  /** 其中余额为正的账户（说明文案里列名字只用这些） */
+  accounts: { code: string; name: string; balance: number }[];
+};
+
+/**
+ * 非协议单位往来账户余额
+ *
+ * 判据：`ar_accounts.company_id IS NULL` —— 没有绑定协议单位的账户。
+ * 不按 `type` 过滤：AR004「携程预付」的 type 是「挂账客户」、AR005「内部挂账」是「内部」，
+ * 用 type 判会漏；而 company_id 为空的补集正好等于「不在 ar_ledgers 覆盖范围内」。
+ * 不过滤 status：/ar 账户总账把停用账户也列出来，两边口径必须一致才谈得上差额。
+ */
+export function nonCompanyArTotal(hotelId: number): ArNonCompanyTotal {
+  const exists = get<{ n: number }>(
+    `SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'ar_accounts'`
+  );
+  if (Number(exists?.n ?? 0) === 0) return { total: 0, accounts: [] };
+
+  const rows = all<{ code: string; name: string; balance: number | null }>(
+    `SELECT code, name, COALESCE(balance, 0) AS balance
+       FROM ar_accounts
+      WHERE hotel_id = ? AND company_id IS NULL
+      ORDER BY balance DESC, id ASC`,
+    [hotelId]
+  );
+
+  const accounts = rows
+    .map((r) => ({
+      code: String(r.code ?? ""),
+      name: String(r.name ?? ""),
+      balance: round2(Number(r.balance ?? 0)),
+    }))
+    .filter((r) => r.balance > EPS);
+
+  return {
+    total: round2(rows.reduce((sum, r) => sum + Number(r.balance ?? 0), 0)),
+    accounts,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * AR 账龄明细（只读）：报表「AR账龄报表」的数据源
+ *
+ * ── 为什么不用 listArAging ──
+ * listArAging 只返回四个分档的**合计**，没有单位、没有笔、没有到期日，
+ * 财务报表要「哪家单位欠了多久」就必须有逐笔明细。
+ * 这里在同一个口径（ar_ledgers 未结余额、账龄 = 今天 − biz_date）上补明细，
+ * 分档边界直接复用本文件的 bucketIndex，因此逐笔加起来必定等于 listArAging 的合计。
+ * ------------------------------------------------------------------ */
+
+/** AR 账龄明细行 */
+export type ArAgingDetailRow = {
+  id: number;
+  companyId: number;
+  companyName: string;
+  folioNo: string | null;
+  bizDate: string;
+  dueDate: string | null;
+  amount: number;
+  settledAmount: number;
+  outstanding: number;
+  status: string;
+  /** 账龄天数 = 今天 − 挂账营业日 */
+  ageDays: number;
+  /** 分档下标（0–30 / 31–60 / 61–90 / 90+） */
+  bucketIndex: number;
+  /** 分档名称，与本文件 AGING_BUCKETS 一致 */
+  bucketLabel: string;
+  /** 超过账期到期日的天数（未到期为 0） */
+  overdueDays: number;
+};
+
+/**
+ * 未结 AR 台账逐笔明细（报表账龄明细用）
+ *
+ * 口径与 listArAging 完全一致：只看 OPEN / PARTIAL 且未结余额 > 0.001 的台账，
+ * 账龄按业务发生日 biz_date 算。因此 `按 bucketIndex 汇总 = listArAging()`。
+ */
+export function listArAgingDetail(hotelId: number): ArAgingDetailRow[] {
+  ensureArLedgerSchema();
+
+  const rows = all<{
+    id: number;
+    company_id: number;
+    company_name: string | null;
+    folio_no: string | null;
+    biz_date: string;
+    due_date: string | null;
+    amount: number;
+    settled_amount: number | null;
+    status: string;
+  }>(
+    `SELECT l.id, l.company_id, c.name AS company_name, l.folio_no, l.biz_date, l.due_date,
+            l.amount, l.settled_amount, l.status
+       FROM ar_ledgers l
+       LEFT JOIN companies c ON c.id = l.company_id AND c.hotel_id = l.hotel_id
+      WHERE l.hotel_id = ?
+        AND l.status IN ('OPEN', 'PARTIAL')
+        AND l.amount - COALESCE(l.settled_amount, 0) > 0.001
+      ORDER BY l.biz_date ASC, l.id ASC`,
+    [hotelId]
+  );
+
+  const today = todayStr();
+  return rows.map((r) => {
+    const bizDate = String(r.biz_date ?? today);
+    const ageDays = daysBetween(bizDate, today);
+    const idx = bucketIndex(ageDays);
+    const dueDate = r.due_date ? String(r.due_date) : null;
+    const amount = round2(Number(r.amount ?? 0));
+    const settledAmount = round2(Number(r.settled_amount ?? 0));
+    return {
+      id: Number(r.id),
+      companyId: Number(r.company_id),
+      companyName: r.company_name ?? `协议单位#${r.company_id}`,
+      folioNo: r.folio_no ? String(r.folio_no) : null,
+      bizDate,
+      dueDate,
+      amount,
+      settledAmount,
+      outstanding: round2(amount - settledAmount),
+      status: String(r.status ?? ""),
+      ageDays,
+      bucketIndex: idx,
+      bucketLabel: AGING_BUCKETS[idx],
+      overdueDays: dueDate ? Math.max(0, daysBetween(dueDate, today)) : 0,
+    };
+  });
+}

@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import Link from "next/link";
 import { redirect } from "next/navigation";
-import { ensureArAccountSchema, listArLedgerDrift } from "@/lib/ar";
+import { ensureArAccountSchema, listArAgingDetail, listArLedgerDrift } from "@/lib/ar";
 import { all, get } from "@/lib/db";
 import {
   nightSeries,
@@ -77,7 +77,10 @@ const REPORTS: Record<string, ReportMeta> = {
   "credit-guests": { label: "挂账客人报表", desc: "在住及已离店仍有挂账余额的客人清单与账龄" },
   "goods-range": { label: "小商品区间报表", desc: "区间内商超小商品逐条销售流水（日期 / 商品 / 房号 / 金额）" },
   "goods-sales": { label: "小商品销售报表", desc: "按商品名汇总销量、金额与收入占比" },
-  "ar-age": { label: "AR账龄报表", desc: "未结账账单按 0-30 / 31-60 / 60+ 天分档的应收账龄" },
+  "ar-age": {
+    label: "AR账龄报表",
+    desc: "协议单位应收台账（ar_ledgers）按 0-30 / 31-60 / 61-90 / 90+ 天分档，按单位分组",
+  },
   "ar-happen": { label: "AR发生汇总报表", desc: "逐日挂账建账、还款核销与未收余额" },
   "ar-account": { label: "AR账报表", desc: "每个协议单位的建账、已收、余额与授信占用" },
   "salesman-detail": { label: "销售员业绩明细表", desc: "按销售员展开的订单明细与小计" },
@@ -1817,39 +1820,11 @@ function goodsSalesAgg(hotelId: number, from: string, to: string): GoodsSalesRow
   );
 }
 
-/* ---------- 5. AR账龄报表 ---------- */
-type ArAgeRow = {
-  id: number;
-  folio_no: string;
-  guest_name: string;
-  room_no: string;
-  total_amount: number;
-  paid_amount: number;
-  balance: number;
-  stay_status: string;
-  created_date: string | null;
-  age: number;
-};
-
-function arAgeRows(hotelId: number): ArAgeRow[] {
-  return all<ArAgeRow>(
-    `SELECT f.id,
-            COALESCE(f.folio_no, '') AS folio_no,
-            COALESCE(f.guest_name, '') AS guest_name,
-            COALESCE(f.room_no, '') AS room_no,
-            COALESCE(f.total_amount, 0) AS total_amount,
-            COALESCE(f.paid_amount, 0) AS paid_amount,
-            COALESCE(f.balance, 0) AS balance,
-            COALESCE(s.status, '') AS stay_status,
-            date(f.created_at, '+8 hours') AS created_date,
-            CAST(julianday(date('now', '+8 hours')) - julianday(date(f.created_at, '+8 hours')) AS INTEGER) AS age
-     FROM folios f
-     LEFT JOIN stays s ON s.id = f.stay_id
-     WHERE f.hotel_id = ? AND f.status = 'OPEN' AND COALESCE(f.balance, 0) > 0.005
-     ORDER BY age DESC, balance DESC`,
-    [hotelId]
-  );
-}
+/* ---------- 5. AR账龄报表 ----------
+ * 数据源已迁到 lib/ar 的 listArAgingDetail（ar_ledgers 协议单位台账），
+ * 原来这里查 folios 的 arAgeRows 已删除 —— 理由见下面第 31 节 ReportArAge 的注释。
+ * 客人欠费账龄仍在「催账报表」(quick-dun) 与「挂账客人报表」(credit-guests) 里。
+ */
 
 /* ---------- 6. AR发生汇总报表 ---------- */
 type ArHappenRow = {
@@ -6043,52 +6018,115 @@ function ReportGoodsSales({ ctx }: ReportProps) {
   );
 }
 
-/* -------------------- 31. AR账龄报表 -------------------- */
+/* -------------------- 31. AR账龄报表（协议单位应收台账） -------------------- */
+
+/*
+ * ── 为什么换数据源（改前查的是 folios）──
+ * 改前本组件调 arAgeRows()：FROM folios f LEFT JOIN stays s ... WHERE f.status='OPEN'
+ * AND balance > 0.005 —— 那是「客人在住欠费」，人还住在店里、账没结清，退房必须收款。
+ * 而系统里「AR」的定义是「协议单位应收」：ar_accounts 账户总账 + ar_ledgers 笔级台账。
+ * 两个概念混在一张报表里，用户点「AR账龄」看到的是客人欠了多久，协议单位欠款一笔
+ * 都不出现；报表名字与数据源对不上，是这次要修的根因。
+ *
+ * 换源后的口径（与 lib/ar 的 listArAging 完全一致，逐笔加总必等于其四档合计）：
+ *   · 数据源 ar_ledgers：只要 OPEN / PARTIAL 且未结余额 > 0 的笔级挂账；
+ *   · 账龄 = 今天 − 营业日 biz_date，分档边界复用 lib/ar 的 bucketIndex
+ *     （0–30 / 31–60 / 61–90 / 90+，与「应收管理」协议单位台账同一套分档）；
+ *   · 按协议单位分组，并保留逐笔明细（账单号 / 到期日 / 逾期天数）。
+ *
+ * 客人欠费账龄没有丢，也不必再造一张重名报表：
+ *   · 「催账报表」(quick-dun) 用 openFolioRows 给出 folios 的 0-30 / 31-60 / 60+ 分档；
+ *   · 「挂账客人报表」(credit-guests) 给出在住与离店仍有余额的客人清单及账龄。
+ * 两张都是客人视角、名字也写的是客人，所以本表可以名正言顺只讲协议单位。
+ */
 const AR_AGE_BUCKETS = [
-  { key: "0-30", label: "0-30 天", min: 0, max: 30 },
-  { key: "31-60", label: "31-60 天", min: 31, max: 60 },
-  { key: "60+", label: "60 天以上", min: 61, max: Number.MAX_SAFE_INTEGER },
+  { label: "0–30 天", hint: "账龄 ≤ 30 天" },
+  { label: "31–60 天", hint: "账龄 31–60 天" },
+  { label: "61–90 天", hint: "账龄 61–90 天" },
+  { label: "90 天以上", hint: "账龄 > 90 天" },
 ] as const;
 
-function arBucketOf(age: number): string {
-  for (const b of AR_AGE_BUCKETS) if (age >= b.min && age <= b.max) return b.label;
-  return AR_AGE_BUCKETS[AR_AGE_BUCKETS.length - 1].label;
-}
+/** 一家协议单位的账龄分布（「协议单位 × 账龄档」矩阵的一行） */
+type ArCompanyAging = {
+  companyId: number;
+  companyName: string;
+  /** 与 AR_AGE_BUCKETS 同序：0–30 / 31–60 / 61–90 / 90+ */
+  buckets: number[];
+  total: number;
+  /** 未结挂账笔数 */
+  cnt: number;
+  /** 最老一笔的账龄（天） */
+  oldest: number;
+  /** 已过账期到期日的应收余额合计 */
+  overdue: number;
+};
 
 function ReportArAge({ ctx }: ReportProps) {
   const { hotelId } = ctx;
-  const rows = arAgeRows(hotelId);
-  const total = rows.reduce((s, r) => s + num(r.balance), 0);
-  const bucketTotals = AR_AGE_BUCKETS.map((b) => ({
-    label: b.label,
-    amount: rows.filter((r) => arBucketOf(num(r.age)) === b.label).reduce((s, r) => s + num(r.balance), 0),
-    cnt: rows.filter((r) => arBucketOf(num(r.age)) === b.label).length,
-  }));
+  const rows = listArAgingDetail(hotelId);
+  const total = round2(rows.reduce((s, r) => s + r.outstanding, 0));
+
+  /* 分档汇总：bucketIndex 来自 lib/ar，四档之和 = total = listArAging 的合计 */
+  const bucketTotals = AR_AGE_BUCKETS.map((b, i) => {
+    const items = rows.filter((r) => r.bucketIndex === i);
+    return {
+      label: b.label,
+      hint: b.hint,
+      amount: round2(items.reduce((s, r) => s + r.outstanding, 0)),
+      cnt: items.length,
+    };
+  });
+
+  /* 按协议单位分组：行 = 单位，列 = 四档 + 合计 */
+  const byCompany = new Map<number, ArCompanyAging>();
+  for (const r of rows) {
+    const cur =
+      byCompany.get(r.companyId) ??
+      ({
+        companyId: r.companyId,
+        companyName: r.companyName,
+        buckets: [0, 0, 0, 0],
+        total: 0,
+        cnt: 0,
+        oldest: 0,
+        overdue: 0,
+      } satisfies ArCompanyAging);
+    cur.buckets[r.bucketIndex] = round2(cur.buckets[r.bucketIndex] + r.outstanding);
+    cur.total = round2(cur.total + r.outstanding);
+    cur.cnt += 1;
+    cur.oldest = Math.max(cur.oldest, r.ageDays);
+    if (r.overdueDays > 0) cur.overdue = round2(cur.overdue + r.outstanding);
+    byCompany.set(r.companyId, cur);
+  }
+  const companyRows = [...byCompany.values()].sort((a, b) => b.total - a.total);
+  const overdueTotal = round2(companyRows.reduce((s, c) => s + c.overdue, 0));
 
   return (
     <>
-      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-5">
         {bucketTotals.map((b) => (
-          <StatCard key={b.label} label={`账龄 ${b.label}`} value={fmtMoney(b.amount)} hint={`${b.cnt} 笔未结账单`} />
+          <StatCard key={b.label} label={`账龄 ${b.label}`} value={fmtMoney(b.amount)} hint={`${b.cnt} 笔未结挂账`} />
         ))}
-        <StatCard label="应收余额合计" value={fmtMoney(total)} hint={`${rows.length} 笔未结账单`} />
+        <StatCard label="应收余额合计" value={fmtMoney(total)} hint={`${rows.length} 笔未结挂账`} />
       </div>
 
-      <SectionCard title="账龄分档汇总" right="未结账（folios.status = OPEN）">
+      <SectionCard title="账龄分档汇总" right="未结 AR 台账（ar_ledgers）">
         <table className="w-full">
           <thead>
             <tr>
               <th className="th">账龄档</th>
-              <th className="th text-right">账单数</th>
+              <th className="th">口径</th>
+              <th className="th text-right">挂账笔数</th>
               <th className="th text-right">应收余额</th>
               <th className="th w-44">占比</th>
             </tr>
           </thead>
           <tbody>
-            {bucketTotals.every((b) => b.cnt === 0) && <EmptyRow colSpan={4} />}
+            {rows.length === 0 && <EmptyRow colSpan={5} />}
             {bucketTotals.map((b) => (
               <tr key={b.label} className="hover:bg-gray-50">
                 <td className="td text-gray-700">{b.label}</td>
+                <td className="td text-gray-400">{b.hint}</td>
                 <td className="td text-right tabular-nums">{fmtInt(b.cnt)}</td>
                 <td className="td text-right tabular-nums text-gray-800">{fmtMoney(b.amount)}</td>
                 <td className="td">
@@ -6098,6 +6136,7 @@ function ReportArAge({ ctx }: ReportProps) {
             ))}
             <TotalRow>
               <td className="td font-medium text-gray-800">合计</td>
+              <td className="td" />
               <td className={SUM_TD}>{fmtInt(rows.length)}</td>
               <td className={SUM_TD}>{fmtMoney(total)}</td>
               <td className="td" />
@@ -6106,39 +6145,107 @@ function ReportArAge({ ctx }: ReportProps) {
         </table>
       </SectionCard>
 
-      <SectionCard title="账龄明细" right={`按账龄倒序 · 共 ${rows.length} 笔`}>
+      <SectionCard
+        title="按协议单位 × 账龄档"
+        right={`${companyRows.length} 家单位 · 已逾期 ${fmtMoney(overdueTotal)}`}
+      >
         <div className="overflow-x-auto">
           <table className="w-full">
             <thead>
               <tr>
-                <th className="th">客人</th>
-                <th className="th">房号</th>
-                <th className="th">房态</th>
-                <th className="th">建账日期</th>
+                <th className="th">协议单位</th>
+                {AR_AGE_BUCKETS.map((b) => (
+                  <th key={b.label} className="th text-right">
+                    {b.label}
+                  </th>
+                ))}
+                <th className="th text-right">合计</th>
+                <th className="th text-right">笔数</th>
+                <th className="th text-right">最老账龄</th>
+                <th className="th text-right">逾期金额</th>
+                <th className="th w-32">占比</th>
+              </tr>
+            </thead>
+            <tbody>
+              {companyRows.length === 0 && <EmptyRow colSpan={10} />}
+              {companyRows.map((c) => (
+                <tr key={c.companyId} className="hover:bg-gray-50">
+                  <td className="td font-medium text-gray-800">{c.companyName}</td>
+                  {c.buckets.map((amount, i) => (
+                    <td key={AR_AGE_BUCKETS[i].label} className="td text-right tabular-nums text-gray-600">
+                      {amount > 0.005 ? fmtMoney(amount) : "—"}
+                    </td>
+                  ))}
+                  <td className={SUM_TD}>{fmtMoney(c.total)}</td>
+                  <td className="td text-right tabular-nums text-gray-500">{fmtInt(c.cnt)}</td>
+                  <td
+                    className={`td text-right tabular-nums ${c.oldest > 90 ? "text-[#e2483a]" : "text-gray-600"}`}
+                  >
+                    {fmtInt(c.oldest)} 天
+                  </td>
+                  <td className="td text-right tabular-nums text-gray-600">
+                    {c.overdue > 0.005 ? fmtMoney(c.overdue) : "—"}
+                  </td>
+                  <td className="td">
+                    <ShareBar value={c.total} total={total} tone="bg-[#e2483a]" />
+                  </td>
+                </tr>
+              ))}
+              <TotalRow>
+                <td className="td font-medium text-gray-800">合计</td>
+                {AR_AGE_BUCKETS.map((b, i) => (
+                  <td key={b.label} className={SUM_TD}>
+                    {fmtMoney(bucketTotals[i].amount)}
+                  </td>
+                ))}
+                <td className={SUM_TD}>{fmtMoney(total)}</td>
+                <td className={SUM_TD}>{fmtInt(rows.length)}</td>
+                <td className="td" />
+                <td className={SUM_TD}>{fmtMoney(overdueTotal)}</td>
+                <td className="td" />
+              </TotalRow>
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <SectionCard title="账龄明细（逐笔台账）" right={`按账龄倒序 · 共 ${rows.length} 笔`}>
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">协议单位</th>
+                <th className="th">账单号</th>
+                <th className="th">营业日</th>
+                <th className="th">到期日</th>
                 <th className="th text-right">账龄（天）</th>
                 <th className="th">账龄档</th>
-                <th className="th text-right">消费</th>
-                <th className="th text-right">已收</th>
+                <th className="th text-right">挂账金额</th>
+                <th className="th text-right">已核销</th>
                 <th className="th text-right">应收余额</th>
-                <th className="th">账单号</th>
+                <th className="th text-right">逾期</th>
               </tr>
             </thead>
             <tbody>
               {rows.length === 0 && <EmptyRow colSpan={10} />}
               {rows.map((r) => (
                 <tr key={r.id} className="hover:bg-gray-50">
-                  <td className="td text-gray-700">{dash(r.guest_name)}</td>
-                  <td className="td tabular-nums text-gray-700">{dash(r.room_no)}</td>
-                  <td className="td text-gray-500">{r.stay_status === "INHOUSE" ? "在住" : "已离店"}</td>
-                  <td className="td tabular-nums text-gray-500">{dash(r.created_date)}</td>
-                  <td className={`td text-right tabular-nums ${num(r.age) > 60 ? "text-[#e2483a]" : "text-gray-600"}`}>
-                    {fmtInt(num(r.age))}
+                  <td className="td text-gray-700">{r.companyName}</td>
+                  <td className="td tabular-nums text-gray-500">{dash(r.folioNo)}</td>
+                  <td className="td tabular-nums text-gray-600">{r.bizDate}</td>
+                  <td className="td tabular-nums text-gray-500">{dash(r.dueDate)}</td>
+                  <td
+                    className={`td text-right tabular-nums ${r.ageDays > 90 ? "text-[#e2483a]" : "text-gray-600"}`}
+                  >
+                    {fmtInt(r.ageDays)}
                   </td>
-                  <td className="td text-gray-600">{arBucketOf(num(r.age))}</td>
-                  <td className="td text-right tabular-nums text-gray-500">{fmtMoney(num(r.total_amount))}</td>
-                  <td className="td text-right tabular-nums text-gray-500">{fmtMoney(num(r.paid_amount))}</td>
-                  <td className={SUM_TD}>{fmtMoney(num(r.balance))}</td>
-                  <td className="td tabular-nums text-gray-500">{dash(r.folio_no)}</td>
+                  <td className="td text-gray-600">{r.bucketLabel}</td>
+                  <td className="td text-right tabular-nums text-gray-500">{fmtMoney(r.amount)}</td>
+                  <td className="td text-right tabular-nums text-[#32a852]">{fmtMoney(r.settledAmount)}</td>
+                  <td className={SUM_TD}>{fmtMoney(r.outstanding)}</td>
+                  <td className="td text-right tabular-nums text-gray-500">
+                    {r.overdueDays > 0 ? `${fmtInt(r.overdueDays)} 天` : "未到期"}
+                  </td>
                 </tr>
               ))}
               <TotalRow>
@@ -6148,8 +6255,8 @@ function ReportArAge({ ctx }: ReportProps) {
                 <td className="td" />
                 <td className="td" />
                 <td className="td" />
-                <td className={SUM_TD}>{fmtMoney(rows.reduce((s, r) => s + num(r.total_amount), 0))}</td>
-                <td className={SUM_TD}>{fmtMoney(rows.reduce((s, r) => s + num(r.paid_amount), 0))}</td>
+                <td className={SUM_TD}>{fmtMoney(rows.reduce((s, r) => s + r.amount, 0))}</td>
+                <td className={SUM_TD}>{fmtMoney(rows.reduce((s, r) => s + r.settledAmount, 0))}</td>
                 <td className={SUM_TD}>{fmtMoney(total)}</td>
                 <td className="td" />
               </TotalRow>
@@ -6159,7 +6266,10 @@ function ReportArAge({ ctx }: ReportProps) {
       </SectionCard>
 
       <NoteCard>
-        口径说明：账龄 = 今日 − 账单创建日（按 +8 小时时区），取未结账且有余额的账单；三档为 0-30 天、31-60 天、60 天以上。
+        口径说明：数据源为协议单位逐笔挂账台账 ar_ledgers（状态 OPEN / PARTIAL 且未结余额 &gt; 0），
+        账龄 = 今日 − 营业日 biz_date，四档为 0–30 / 31–60 / 61–90 / 90 天以上；合计 = 各笔未结余额之和，
+        与「应收管理」页的协议单位台账一致。非协议单位往来账户（无 company_id 的挂账客户 / 内部往来）
+        不进本表，见「应收管理」账户总账；客人在住欠费账龄见「催账报表」与「挂账客人报表」。
       </NoteCard>
     </>
   );

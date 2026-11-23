@@ -24,6 +24,13 @@
  *   一堆逾期在住单，工作台 / 夜审 / 报表全部虚高。这段 SQL 在导入时以「导入当天」
  *   为锚重新滚动，把这个问题根治在数据文件里，而不是指望谁记得手动跑脚本。
  *
+ * ── 导出时排除「DEMO 前缀单」（冒烟 / 均匀补数据的产物）──
+ *
+ * 这些单是运行期生成的，日期锚在「生成那天」，写进文件就只会越来越旧；
+ * 而设置页「一键导入」在 SQL 导入后本来就会调用 seedUniformDemo 按导入当天
+ * 重新补一遍（见 src/app/(main)/settings/demo-actions.ts 末尾），文件里再带一份
+ * 纯属重复。排除口径与依赖闭包见 scripts/demo-data-filter.mjs。
+ *
  * 同时写出 .gz：设置页「一键导入演示数据」读的是 demo-data.sql.gz，只更新 .sql
  * 不更新 .gz 等于改了没人用 —— 之前靠手工 gzip，漏一次就两边不一致。
  */
@@ -31,6 +38,13 @@ import { DatabaseSync } from "node:sqlite";
 import { writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { buildImportBlock } from "./roll-demo-dates.mjs";
+import {
+  collectDemoIds,
+  demoIdCounts,
+  demoExclusionWhere,
+  tableColumns,
+  quoteIdent,
+} from "./demo-data-filter.mjs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -73,7 +87,10 @@ const tables = db
   .map((r) => r.name)
   .filter((t) => !SKIP.has(t));
 
-const quoteIdent = (s) => `"${String(s).replace(/"/g, '""')}"`;
+/* 排除「DEMO 前缀单」及其派生行（口径集中在 demo-data-filter.mjs） */
+const demoIds = collectDemoIds(db);
+const excluded = {};
+let excludedRows = 0;
 
 /** SQL 字面量（NULL / 数字原样 / 其余按字符串转义） */
 function lit(v) {
@@ -92,21 +109,55 @@ const chunks = [];
 chunks.push("-- 云栖 PMS 演示数据（由 scripts/export-demo-sql.mjs 生成）");
 chunks.push(`-- 生成时间：${new Date().toISOString()}`);
 chunks.push(`-- 源库：${dbFile}`);
-chunks.push("-- 说明：只含数据，不含建表语句；导入时会先能清空同名表再插入。\n");
+chunks.push("-- 说明：只含数据，不含建表语句；导入时会先清空同名表再插入。");
+chunks.push("-- 说明：不含冒烟 / 均匀补数据生成的单据（导入后由 seedUniformDemo 按导入当天重新补）。\n");
 
 let totalRows = 0;
 const perTable = [];
 
 for (const t of tables) {
-  let rows;
+  const cols = tableColumns(db, t);
+  const where = demoExclusionWhere(t, cols, demoIds);
+
+  let total = 0;
   try {
-    rows = db.prepare(`SELECT * FROM ${quoteIdent(t)}`).all();
+    total = Number(db.prepare(`SELECT COUNT(*) AS c FROM ${quoteIdent(t)}`).get().c ?? 0);
   } catch {
     continue;
   }
-  if (rows.length === 0) continue;
+  if (total === 0) continue;
 
-  const cols = Object.keys(rows[0]);
+  let rows;
+  try {
+    /*
+     * 注意：必须用 `IS NOT TRUE` 而不是 `NOT (...)`。
+     * 排除条件里有 `folio_id IN (...)` / `refund_of IN (...)` 这类可能为 NULL 的列，
+     * 三值逻辑下 `NOT NULL` 仍然是 NULL → 行不会进入结果集 —— 会**多删**正常数据
+     * （实测把 ar_ledgers 23 行、真实流水 389 行整片滤掉）。
+     */
+    rows = db
+      .prepare(`SELECT * FROM ${quoteIdent(t)}${where ? ` WHERE (${where}) IS NOT TRUE` : ""}`)
+      .all();
+  } catch {
+    continue;
+  }
+
+  if (where && rows.length < total) {
+    excluded[t] = total - rows.length;
+    excludedRows += total - rows.length;
+  }
+
+  /*
+   * 整张表都被排除（历史上可能有全由生成单构成的表）：
+   * 仍然要发 DELETE —— 目标库里这些行必须先清掉，否则导入后残留。
+   */
+  if (rows.length === 0) {
+    chunks.push(`-- ${t}：0 行（原有 ${total} 行全是生成单，已排除）`);
+    chunks.push(`DELETE FROM ${quoteIdent(t)};`);
+    chunks.push("");
+    continue;
+  }
+
   const colList = cols.map(quoteIdent).join(", ");
   totalRows += rows.length;
   perTable.push([t, rows.length]);
@@ -151,6 +202,22 @@ console.log(`已导出：${outFile}`);
 console.log(`        ${outFile}.gz（${(gz.length / 1024).toFixed(0)} KB，设置页一键导入读这个）`);
 console.log(`  ${perTable.length} 张表 / ${totalRows} 行`);
 console.log(`  文件大小：${(Buffer.byteLength(sql) / 1024).toFixed(0)} KB`);
+
+const idCounts = demoIdCounts(demoIds);
+console.log(
+  `  排除生成单：入住单 ${idCounts.stays} / 预订 ${idCounts.bookings} / 账单 ${idCounts.folios} / 流水 ${idCounts.payments}` +
+    `，连带删除 ${excludedRows} 行（${Object.keys(excluded).length} 张表）`
+);
+for (const [t, n] of Object.entries(excluded)) console.log(`    - ${t}: ${n} 行`);
+
+const demoMentions = (sql.match(/DEMO-/g) ?? []).length;
+if (demoMentions > 0) {
+  console.error(`  ❌ 导出文件里仍有 ${demoMentions} 处生成单前缀，请检查 demo-data-filter.mjs 的排除口径`);
+  process.exitCode = 1;
+} else {
+  console.log(`  ✅ 导出文件里生成单前缀出现 0 次`);
+}
+
 console.log("\n前 12 张：");
 perTable
   .sort((a, b) => b[1] - a[1])
