@@ -62,8 +62,15 @@ if (rows.length === 0) {
 
 console.log(`\n在住单 guest_id 为空：${rows.length} 张\n`);
 
-/* 逐单判断：能匹配已有客史就复用，否则新建 */
+/*
+ * 逐单判断：能匹配已有客史就复用，否则新建
+ *
+ * ⚠️ 同批次内同一手机号只能建一个客史（idx_guests_mobile 是 UNIQUE）
+ * VPS 上有 18 张单要补、其中好几张是同一手机号（同一客人的多间房），
+ * 不合并就会撞「UNIQUE constraint failed: guests.hotel_id, guests.mobile」。
+ */
 const plan = [];
+const plannedByMobile = new Map();
 for (const r of rows) {
   const name = String(r.guest_name ?? "").trim();
   const mobile = String(r.mobile ?? "").trim();
@@ -92,13 +99,21 @@ for (const r of rows) {
     }
   }
 
-  /* ③ 建新客史（按姓名+手机，同名不同手机算不同人 —— 金泽宇就有两个手机） */
+  /* ③ 同批次内同手机号 → 复用前面已经计划要建的那个（稍后第一个人建完，后面直接指过去） */
+  if (mobile && plannedByMobile.has(mobile)) {
+    plan.push({ row: r, action: "reuse-batch", guestId: null, batchMobile: mobile, note: `同批次同手机号，复用先建的客史` });
+    continue;
+  }
+
+  /* ④ 建新客史（按姓名+手机，同名不同手机算不同人 —— 金泽宇就有两个手机） */
   plan.push({
     row: r,
     action: "create",
     guestId: null,
     note: `新建客史：${name}${mobile ? ` / ${mobile}` : ""}`,
+    batchMobile: mobile || null,
   });
+  if (mobile) plannedByMobile.set(mobile, true);
 }
 
 for (const p of plan) {
@@ -124,10 +139,17 @@ console.log(`已备份：${backupPath}`);
 
 let created = 0;
 let linked = 0;
+/* 本次运行内「手机号 → 新建出来的 guestId」，处理同手机号的多张单 */
+const createdByMobile = new Map();
 db.exec("BEGIN");
 try {
   for (const p of plan) {
     let guestId = p.guestId;
+
+    /* 同批次同手机号：前面已经建过就复用 */
+    if (guestId === null && p.action === "reuse-batch" && p.batchMobile && createdByMobile.has(p.batchMobile)) {
+      guestId = createdByMobile.get(p.batchMobile);
+    }
 
     if (guestId === null) {
       const name = String(p.row.guest_name ?? "").trim();
@@ -145,6 +167,7 @@ try {
       );
       guestId = Number(one(`SELECT id FROM guests WHERE hotel_id = ? ORDER BY id DESC LIMIT 1`, [HOTEL]).id);
       created++;
+      if (mobile) createdByMobile.set(mobile, guestId);
     }
 
     /* 回填（只改仍然为空的行，幂等） */
