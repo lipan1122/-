@@ -127,12 +127,18 @@ try {
     const payload = {
       hotel_id: HOTEL,
       ar_account_id: a.id,
-      /* type：老库可能叫 kind 或 type，两个都试 */
+      /* type：NOT NULL，POST = 入账 */
       type: "POST",
-      kind: "POST",
       amount: gap,
+      /*
+       * balance_after：NOT NULL，表示「这笔发生后的账户余额」
+       *
+       * 这条期初结转是补在**最前面**的，所以发生后的余额就是它自己的金额
+       * （原流水为 0，补完之后总额正好等于账户余额）。
+       */
+      balance_after: gap,
       biz_date: bizDate,
-      remark: `期初余额结转（自动补齐：原余额 ${a.balance}，原流水合计 ${a.txsum}，差额 ${gap}）`,
+      note: `期初余额结转（自动补齐：原余额 ${a.balance}，原流水合计 ${a.txsum}，差额 ${gap}）`,
       operator: "系统补档",
       created_at: nowIso(),
     };
