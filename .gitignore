@@ -38,3 +38,9 @@ dsh-home.*.vercel.cli/
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 备份与凭据（异地备份拉取用，勿入库）
+.vps-creds.bat
+.vps-creds
+backups/
+*.pull-backup.log

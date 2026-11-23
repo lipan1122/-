@@ -1,0 +1,51 @@
+@echo off
+REM ============================================================
+REM Pull the latest DB backup from VPS to this machine (offsite copy)
+REM
+REM Why: the VPS has only one disk, so backup-db.mjs writes backups
+REM onto the same partition as the live data/pms.db. Disk failure,
+REM machine loss, or `rm -rf /opt/pms` would lose both.
+REM This script SFTPs the newest backup to the local D: drive and
+REM keeps the most recent N copies.
+REM
+REM Called by Windows Task Scheduler daily (03:30), or run manually.
+REM Credentials live in .vps-creds.bat (same dir, kept out of git).
+REM
+REM NOTE: ASCII-only on purpose, and the whole path is ASCII-only too.
+REM cmd.exe parses .bat with the OEM codepage (GBK here); a UTF-8
+REM Chinese path or comment would be mis-read and break the commands.
+REM ============================================================
+
+setlocal
+
+set BASE_DIR=D:\dsh-home\pms-backup
+set PYTHON=C:\Users\13067\XowAZ1wE\python
+set LOG=%BASE_DIR%\pull-backup.log
+
+if not exist "%BASE_DIR%\.vps-creds.bat" (
+  echo [ERR] missing credentials file: %BASE_DIR%\.vps-creds.bat
+  echo %date% %time%  exit=1  reason=no-creds >> "%LOG%"
+  exit /b 1
+)
+
+call "%BASE_DIR%\.vps-creds.bat"
+
+REM Force UTF-8 so the python script output does not crash on GBK console
+set PYTHONIOENCODING=utf-8
+set PMS_BACKUP_LOCAL_DIR=%BASE_DIR%\data
+
+cd /d "%BASE_DIR%"
+"%PYTHON%" vps-get-backup.py --keep 10
+
+REM Use `if errorlevel N` instead of `set RC=%ERRORLEVEL%`:
+REM %ERRORLEVEL% does not always expand reliably inside a redirected
+REM echo on the same line, which made the log record an empty exit code.
+if errorlevel 1 (
+  echo [ERR] pull failed
+  echo %date% %time%  exit=1 >> "%LOG%"
+  exit /b 1
+)
+
+echo [OK] pull done
+echo %date% %time%  exit=0 >> "%LOG%"
+exit /b 0
