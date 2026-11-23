@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-23T05:49:55.838Z",
+  "generatedAt": "2026-11-23T06:37:01.144Z",
   "tables": {
     "ar_accounts": [
       {
@@ -6698,6 +6698,11 @@
       "sql": "CREATE INDEX idx_booking_rooms_booking ON booking_rooms(booking_id)"
     },
     {
+      "name": "idx_booking_rooms_hotel",
+      "table": "booking_rooms",
+      "sql": "CREATE INDEX idx_booking_rooms_hotel ON booking_rooms(hotel_id, booking_id)"
+    },
+    {
       "name": "idx_booking_rooms_occupied",
       "table": "booking_rooms",
       "sql": "CREATE UNIQUE INDEX idx_booking_rooms_occupied\n  ON booking_rooms(room_id, check_in_date, check_out_date)\n  WHERE room_id IS NOT NULL AND status IN ('CONFIRMED','CHECKED_IN')"
@@ -6726,6 +6731,11 @@
       "name": "idx_bookings_status",
       "table": "bookings",
       "sql": "CREATE INDEX idx_bookings_status ON bookings(hotel_id, status, check_in_date)"
+    },
+    {
+      "name": "idx_breakfast_hotel_date",
+      "table": "breakfast_records",
+      "sql": "CREATE INDEX idx_breakfast_hotel_date ON breakfast_records(hotel_id, date)"
     },
     {
       "name": "idx_channel_orders_key",
@@ -6873,6 +6883,16 @@
       "sql": "CREATE UNIQUE INDEX idx_login_attempts_key ON login_attempts(login_key)"
     },
     {
+      "name": "idx_lost_items_hotel",
+      "table": "lost_items",
+      "sql": "CREATE INDEX idx_lost_items_hotel ON lost_items(hotel_id, found_at)"
+    },
+    {
+      "name": "idx_meal_vouchers_hotel",
+      "table": "meal_vouchers",
+      "sql": "CREATE INDEX idx_meal_vouchers_hotel ON meal_vouchers(hotel_id, code)"
+    },
+    {
       "name": "idx_wallet_account_member",
       "table": "member_wallet",
       "sql": "CREATE UNIQUE INDEX idx_wallet_account_member ON member_wallet(hotel_id, member_id) WHERE member_id IS NOT NULL"
@@ -7006,6 +7026,11 @@
       "name": "idx_shifts_open",
       "table": "shifts",
       "sql": "CREATE UNIQUE INDEX idx_shifts_open ON shifts(hotel_id, operator) WHERE status = 'OPEN'"
+    },
+    {
+      "name": "idx_shop_items_hotel",
+      "table": "shop_items",
+      "sql": "CREATE INDEX idx_shop_items_hotel ON shop_items(hotel_id, category)"
     },
     {
       "name": "idx_shop_sales_order",

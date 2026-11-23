@@ -57,6 +57,14 @@ import { createActionHarness } from "./helpers/action-harness.mjs";
 const ROOT = process.cwd();
 const BASE = process.env.PMS_BASE || "http://localhost:3100";
 const NO_HTTP = process.argv.includes("--no-http") || process.env.PMS_NO_HTTP === "1";
+/**
+ * 源码根目录（默认仓库里的 src/）。
+ *
+ * 设了 PMS_SRC_ROOT 才换成副本 —— 用来做「mutation 自检」：把 src 整份拷到 .tmp 下、
+ * 故意删掉某个 action 的权限守卫，再跑本脚本，确认它会变红。
+ * 这样就不用为了证明测试有效而原地改坏 src/（src 随时有别的 agent 在改）。
+ */
+const SRC_ROOT = process.env.PMS_SRC_ROOT ? path.resolve(ROOT, process.env.PMS_SRC_ROOT) : path.join(ROOT, "src");
 
 /* ============================================================ 期望表 */
 
@@ -772,6 +780,45 @@ const NEW_MODULES = [
  */
 const READ_ONLY = {};
 
+/**
+ * 本轮 fix-perm-stock 补的 26 个 action 用的是 requirePermissionOrRedirect：
+ * 生产构建会把 Server Action 抛出的错误文案脱敏成「操作失败」，
+ * 只有 redirect 到 /no-permission?p=xxx 才能让用户看到「没有该操作权限」。
+ * 所以这里把「拒绝机制」也纳入断言 —— 谁把 OrRedirect 改回 requirePermission()（抛错），
+ * 静态段与运行时段的严格判定都会变红。
+ *
+ * 另外 4 个（goods.purchaseAction / shop.sellCartAction / shop.voidSaleAction /
+ * points.adjustPointsAction）本来就用 requirePermission / requireAdmin，不在此列。
+ */
+const EXPECT_REDIRECT_GUARD = new Set([
+  "src/app/(main)/ar/actions.ts#ensureArSchema",
+  "src/app/(main)/goods/actions.ts#ensureGoodsSchema",
+  "src/app/(main)/housekeeping/actions.ts#completeTaskAction",
+  "src/app/(main)/housekeeping/actions.ts#setRoomCleanAction",
+  "src/app/(main)/id-verify/actions.ts#ensureIdVerifySchema",
+  "src/app/(main)/id-verify/actions.ts#verifyIdAction",
+  "src/app/(main)/lost-found/actions.ts#createLostItemAction",
+  "src/app/(main)/lost-found/actions.ts#claimLostItemAction",
+  "src/app/(main)/lost-found/actions.ts#deleteLostItemAction",
+  "src/app/(main)/lost-found/actions.ts#markReturnedAction",
+  "src/app/(main)/meal-vouchers/actions.ts#redeemVoucherAction",
+  "src/app/(main)/meal-vouchers/actions.ts#redeemVoucherByIdAction",
+  "src/app/(main)/meal-vouchers/actions.ts#voidVoucherAction",
+  "src/app/(main)/notices/actions.ts#createNoticeAction",
+  "src/app/(main)/notices/actions.ts#deleteNoticeAction",
+  "src/app/(main)/points/actions.ts#ensurePointsSchema",
+  "src/app/(main)/points/actions.ts#redeemPointsAction",
+  "src/app/(main)/rental/actions.ts#ensureRentalSchema",
+  "src/app/(main)/rental/actions.ts#rentItemAction",
+  "src/app/(main)/rental/actions.ts#returnRentalAction",
+  "src/app/(main)/shop/actions.ts#ensureShopPageSchema",
+  "src/app/(main)/sms/actions.ts#ensureSmsSeed",
+  "src/app/(main)/sms/actions.ts#createTemplateAction",
+  "src/app/(main)/sms/actions.ts#updateTemplateAction",
+  "src/app/(main)/sms/actions.ts#toggleTemplateAction",
+  "src/app/(main)/sms/actions.ts#sendSmsAction",
+]);
+
 /* ============================================================ 工具 */
 
 let pass = 0;
@@ -810,7 +857,15 @@ const check = (ok, label, extra = "") => {
 /** 运行时副作用的断言小结构 */
 const fx = (label, ok, extra = "") => ({ label, ok, extra });
 
-const read = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf8");
+const read = (rel) => fs.readFileSync(path.join(SRC_ROOT, rel.replace(/^src\//, "")), "utf8");
+
+/** 每个 action 的断言数（静态 / 运行时），最后打印明细表用 */
+const perAction = new Map();
+function recordActionCount(key, bucket, n) {
+  const cur = perAction.get(key) ?? { static: 0, runtime: 0 };
+  cur[bucket] += n;
+  perAction.set(key, cur);
+}
 
 const fmtTime = (ms) =>
   new Date(ms).toLocaleString("zh-CN", {
@@ -859,6 +914,21 @@ function sliceFunction(src, name) {
   const nextExport = src.indexOf("\nexport ", start + sig.length);
   const end = nextExport < 0 ? src.length : nextExport;
   return src.slice(start, end);
+}
+
+/** 取任意函数（含未导出）的函数体：先按导出找，找不到按 `async function <name>(` 切到下一个 export */
+function sliceAnyFunction(src, name) {
+  const exported = sliceFunction(src, name);
+  if (exported) return exported;
+  const start = src.indexOf(`async function ${name}(`);
+  if (start < 0) return null;
+  const nextExport = src.indexOf("\nexport ", start);
+  return src.slice(start, nextExport < 0 ? src.length : nextExport);
+}
+
+/** 去掉注释后再做「有没有残留 requireUser()」这类统计（源码注释里大量提到旧写法） */
+function stripComments(src) {
+  return src.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/^\s*\/\/.*$/gm, " ");
 }
 
 /** 函数体里第一处写库操作的下标（用于断言「权限校验在写库之前」） */
@@ -1000,6 +1070,8 @@ function auditModule(mod, table, db, isNew = false) {
     const spec = mod.actions[name];
     if (!spec) continue; // 上面已经报过「未登记」
 
+    const p0 = pass;
+    const f0 = fail;
     const body = sliceFunction(src, name);
     if (!body) {
       check(false, `${name} 函数体解析失败`);
@@ -1018,6 +1090,14 @@ function auditModule(mod, table, db, isNew = false) {
       guard.permission === spec.permission,
       `${name} 权限点符合期望（期望 ${spec.permission}，实际 ${guard.permission}）`
     );
+
+    /* 2.4.1b 本轮补的 26 个必须用 OrRedirect（否则生产构建只会显示「操作失败」） */
+    if (EXPECT_REDIRECT_GUARD.has(`${mod.file}#${name}`)) {
+      check(
+        guard.kind === "redirect",
+        `${name} 用 requirePermissionOrRedirect 拒绝（用户能看到 /no-permission 页面，实际 ${guard.kind}）`
+      );
+    }
 
     /* 2.4.2 权限点 / 管理员 / 受限角色 */
     if (spec.permission !== "@requireAdmin") {
@@ -1051,13 +1131,14 @@ function auditModule(mod, table, db, isNew = false) {
 
     /* 2.4.4 权限校验必须发生在任何写库操作之前 */
     if (guard.kind === "delegate") {
-      const targetBody = sliceFunction(src, guard.target);
+      const targetBody = sliceAnyFunction(src, guard.target);
       const targetGuard = findGuard(targetBody ?? "", {});
       const permIdx = targetGuard ? targetGuard.at : -1;
       const mutIdx = firstMutationIndex(targetBody ?? "");
       check(
         Boolean(targetGuard) && permIdx >= 0 && (mutIdx < 0 || permIdx < mutIdx),
-        `${name} 的委托目标 ${guard.target}() 权限校验在写库之前`
+        `${name} 的委托目标 ${guard.target}() 权限校验在写库之前`,
+        targetGuard ? "" : `（${guard.target} 函数体解析失败或缺权限校验）`
       );
       // 包装自身不能先写库再委托
       check(
@@ -1081,15 +1162,13 @@ function auditModule(mod, table, db, isNew = false) {
         `${name} 校验 hotelId 与会话一致（跨店初始化被 FORBIDDEN 拒绝）`
       );
     }
+
+    recordActionCount(`${mod.file}#${name}`, "static", pass - p0 + (fail - f0));
   }
 
   /* 2.5 内部受保护函数：helpers（被多个导出共用）必须有守卫 */
   for (const [fn, perm] of Object.entries(helpers)) {
-    // 非导出函数：从 `async function <fn>(` 切到下一个 export（导出动作里的引用不算定义）
-    const start = src.indexOf(`async function ${fn}(`);
-    const nextExport = start < 0 ? -1 : src.indexOf("\nexport ", start);
-    const sliced = start < 0 ? null : src.slice(start, nextExport < 0 ? src.length : nextExport);
-    const g = findGuard(sliced ?? "", {});
+    const g = findGuard(sliceAnyFunction(src, fn) ?? "", {});
     check(Boolean(g) && g.permission === perm, `内部共用函数 ${fn}() 有权限守卫（期望 ${perm}，实际 ${g?.label ?? "无"}）`);
   }
 
@@ -1110,7 +1189,8 @@ function auditModule(mod, table, db, isNew = false) {
   }
 
   /* 2.8 写操作文件不应再残留 requireUser（只读白名单存在时除外） */
-  const requireUserLeft = (src.match(/requireUser\s*\(/g) || []).length;
+  // 源码注释里会提到「原来只有 requireUser()」，统计前先去掉注释，只数真正的调用
+  const requireUserLeft = (stripComments(src).match(/requireUser\s*\(/g) || []).length;
   if (whitelist.length === 0) {
     check(
       requireUserLeft === 0,
@@ -1211,6 +1291,7 @@ async function prepareRuntime() {
   ids.lfClaim = insertLost(`待认领-${suffix}`);
   ids.lfReturn = insertLost(`待归还-${suffix}`);
   ids.lfDelete = insertLost(`待删除-${suffix}`);
+  ids.lfCross = insertLost(`跨店保护-${suffix}`); // 跨酒店隔离用，不被本店动作消耗
 
   // 餐券：按券号核销 / 按 id 核销 / 作废 各一张（都是当天的 UNUSED 券）
   const insertVoucher = (code) =>
@@ -1233,6 +1314,10 @@ async function prepareRuntime() {
   ids.noticeDel = h.run(
     `INSERT INTO notices (hotel_id, title, content, author, level, created_at) VALUES (1,?,?,?,?,?)`,
     [`待删公告-${suffix}`, "", "权限验收", "normal", now]
+  ).lastInsertRowid;
+  ids.noticeCross = h.run(
+    `INSERT INTO notices (hotel_id, title, content, author, level, created_at) VALUES (1,?,?,?,?,?)`,
+    [`跨店保护公告-${suffix}`, "", "权限验收", "normal", now]
   ).lastInsertRowid;
 
   // 短信模板：待编辑 / 待启停 / 待发送各一条（直接种，避免依赖 ensureSmsSeed 的种子内容）
@@ -1301,11 +1386,20 @@ async function callPositional(fn, args) {
   }
 }
 
-/** 被权限拦下的判据：redirect /no-permission?p=xxx（requirePermissionOrRedirect）或 FORBIDDEN 抛错（requirePermission/requireAdmin） */
-function denialOf(result, permission) {
+/**
+ * 被权限拦下的判据：
+ *   · requirePermissionOrRedirect → redirect /no-permission?p=<权限点>
+ *   · requirePermission / requireAdmin → 抛 FORBIDDEN（生产构建会脱敏成「操作失败」）
+ *
+ * requireRedirect=true 时只认 redirect（用于本轮 26 个必须给用户看权限页的动作）。
+ */
+function denialOf(result, permission, { requireRedirect = false } = {}) {
   if (result?.url && result.url.startsWith("/no-permission")) {
     const p = new URL(result.url, "http://localhost").searchParams.get("p") ?? "";
     return { ok: p === permission, how: `redirect ${result.url}` };
+  }
+  if (requireRedirect) {
+    return { ok: false, how: `没有 redirect 到 /no-permission（${describeResult(result)}）` };
   }
   if (result?.kind === "threw" && /^FORBIDDEN/.test(result.message)) {
     const ok = permission === "@requireAdmin" ? true : result.message.includes(permission);
@@ -1316,7 +1410,15 @@ function denialOf(result, permission) {
 
 function describeResult(r) {
   if (!r) return "无返回";
-  if (r.url) return `${r.kind} ${r.url}`;
+  if (r.url) {
+    let url = r.url;
+    try {
+      url = decodeURIComponent(url);
+    } catch {
+      /* 非法百分号编码就按原样展示 */
+    }
+    return `${r.kind} ${url}`;
+  }
   return `${r.kind}${r.message ? ` ${r.message}` : ""}`;
 }
 
@@ -1362,6 +1464,19 @@ function rolePermissionRows(ctx, role, permission) {
   return ctx.h.all(`SELECT id FROM role_permissions WHERE hotel_id = 1 AND role = ? AND permission = ?`, [role, permission]);
 }
 
+/** 把某角色某权限点恢复成「矩阵开始前」的行数（临时授权/撤权都走它收尾） */
+function restoreRolePermission(ctx, role, permission, rows) {
+  ctx.h.run(`DELETE FROM role_permissions WHERE hotel_id = 1 AND role = ? AND permission = ?`, [role, permission]);
+  for (let i = 0; i < rows.length; i += 1) {
+    ctx.h.run(`INSERT INTO role_permissions (hotel_id, role, permission, created_at) VALUES (1,?,?,?)`, [
+      role,
+      permission,
+      new Date().toISOString(),
+    ]);
+  }
+  ctx.session.invalidatePermissionCache(1);
+}
+
 /* ---------- 运行时主流程 ---------- */
 
 const evidence = { revoked: [], allowed: [], effects: [] };
@@ -1393,17 +1508,23 @@ async function auditRuntime(ctx) {
   for (const mod of NEW_MODULES) {
     for (const [name, spec] of Object.entries(mod.actions)) {
       index += 1;
+      const runtimeKey = `${mod.file}#${name}`;
+      const p0 = pass;
+      const f0 = fail;
       const rt = spec.runtime;
       if (!rt) {
         check(false, `${name} 缺运行时配置（新补的权限点必须有运行时验证）`);
+        recordActionCount(runtimeKey, "runtime", pass - p0 + (fail - f0));
         continue;
       }
       console.log(`\n--- [${index}/${total}] ${mod.file} → ${name}（${spec.permission}） ---`);
+      /** 本轮补的 26 个必须给用户看到 /no-permission 页面（拒绝机制也进断言） */
+      const strictRedirect = EXPECT_REDIRECT_GUARD.has(runtimeKey);
 
       /* ① 无权角色必须被拒 */
       for (const role of spec.rejected) {
         const r = await callAs(ctx, mod, name, spec, role);
-        const d = denialOf(r, spec.permission);
+        const d = denialOf(r, spec.permission, { requireRedirect: strictRedirect });
         check(
           d.ok,
           `${name} 拒绝 ${role}（${spec.permission}）`,
@@ -1475,7 +1596,9 @@ async function auditRuntime(ctx) {
         } finally {
           restoreRolePermission(ctx, probe, spec.permission, original);
         }
-        const revokedDenied = denialOf(revokedResult ?? { kind: "returned" }, spec.permission);
+        const revokedDenied = denialOf(revokedResult ?? { kind: "returned" }, spec.permission, {
+          requireRedirect: strictRedirect,
+        });
         check(
           revokedDenied.ok,
           `${name} 撤销 ${probe} 的 ${spec.permission} 后被拒（${revokedDenied.how}）`,
@@ -1498,6 +1621,8 @@ async function auditRuntime(ctx) {
           `实际 ${restored.length} 行`
         );
       }
+
+      recordActionCount(runtimeKey, "runtime", pass - p0 + (fail - f0));
     }
   }
 }
@@ -1507,8 +1632,6 @@ async function auditRuntime(ctx) {
 async function auditCrossHotel(ctx) {
   const { h } = ctx;
   console.log("\n=== 运行时校验 B：跨酒店隔离（A 店身份不能操作 B 店数据） ===");
-
-  const modByKey = (key) => NEW_MODULES.find((m) => m.key === key);
 
   /* B1. ensure*Schema 用别家 hotelId 调用 → FORBIDDEN（否则能往别家灌种子数据） */
   for (const [key, fn, label] of [
@@ -1527,12 +1650,12 @@ async function auditCrossHotel(ctx) {
 
   /* B2. 二店身份不能删一店的失物记录（一店记录在二店视野里不存在） */
   h.useSession(ctx.sidOf.h2);
-  const before = h.one(`SELECT status FROM lost_items WHERE id = ?`, [ctx.ids.lfDelete]);
+  const before = h.one(`SELECT status FROM lost_items WHERE id = ?`, [ctx.ids.lfCross]);
   const delH2 = await h.invoke(ctx.mods.lf.deleteLostItemAction, {
-    id: ctx.ids.lfDelete,
+    id: ctx.ids.lfCross,
     reason: "跨店试探",
   });
-  const after = h.one(`SELECT status FROM lost_items WHERE id = ?`, [ctx.ids.lfDelete]);
+  const after = h.one(`SELECT status FROM lost_items WHERE id = ?`, [ctx.ids.lfCross]);
   check(
     delH2.kind === "err" && /未找到/.test(delH2.message ?? ""),
     "二店管理员删除一店失物 → 业务层查不到（未找到该失物记录）",
@@ -1557,7 +1680,7 @@ async function auditCrossHotel(ctx) {
 
   /* B4. 二店身份租不到一店的物品（查询带 hotel_id，物品不存在） */
   h.useSession(ctx.sidOf.h2);
-  const rH2 = await h.invoke(ctx.mods.rent.rentItemAction, { item_id: 1, qty: 1, room_no: "PA-1" });
+  const rH2 = await h.invoke(ctx.mods.rental.rentItemAction, { item_id: 1, qty: 1, room_no: "PA-1" });
   check(
     rH2.kind === "err" && /物品不存在/.test(rH2.message ?? ""),
     "二店管理员租一店物品 → 物品不存在（查询带 hotel_id）",
@@ -1566,17 +1689,14 @@ async function auditCrossHotel(ctx) {
 
   /* B5. 二店身份改不到一店的公告（deleteNotice 也是 settings.manage → 二店 admin 权限全通过，靠 hotel_id 挡） */
   h.useSession(ctx.sidOf.h2);
-  const noticeBefore = h.one(`SELECT COUNT(*) AS n FROM notices WHERE id = ?`, [ctx.ids.noticeDel])?.n ?? 0;
-  const nH2 = await h.invoke(ctx.mods.notices.deleteNoticeAction, { id: ctx.ids.noticeDel });
-  const noticeAfter = h.one(`SELECT COUNT(*) AS n FROM notices WHERE id = ?`, [ctx.ids.noticeDel])?.n ?? 0;
+  const noticeBefore = h.one(`SELECT COUNT(*) AS n FROM notices WHERE id = ?`, [ctx.ids.noticeCross])?.n ?? 0;
+  const nH2 = await h.invoke(ctx.mods.notices.deleteNoticeAction, { id: ctx.ids.noticeCross });
+  const noticeAfter = h.one(`SELECT COUNT(*) AS n FROM notices WHERE id = ?`, [ctx.ids.noticeCross])?.n ?? 0;
   check(
     noticeBefore === 1 && noticeAfter === 1 && nH2.kind === "returned",
     "二店管理员按 id 删除一店公告 → 影响 0 行（公告仍在）",
     `实际 ${noticeBefore} → ${noticeAfter}（${describeResult(nH2)}）`
   );
-
-  const mod = modByKey("lf");
-  void mod;
 }
 
 /* ============================================================ 4. HTTP 运行时校验（可选） */
@@ -1671,7 +1791,7 @@ async function httpRuntimeAudit() {
     return;
   }
   const buildTime = fs.statSync(buildIdPath).mtimeMs;
-  const srcTime = Math.max(...MODULES.map((m) => fs.statSync(path.join(ROOT, m.file)).mtimeMs));
+  const srcTime = Math.max(...MODULES.map((m) => fs.statSync(path.join(SRC_ROOT, m.file.replace(/^src\//, ""))).mtimeMs));
   if (buildTime < srcTime) {
     skipRuntime(
       `3100 上运行的是 ${fmtTime(buildTime)} 的预构建产物，早于本次源码修改（${fmtTime(srcTime)}）；` +
@@ -1791,6 +1911,18 @@ async function main() {
     `受检 action：${oldTotal + newTotal} 个（夜审 2 / 预订 15 / 在住 8 / 本轮补权限 ${newTotal}，共 ${MODULES.length + NEW_MODULES.length} 个文件）`
   );
   console.log(`其中「真调 action」运行时验证：${newTotal} 个（每个 ①拒绝 ②放行 ③授权后放行 ④撤权后拒绝）`);
+
+  /* 本轮 30 个 action 的断言明细（文件 / 动作 / 权限点 / 静态 / 运行时 / 合计） */
+  console.log("\n本轮新补权限 action 明细（静态 + 运行时断言数）：");
+  for (const mod of NEW_MODULES) {
+    for (const [name, spec] of Object.entries(mod.actions)) {
+      const c = perAction.get(`${mod.file}#${name}`) ?? { static: 0, runtime: 0 };
+      console.log(
+        `  · ${mod.file.replace("src/app/(main)/", "")}#${name}（${spec.permission}）静态 ${c.static} + 运行时 ${c.runtime} = ${c.static + c.runtime}`
+      );
+    }
+  }
+
   console.log(`通过：${pass}    失败：${fail}`);
   /*
    * 跳过不是静默的：HTTP 段没跑时必须在最后一行说出来，避免「只看退出码 = 以为端到端过了」。

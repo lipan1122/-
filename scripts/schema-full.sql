@@ -1083,6 +1083,22 @@ CREATE UNIQUE INDEX idx_booking_rooms_occupied
   ON booking_rooms(room_id, check_in_date, check_out_date)
   WHERE room_id IS NOT NULL AND status IN ('CONFIRMED','CHECKED_IN');
 
+/*
+ * 多租户索引补齐（chk-upgrade-tenant 扫出来的）
+ *
+ * 这几张表都有 hotel_id，但原来的索引全都不以 hotel_id 打头：
+ *   booking_rooms   → idx_booking_rooms_booking(booking_id) / _room(room_id)
+ *   breakfast_records / meal_vouchers / shop_items / lost_items → 无索引或按别的列
+ *
+ * 所有查询都带 `WHERE hotel_id = ?`，没有以 hotel_id 打头的索引就只能全表扫。
+ * 现在数据量小（670 / 256 / 40 / 10 / 6 行）看不出，但多酒店上线后会成瓶颈。
+ */
+CREATE INDEX IF NOT EXISTS idx_booking_rooms_hotel ON booking_rooms(hotel_id, booking_id);
+CREATE INDEX IF NOT EXISTS idx_breakfast_hotel_date ON breakfast_records(hotel_id, date);
+CREATE INDEX IF NOT EXISTS idx_meal_vouchers_hotel ON meal_vouchers(hotel_id, code);
+CREATE INDEX IF NOT EXISTS idx_shop_items_hotel ON shop_items(hotel_id, category);
+CREATE INDEX IF NOT EXISTS idx_lost_items_hotel ON lost_items(hotel_id, found_at);
+
 CREATE INDEX idx_shifts_hotel_date ON shifts(hotel_id, biz_date);
 
 CREATE UNIQUE INDEX idx_shifts_open ON shifts(hotel_id, operator) WHERE status = 'OPEN';

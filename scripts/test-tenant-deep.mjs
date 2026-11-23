@@ -1035,11 +1035,11 @@ check("副本库 integrity_check = ok", integrity.length === 1 && integrity[0] =
 /* ============================================================ 汇总 */
 
 const failCount = done();
-console.log(`\n· 覆盖表：ar_ledgers / ar_accounts / ar_write_offs / ar_transactions / payments / folio_items / invoices`);
+console.log(`\n· 覆盖表（21 张）：ar_ledgers / ar_accounts / ar_write_offs / ar_transactions / payments / folio_items / invoices`);
 console.log(`          shop_items / shop_sales / shop_stock_flows / member_wallet / member_wallet_ledger`);
 console.log(`          housekeeping / breakfast_records / meal_vouchers / lost_items`);
 console.log(`          bookings / booking_rooms / rooms / guests / companies`);
-console.log(`· 真实 action 用例：${18} 个动作 × 双向（998 打 1 店 + 1 店正例），另加 4 个 998 自写反向验证`);
+console.log(`· 真实 action 用例：25 个动作 × 双向（998 打 1 店 + 1 店正例），另加 4 个 998 自写反向验证`);
 console.log(`· 静态扫描：${SRC_FILES.length} 个源码文件 / ${realWrites.length} 条写操作 / ${writeTables.length} 张表`);
 console.log(`· 结构扫描：${allTables.length} 张表（${withHotelId.length} 张有 hotel_id，${withoutHotelId.length} 张按设计没有）`);
 

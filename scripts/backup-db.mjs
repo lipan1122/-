@@ -60,6 +60,8 @@ import {
   openSync,
   readSync,
   closeSync,
+  accessSync,
+  constants,
 } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
@@ -402,6 +404,25 @@ if (DRY_RUN) {
 
 mkdirSync(BACKUP_DIR, { recursive: true });
 
+/*
+ * 先预检目录可写，再动手。
+ *
+ * 不预检的后果：VACUUM INTO 在一个几 GB 的库上可能先跑十几秒，
+ * 最后才因为目录不可写而失败，报的还是 "unable to open database"
+ * 这种不指明原因的消息。目录不可写是**最容易排查**的问题，
+ * 应该在花任何时间之前就报出来（附带 chown 命令）。
+ */
+try {
+  accessSync(BACKUP_DIR, constants.W_OK);
+} catch {
+  console.error(`[失败] 备份目录不可写：${BACKUP_DIR}`);
+  console.error(`       查：ls -ld ${BACKUP_DIR}`);
+  console.error(`       修：sudo chown -R $(id -un):$(id -gn) ${path.dirname(DB_PATH)}`);
+  console.error(`       （VPS 上并行的 sudo 操作会把 data 目录 owner 改回 root，服务却仍在正常读写，`);
+  console.error(`         只有新建文件会失败 —— 这个症状很容易误判成磁盘满或库损坏）`);
+  process.exit(3);
+}
+
 // 临时文件名带 pid：同一个 backup 目录被两个进程同时跑（cron + 手工）时不会互相覆盖
 const tmpFile = path.join(BACKUP_DIR, `.tmp-${process.pid}-${Date.now()}.db`);
 
@@ -435,7 +456,21 @@ try {
     /* ignore */
   }
   console.error(`[失败] VACUUM INTO 失败：${e instanceof Error ? e.message : String(e)}`);
-  console.error(`       常见原因：磁盘满（df -h）、目标目录无权写、源库被长时间独占`);
+  /*
+   * 这里刻意把「三种最常见原因」都列出来，并给出可复制的修复命令。
+   *
+   * 真实踩过的坑（2026-11-23）：并行的 sudo 操作把 /opt/pms/data 的 owner 改成了
+   * root:root，而服务/备份都以 ubuntu 运行。症状极具误导性 ——
+   *   · 服务照样正常读写（句柄是 chown 之前打开的，权限只在 open 时检查）
+   *   · 只有**新建文件**失败，报 "unable to open database: .../backup/.tmp-xxx.db"
+   * 光看这句话会以为是磁盘满或 SQLite 坏了，实际是目录不可写。
+   */
+  console.error(`       目标目录：${BACKUP_DIR}`);
+  console.error(`       1) 目录不可写（VPS 上最常见，sudo 操作后 owner 变 root）`);
+  console.error(`          查：ls -ld ${BACKUP_DIR}`);
+  console.error(`          修：sudo chown -R $(id -un):$(id -gn) ${path.dirname(DB_PATH)}`);
+  console.error(`       2) 磁盘满：df -h ${BACKUP_DIR}`);
+  console.error(`       3) 源库被长时间独占：ss -ltnp | grep 3100`);
   process.exit(3);
 }
 

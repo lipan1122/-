@@ -419,7 +419,16 @@ export function repairDepositResidual(db, hotelId = null, opts = {}) {
 
     /* ---- A2. 只有 stays.deposit、没有押金明细的历史脏数据 ---- */
     const stayOnlyPlans = [];
+    const stayHasPlan = new Set(plans.map((p) => p.stayId).filter((x) => x !== null && x !== undefined));
     for (const stay of checkedOutStays) {
+      /*
+       * 已经有 plan 的入住单不再重复计入：
+       *   有明细时靠 hasItems 天然不会重叠；但「明细已被安全子集清零、按流水兜底」
+       *   （zeroedDepositFallback）时明细是 0，hasItems 变成 false —— 不拦一下就会
+       *   同一张单既算「账单押金冲销」又算「仅入住单清零」，计划数虚高、还多写一遍
+       *   stays.deposit = 0（值相同，但计数和报告会骗人）。
+       */
+      if (stayHasPlan.has(stay.id)) continue;
       const hasItems = foliosOfStay(db, stay.id, stay.hotel_id).some(
         (f) => folioLib.depositHeld(stay.hotel_id, f.id) > 0.005
       );

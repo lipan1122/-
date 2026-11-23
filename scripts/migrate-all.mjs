@@ -763,6 +763,35 @@ export function runMigrations(db, { checkOnly = false } = {}) {
     `CREATE UNIQUE INDEX idx_shifts_open ON shifts(hotel_id, operator) WHERE status = 'OPEN'`
   );
 
+  /*
+   * ---------- 5b-2. 多租户索引补齐（chk-upgrade-tenant 扫出来的）----------
+   *
+   * 这 5 张表都有 hotel_id，但原来的索引**全都不以 hotel_id 打头**：
+   *   booking_rooms      → 只按 booking_id / room_id 建索引
+   *   breakfast_records  → 无 hotel 索引
+   *   meal_vouchers      → 无 hotel 索引
+   *   shop_items         → 无 hotel 索引
+   *   lost_items         → 无 hotel 索引
+   *
+   * 所有查询都带 `WHERE hotel_id = ?`，没有以 hotel_id 打头的索引就只能全表扫。
+   * 现在数据量小（670 / 256 / 40 / 10 / 6 行）看不出，多酒店上线后会成瓶颈。
+   */
+  if (hasTable("booking_rooms")) {
+    addIndex("idx_booking_rooms_hotel", `CREATE INDEX idx_booking_rooms_hotel ON booking_rooms(hotel_id, booking_id)`);
+  }
+  if (hasTable("breakfast_records") && hasColumn("breakfast_records", "date")) {
+    addIndex("idx_breakfast_hotel_date", `CREATE INDEX idx_breakfast_hotel_date ON breakfast_records(hotel_id, date)`);
+  }
+  if (hasTable("meal_vouchers") && hasColumn("meal_vouchers", "code")) {
+    addIndex("idx_meal_vouchers_hotel", `CREATE INDEX idx_meal_vouchers_hotel ON meal_vouchers(hotel_id, code)`);
+  }
+  if (hasTable("shop_items") && hasColumn("shop_items", "category")) {
+    addIndex("idx_shop_items_hotel", `CREATE INDEX idx_shop_items_hotel ON shop_items(hotel_id, category)`);
+  }
+  if (hasTable("lost_items") && hasColumn("lost_items", "found_at")) {
+    addIndex("idx_lost_items_hotel", `CREATE INDEX idx_lost_items_hotel ON lost_items(hotel_id, found_at)`);
+  }
+
   /* ---------- 5c. 房态异常记录表（整改报告第 7 节） ----------
    * 为什么要有这张表：
    *   房态（rooms.status）和入住单（stays.status）是两份独立维护的数据，对不上的时候
@@ -3236,7 +3265,7 @@ export function runMigrations(db, { checkOnly = false } = {}) {
           `押金残留（第 24 段）：${plannedTotal} 处待修复（退现金 ${refundTotal.toFixed(2)}）—— ${detail.join("；")}`
         );
         notes.push(
-          `押金残留：第 23 段提示「需单独跑 node scripts/fix-deposit-residual.mjs --apply」的 ${plannedTotal} 处，` +
+          `押金残留：第 23 段提示「需单独跑 node scripts/fix-deposit-residual.mjs --apply」的部分，` +
             `第 24 段已接管（本次是 --check，只报告；直接跑 node scripts/migrate-all.mjs 或 ` +
             `node scripts/post-deploy.mjs --apply 即清零，不用再单独跑那个脚本）`
         );
@@ -3245,6 +3274,20 @@ export function runMigrations(db, { checkOnly = false } = {}) {
           `押金残留（第 24 段）：已修复 ${changedTotal} 处（退现金 ${refundTotal.toFixed(2)}）—— ${detail.join("；")}`
         );
         changed += changedTotal;
+        /*
+         * 收尾：把本段（以及第 23 段）刚刚清零的零额押金明细删掉。
+         *
+         * 清零的写法是「amount = 0」而不是 DELETE —— 与生产 checkoutAction 一致
+         * （历史上就是只置 0 不删行），所以修复完会留下一批 amount=0 的 DEPOSIT 行；
+         * 而第 22.1 段的规则是「SETTLED 账单上的零额押金明细要删」。
+         * 第 22 段在本段之前已经跑过，这批新出现的行只能等**下一次**迁移才被删 ——
+         * 于是「跑完迁移再跑一次」会多出 1 处变更，看起来像不幂等。
+         * 所以这里把第 22 段那段清理再跑一次（同一份实现，不抄 SQL），让
+         * 「一次迁移 = 收敛到 0 变更」成立；干净库上 changedTotal=0，不会走到这里。
+         */
+        const cleanup = repairDemoDataConsistency(db, { checkOnly: false });
+        for (const a of cleanup.applied) applied.push(`（第 24 段收尾）${a}`);
+        changed += cleanup.changed;
         notes.push(
           `押金残留：第 24 段已自动处理 ${changedTotal} 处，无需再单独跑 scripts/fix-deposit-residual.mjs`
         );
