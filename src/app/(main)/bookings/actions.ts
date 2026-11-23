@@ -134,6 +134,16 @@ function revalidateBookingPaths() {
   revalidatePath("/dashboard");
 }
 
+/*
+ * 建单业务校验失败（并发建单修复）
+ *
+ * 事务里不能直接 `redirect()`：Next 的 redirect 是靠抛 NEXT_REDIRECT 实现的，
+ * 抛在 tx 里会被 tx 的 catch 当成普通异常回滚，外层再翻译成「建单失败：NEXT_REDIRECT」。
+ * 所以事务内一律抛这个专用错误，由 createBookingAction 外层的 catch 统一转成
+ * 「回新建页 + 明确文案」—— 与 assignRoomAction 的 AssignRoomError 同一种写法。
+ */
+class BookingCreateError extends Error {}
+
 /**
  * 新建预订：一个房型一条记录，room_count 为该行预订间数。
  * 入住日期必须早于离店日期；排了具体房间则直接置为已确认，否则待排房。
@@ -383,7 +393,44 @@ export async function createBookingAction(formData: FormData) {
   // 要走「建新表→复制→删旧表→改名→重建索引」12 步流程），风险较高，
   // 已记录在 docs/已知问题.md，单店部署不受影响。
   let remainingLast = 0;
-  tx(() => {
+
+  /** 建单的事务体（抽成函数只为让下面的 catch 兜住事务内的校验异常与唯一索引冲突） */
+  const createBookingInTx = () => {
+    /*
+     * 事务内复查「指定房间」的区间占用（chk-perf 并发建单 4/5 抛 UNIQUE 的根因修复）
+     *
+     * 症状：5 个前台同时给同一间房建同一区间的预订 → 1 个成功、4 个抛
+     *   `UNIQUE constraint failed: booking_rooms.room_id, check_in_date, check_out_date`
+     *   → 生产环境 500，前台不知道订单到底建没建。
+     *
+     * 根因：唯一索引上面那句 `findRoomConflicts()` 在**事务外**，并发下五个请求
+     *   互相看不见对方刚提交的明细，全部通过校验；唯一索引兜底后又没有翻译成人话。
+     *
+     * 修法：事务内再查一遍。`tx()` 是 BEGIN IMMEDIATE，事务开头就拿到写锁，
+     *   后到的事务在 BEGIN 处排队，进入后一定看得见前一个已提交的 booking_rooms 明细，
+     *   所以这一遍才是权威的 —— 命中就抛 BookingCreateError，整单回滚，
+     *   由外层 catch 转成「不能指定该房间：房间 XXX 已被占用…」，不再是 500。
+     *
+     * 事务外那一遍保留：快速失败 / 减少白开事务，但不再作为判定依据。
+     * ⚠ 唯一索引仍是最后一道兜底（见下面的 UNIQUE 翻译），不能删。
+     */
+    for (const line of validLines) {
+      if (!line.roomId) continue;
+      const conflicts = findRoomConflicts({
+        hotelId,
+        roomId: line.roomId,
+        checkIn: checkInDate,
+        checkOut: checkOutDate,
+      });
+      if (conflicts.length > 0) {
+        const room = get<{ room_no: string }>(
+          `SELECT room_no FROM rooms WHERE id = ? AND hotel_id = ?`,
+          [line.roomId, hotelId]
+        );
+        throw new BookingCreateError(`不能指定该房间：${conflictMessage(conflicts, room?.room_no)}`);
+      }
+    }
+
     /*
      * 事务内复查房型库存（P0 超卖）
      *
@@ -493,7 +540,35 @@ export async function createBookingAction(formData: FormData) {
         );
       }
     }
-  });
+  };
+
+  /*
+   * 事务错误翻译（并发建单）
+   *
+   * 事务已由 tx() 内部 ROLLBACK，这里只负责把错误翻成前台能懂的话并回新建页：
+   *   · BookingCreateError = 事务内复查的「房间区间已被占用」→ 原文案就是给用户看的；
+   *   · 房型库存不足（事务内校验抛的普通 Error，文案本来就是给人看的）→ 原样回显；
+   *   · UNIQUE = 唯一索引兜底（事务内复查之后、插入之前被抢写；或老库缺区间校验）
+   *     → 「房间刚被占用，请刷新后重试」，绝不再变成 500；
+   *   · SQLITE_BUSY / database is locked = 写锁排队超时 → 提示稍后重试；
+   *   · 其它异常继续抛：那是真 bug，保留第一手堆栈便于排查。
+   */
+  try {
+    tx(createBookingInTx);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (e instanceof BookingCreateError) {
+      backNew(msg);
+    } else if (/UNIQUE constraint failed/i.test(msg)) {
+      backNew("该房间刚被其他订单占用（并发冲突），整单未创建，请刷新后重试");
+    } else if (/SQLITE_BUSY|database is locked/i.test(msg)) {
+      backNew("系统正忙：另一笔建单正在写库，本次未生效，请稍后重试");
+    } else if (/库存不足|整单未创建/.test(msg)) {
+      backNew(msg);
+    } else {
+      throw e;
+    }
+  }
 
   revalidateBookingPaths();
   redirect("/bookings");

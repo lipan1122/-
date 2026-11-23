@@ -29,7 +29,13 @@ import { registerHooks } from "node:module";
 import { DatabaseSync } from "node:sqlite";
 
 const ROOT = process.cwd();
-const DB_FILE = path.join(ROOT, "data", "pms.db");
+/*
+ * 库路径：优先 PMS_DB_PATH（和全项目其它脚本一致）
+ *
+ * 原来硬编码 path.join(ROOT, "data", "pms.db") —— 连 PMS_DB_PATH 都不认，
+ * 副本库模式在这个脚本上完全失效，永远打真库。
+ */
+const DB_FILE = process.env.PMS_DB_PATH ?? path.join(ROOT, "data", "pms.db");
 
 let pass = 0;
 let fail = 0;

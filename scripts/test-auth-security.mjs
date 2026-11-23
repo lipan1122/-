@@ -16,6 +16,48 @@ import path from "node:path";
 const BASE = { host: "localhost", port: 3100 };
 const DB = process.env.PMS_DB_PATH ?? path.join(process.cwd(), "data", "pms.db");
 const db = new DatabaseSync(DB);
+/*
+ * 这个测试会**临时停用真库的 front 账号**（验证「停用用户后旧 session 立即失效」）。
+ * 原来第 84 行停用、第 87 行恢复 —— 中间崩溃 / 被 kill 就是**永久停用前台账号**。
+ *
+ * 所以这里把原值先记下来，并在 exit / SIGINT / SIGTERM / uncaughtException 时无条件恢复。
+ *
+ * 为什么不用副本库：这是 HTTP 测试，打的是 3100 那个进程，它读的是真库；
+ * PMS_DB_PATH 只影响本脚本自己的连接，不影响服务。所以只能「改真库 + 保证恢复」。
+ */
+const frontBefore = db.prepare("SELECT status FROM users WHERE username = 'front' LIMIT 1").get();
+const frontStatusBefore = frontBefore ? Number(frontBefore.status) : 1;
+let frontRestored = false;
+function restoreFront() {
+  if (frontRestored) return;
+  try {
+    db.prepare("UPDATE users SET status = ? WHERE username = 'front'").run(frontStatusBefore);
+    frontRestored = true;
+    const now = db.prepare("SELECT status FROM users WHERE username = 'front' LIMIT 1").get();
+    console.log(`\n[LOCK] front 账号 status 已恢复为 ${now?.status}（跑前是 ${frontStatusBefore}）`);
+  } catch (e) {
+    console.error(`[WARN] 恢复 front 账号失败：${e.message}`);
+  }
+}
+process.on("exit", () => {
+  try {
+    restoreFront();
+  } catch {
+    /* ignore */
+  }
+});
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(sig, () => {
+    restoreFront();
+    process.exit(130);
+  });
+}
+process.on("uncaughtException", (e) => {
+  console.error(e);
+  restoreFront();
+  process.exit(1);
+});
+
 let pass = 0, fail = 0;
 const check = (name, ok, extra = "") => {
   if (ok) { pass++; console.log(`✅ ${name}`); }
@@ -82,9 +124,16 @@ const frontCookie = again.cookies.join("; ");
 const rBefore = await req("/rooms", { cookie: frontCookie });
 check("前台登录后可访问 /rooms", rBefore.status === 200, `got ${rBefore.status}`);
 db.prepare(`UPDATE users SET status = 0 WHERE username = 'front'`).run();
+try {
 const rAfter = await req("/rooms", { cookie: frontCookie });
 check("停用用户后旧 session 立即失效", rAfter.status === 307 && rAfter.location.includes("/login"), `got ${rAfter.status}`);
-db.prepare(`UPDATE users SET status = 1 WHERE username = 'front'`).run();
+} finally {
+  /* 无论上面断言过不过、有没有抛错，都把 front 账号恢复成跑前的状态 */
+  db.prepare("UPDATE users SET status = ? WHERE username = 'front'").run(frontStatusBefore);
+  frontRestored = true;
+  const restored = db.prepare("SELECT status FROM users WHERE username = 'front' LIMIT 1").get();
+  check("front 账号已恢复原状态（防止测试把它永久停用）", Number(restored?.status) === frontStatusBefore, `got ${restored?.status}`);
+}
 
 /*
  * 7 密码字段非明文

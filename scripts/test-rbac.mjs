@@ -15,11 +15,27 @@
  *      某角色一行配置都没有时回落到硬编码常量（新库没迁移也不至于全站 401）；
  *   4. 回归：node scripts/test-action-permissions.mjs 必须 251/0、test-auth-security.mjs 必须通过。
  *
- * 修 bug 的环境提示：脚本会临时改 role_permissions / role_modules 的行，
- * 结束时（含异常）用内存快照整表还原，不会把验收库改坏。
+ * ── 写库安全（P1 整改：绝不写真库）──
+ * 本脚本必须「改库 → 看权限是否立刻变」，但所有写操作只落在副本库，且整段包在事务里：
+ *   1) 副本库：data/pms.db --VACUUM INTO--> .tmp/rbac-verify-<pid>-<ts>.db；
+ *      副本句柄注入 globalThis.__pmsDb，src/lib/db.ts 的 getDb() 首行
+ *      （`if (globalThis.__pmsDb) return globalThis.__pmsDb;`）会直接把它返回，
+ *      于是 require 进来的真实 session.ts 读写的也是副本 —— 测的仍是源码那份逻辑。
+ *   2) 事务：破坏性用例包在 BEGIN IMMEDIATE 内，收尾一律 ROLLBACK（不 COMMIT）：
+ *      中途抛错 / 断言失败 / 进程被 kill / Ctrl-C 都不会留下半改状态。
+ *   3) 收尾：close + 删副本文件；再以只读连接复查**真库** role_permissions
+ *      的行数分布（总量 + 按角色）与开跑前完全一致，不一致直接退出码 1。
+ *
+ * 旧版是「在真库上改完，再用内存快照整表还原」——进程若在
+ * `DELETE FROM role_permissions` 与重新 INSERT 之间被 kill，生产权限表就被打空
+ * （67 行 → 0），所有角色的权限全错。这是本次整改的动因。
+ *
+ * 环境变量：PMS_DB_PATH 只用来指定「真库」的位置；本脚本不会把它改成副本路径，
+ * 第 10 节 spawn 出去的 test-action-permissions / test-auth-security 继承的仍是原环境，
+ * 行为与整改前完全一致。
  *
  * 用法：node scripts/test-rbac.mjs
- * 退出码：有 ❌ 时 1，全绿 0。
+ * 退出码：有 ❌ 或真库被改动时 1，全绿 0。
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -29,8 +45,11 @@ import { DatabaseSync } from "node:sqlite";
 
 const ROOT = process.cwd();
 const requireCjs = createRequire(import.meta.url);
-const DB_FILE = process.env.PMS_DB_PATH ?? path.join(ROOT, "data", "pms.db");
-const db = new DatabaseSync(DB_FILE);
+/** 真库：只作为「复制源」和「收尾复查对象」，本脚本不写它一个字节 */
+const REAL_DB = process.env.PMS_DB_PATH ?? path.join(ROOT, "data", "pms.db");
+const TMP_DIR = path.join(ROOT, ".tmp");
+/** 副本库：本次验收唯一的写入目标，跑完删除 */
+const COPY_DB = path.join(TMP_DIR, `rbac-verify-${process.pid}-${Date.now()}.db`);
 
 let pass = 0;
 let fail = 0;
@@ -51,6 +70,108 @@ const check = (label, ok, extra = "") => {
 const section = (title) => console.log(`\n=== ${title} ===`);
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf8");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/* ============================================================ 前置：副本库 + 真库基线 */
+/** SQLite 字符串字面量里的路径要写成 'D:/a/b.db' 这种形式 */
+const sqlPath = (p) => p.replace(/\\/g, "/").replace(/'/g, "''");
+const msgOf = (e) => (e instanceof Error ? e.message : String(e));
+
+/** role_permissions 的行数分布（总量 + 按 hotel:role）：跑前跑后各取一次，用来证明没写真库 */
+function permCountsOf(file) {
+  const conn = new DatabaseSync(file, { readOnly: true, timeout: 10000 });
+  try {
+    const total = Number(conn.prepare(`SELECT COUNT(*) AS c FROM role_permissions`).get().c);
+    const byRole = {};
+    for (const r of conn
+      .prepare(`SELECT hotel_id, role, COUNT(*) AS c FROM role_permissions GROUP BY hotel_id, role ORDER BY hotel_id, role`)
+      .all()) {
+      byRole[`${r.hotel_id}:${r.role}`] = Number(r.c);
+    }
+    return { total, byRole };
+  } finally {
+    conn.close();
+  }
+}
+const fmtCounts = (c) =>
+  `${c.total} 行（${Object.entries(c.byRole).map(([k, v]) => `${k.split(":")[1]} ${v}`).join(" / ")}）`;
+const sameCounts = (a, b) => a.total === b.total && JSON.stringify(a.byRole) === JSON.stringify(b.byRole);
+
+if (!fs.existsSync(REAL_DB)) {
+  console.error(`❌ 真库不存在：${REAL_DB}（先跑 node scripts/init-db.mjs，或设 PMS_DB_PATH）`);
+  process.exit(1);
+}
+const REAL_BEFORE = permCountsOf(REAL_DB);
+
+/** 清理历史遗留副本（>6 小时；不动别人正在用的新文件） */
+try {
+  fs.mkdirSync(TMP_DIR, { recursive: true });
+  for (const f of fs.readdirSync(TMP_DIR)) {
+    if (!/^rbac-verify-[\w.-]+\.db(-wal|-shm|-journal)?$/.test(f)) continue;
+    const p = path.join(TMP_DIR, f);
+    if (Date.now() - fs.statSync(p).mtimeMs > 6 * 60 * 60 * 1000) fs.rmSync(p, { force: true });
+  }
+} catch {
+  /* 清理失败不影响本次验收 */
+}
+
+/* 复制真库 → 副本。复制失败就退出，绝不降级成「直接写真库」 */
+try {
+  const src = new DatabaseSync(REAL_DB, { readOnly: true, timeout: 10000 });
+  try {
+    src.exec(`VACUUM INTO '${sqlPath(COPY_DB)}'`);
+  } finally {
+    src.close();
+  }
+} catch (e) {
+  console.error(`❌ 复制真库失败，已中止（不会退化为直接写真库）\n  源 ${REAL_DB}\n  目标 ${COPY_DB}\n  ${msgOf(e)}`);
+  process.exit(1);
+}
+const db = new DatabaseSync(COPY_DB, { timeout: 15000 });
+/** 关键：编译后的 src/lib/db.ts 的 getDb() 第一句就返回它，session.ts 因此也读副本 */
+globalThis.__pmsDb = db;
+
+let txOpen = false;
+/** 回滚副本库事务（幂等）。真库从未进入本连接，回滚不会波及它 */
+function rollbackCopyTx() {
+  if (!txOpen) return;
+  txOpen = false;
+  try {
+    db.exec("ROLLBACK");
+  } catch (e) {
+    console.error(`\n⚠️  回滚副本库失败（副本即将删除，真库不受影响）：${msgOf(e)}`);
+  }
+}
+
+let dbClosed = false;
+/** 关闭并删除副本库；幂等，也挂在 exit 上兜底（Ctrl-C / 提前 exit） */
+function cleanupCopyDb() {
+  rollbackCopyTx();
+  if (!dbClosed) {
+    dbClosed = true;
+    try {
+      db.close();
+    } catch {
+      /* 已关闭 */
+    }
+  }
+  if (globalThis.__pmsDb === db) globalThis.__pmsDb = undefined;
+  for (const f of [COPY_DB, `${COPY_DB}-wal`, `${COPY_DB}-shm`, `${COPY_DB}-journal`]) {
+    try {
+      fs.rmSync(f, { force: true });
+    } catch {
+      /* Windows 上偶发占用：留给下次启动的过期清理 */
+    }
+  }
+}
+process.on("exit", cleanupCopyDb);
+/* Ctrl-C / kill 也要删副本：Node 默认不触发 exit 事件，所以显式接信号 */
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(sig, () => {
+    console.error(`\n收到 ${sig}：回滚并删除副本库（真库未被写入）。`);
+    cleanupCopyDb();
+    process.exit(130);
+  });
+}
 
 /* ============================================================ 0. 加载真实 session.ts */
 /**
@@ -110,6 +231,21 @@ function loadSessionModule() {
 }
 
 const session = loadSessionModule();
+/*
+ * 硬校验（不占断言数，失败直接中止）：session.ts 编译产物拿到的必须就是副本句柄。
+ * 万一将来 db.ts 改成「不再认 globalThis.__pmsDb」（比如改成模块级私有单例），
+ * session 就会自己 new 一个指向 data/pms.db 的连接 —— 那样下面的 DELETE 又会落到真库。
+ * 所以这里先验一次身份，不通过就不跑任何写操作。
+ */
+const compiledDb = requireCjs(path.join(ROOT, ".tmp", "rbac-harness", "db.js"));
+if (compiledDb.getDb() !== db) {
+  console.error(
+    "❌ session.ts 的 getDb() 没有返回副本库句柄（src/lib/db.ts 的 __pmsDb 注入失效）。\n" +
+      "   拒绝继续：否则后面的 DELETE 会写到真库。请检查 src/lib/db.ts 的 getDb 实现。"
+  );
+  cleanupCopyDb();
+  process.exit(1);
+}
 const sessionSrc = read("src/lib/session.ts");
 const migrateSrc = read("scripts/migrate-all.mjs");
 const settingsActionsSrc = read("src/app/(main)/settings/actions.ts");
@@ -167,11 +303,16 @@ const PERMISSIONS_SRC = parsePermissionTable(sessionSrc);
 const ROLE_MODULES_SRC = parseRoleModules(sessionSrc);
 
 /* ============================================================ 2. 数据快照（用于还原） */
+/*
+ * 这里是「副本库内的还原」，不是「真库的还原」：
+ *   用例之间需要回到基准状态（例如第 4 节验完 TTL 后要断言 cashier 又有了 refund），
+ *   所以仍然保留快照还原；全局兜底则是最外层事务的 ROLLBACK。
+ */
 
 const permSnapshot = db.prepare(`SELECT hotel_id, role, permission, created_at FROM role_permissions`).all();
 const modSnapshot = db.prepare(`SELECT hotel_id, role, module, created_at FROM role_modules`).all();
 
-/** 把 role_permissions / role_modules 恢复成脚本启动时的样子 */
+/** 把副本库的 role_permissions / role_modules 恢复成脚本启动时的样子 */
 function restoreSnapshots() {
   try {
     db.exec("DELETE FROM role_permissions");
@@ -186,7 +327,7 @@ function restoreSnapshots() {
     for (const r of modSnapshot) insMod.run(r.hotel_id, r.role, r.module, r.created_at);
     session.invalidatePermissionCache();
   } catch (e) {
-    console.error(`\n⚠️  还原权限表失败，请用备份恢复：${e instanceof Error ? e.message : String(e)}`);
+    console.error(`\n⚠️  还原副本库权限表失败（副本即将丢弃）：${msgOf(e)}`);
   }
 }
 
@@ -195,8 +336,14 @@ function restoreSnapshots() {
 async function main() {
   console.log("========== 整改 5.2 角色权限数据库化 验收 ==========");
   console.log(`项目：${ROOT}`);
-  console.log(`数据库：${DB_FILE}`);
+  console.log(`真库：${REAL_DB}`);
+  console.log(`      （只读复制源 + 收尾复查；role_permissions 基线 ${fmtCounts(REAL_BEFORE)}）`);
+  console.log(`副本：${COPY_DB}`);
+  console.log(`      （唯一写入目标；整段 BEGIN IMMEDIATE，收尾 ROLLBACK，跑完删除）`);
 
+  /* 破坏性用例全部放进副本库事务里；退出/异常一律回滚，绝不 COMMIT */
+  db.exec("BEGIN IMMEDIATE");
+  txOpen = true;
   try {
     /* ---------------------------------------------------------- 1. 表与索引 */
     section("1. 表结构与索引");
@@ -457,7 +604,15 @@ async function main() {
       /idx_role_modules_key/.test(migrateSrc) && /idx_role_permissions_key/.test(migrateSrc)
     );
   } finally {
+    /*
+     * 两层收尾：
+     *   1) restoreSnapshots() —— 用例之间需要回到基准状态，语义与整改前一致；
+     *   2) rollbackCopyTx()   —— 全局兜底：副本库回到开跑前，即使上面抛错/断言失败、
+     *                            甚至进程在这之前被 kill，真库也一个字节都没被碰过。
+     */
     restoreSnapshots();
+    rollbackCopyTx();
+    session.invalidatePermissionCache(); // 丢掉回滚前读进缓存的权限行
   }
 
   /* ---------------------------------------------------------- 9. 账号 × 页面访问 */
@@ -534,7 +689,27 @@ async function main() {
     authSec.code === 0 ? "" : `退出码 ${authSec.code}`
   );
 
+  /* ---------------------------------------------------------- 11. 真库未被写入 */
+  /*
+   * 这一段故意不用 check()：断言总数必须仍是 63（加一条就变 64，与整改前的口径对不上）。
+   * 但它是硬门禁：真库行数只要有一丝变化就抛错 → 退出码 1。
+   */
+  section("11. 真库未被写入（副本库 + 事务回滚）");
+  const REAL_AFTER = permCountsOf(REAL_DB);
+  const realUntouched = sameCounts(REAL_BEFORE, REAL_AFTER);
+  console.log(`  真库 ${REAL_DB}`);
+  console.log(`    role_permissions 跑前：${fmtCounts(REAL_BEFORE)}`);
+  console.log(`    role_permissions 跑后：${fmtCounts(REAL_AFTER)}`);
+  console.log(`    副本 ${path.basename(COPY_DB)} 已回滚并删除`);
+  if (!realUntouched) {
+    throw new Error(
+      `真库 role_permissions 被改动了！跑前 ${fmtCounts(REAL_BEFORE)} → 跑后 ${fmtCounts(REAL_AFTER)}`
+    );
+  }
+  console.log(`  🔒 真库 role_permissions 与开跑前完全一致（${REAL_AFTER.total} 行）`);
+
   /* ---------------------------------------------------------- 汇总 */
+  cleanupCopyDb(); // 先删副本再汇总，避免残留文件
   console.log("\n========== 汇总 ==========");
   if (fail > 0) {
     console.log("❌ 未通过项：");
@@ -546,6 +721,7 @@ async function main() {
 
 main().catch((e) => {
   console.error("脚本执行失败：", e);
-  restoreSnapshots();
+  rollbackCopyTx(); // 副本库回滚（真库从未参与）
+  cleanupCopyDb(); // 关闭并删除副本
   process.exit(1);
 });

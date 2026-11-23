@@ -216,7 +216,16 @@ function main() {
   };
   const HOTEL_ID = Number(argVal("--hotel", process.env.PMS_HOTEL_ID ?? 1));
   const today = argVal("--date", process.env.PMS_BIZ_DATE ?? localToday());
-  const DRY_RUN = args.includes("--dry-run");
+  /*
+   * 默认 dry-run，写库必须显式 --apply
+   *
+   * 原来 DRY_RUN = args.includes("--dry-run") → 默认 false → **直接跑就往真库
+   * room_anomalies 里 INSERT**。运维脚本一上手就改生产数据，风险太高。
+   *
+   * 现在：默认只读；要落库加 --apply；仍然接受 --dry-run（显式只读，等价于默认）。
+   */
+  const APPLY = args.includes("--apply");
+  const DRY_RUN = !APPLY || args.includes("--dry-run");
 
   if (!existsSync(DB_PATH)) {
     console.error(`数据库不存在：${DB_PATH}`);

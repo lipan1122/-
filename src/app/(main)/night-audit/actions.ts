@@ -128,11 +128,15 @@ export async function runNightAuditAction(): Promise<{ error: string } | { ok: t
   // 营业日（按设置里的切换时间，默认 00:00）
   const today = bizToday(user.hotelId);
 
+  /*
+   * 事务外先看一眼「今天是否已夜审」——只用于**快速失败**（避免白跑 preflight），
+   * 真正的判定在下面事务内复查（chk-perf 并发夜审 2/3 抛 UNIQUE 的根因就是只看了这一眼）。
+   */
   const existed = get<{ id: number }>(
     `SELECT id FROM night_audits WHERE hotel_id = ? AND biz_date = ?`,
     [hotelId, today]
   );
-  if (existed) return { error: "今日已完成夜审" };
+  if (existed) return { error: "今日夜审已完成，无需重复执行" };
 
   /*
    * 第 4 轮 P1-1：营业日未结束时不能夜审
@@ -191,7 +195,51 @@ export async function runNightAuditAction(): Promise<{ error: string } | { ok: t
 
   const now = nowIso();
 
-  tx(() => {
+  /*
+   * ══════════════════════════════════════════════════════════════════════════
+   * 并发夜审修复（chk-perf 真子进程压测：3 个请求同时夜审 → 2 个抛 UNIQUE）
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * 症状：3 个店长同时点「执行夜审」，数据是对的（night_audits 只有 1 条），
+   *   但另外 2 个请求抛 `UNIQUE constraint failed: night_audits.hotel_id, night_audits.biz_date`
+   *   —— 生产环境就是 500 错误页，用户不知道到底审没审成功。
+   *
+   * 根因：`existed` 查在**事务外**，事务内不复查；两个请求都读到「今天没审过」，
+   *   然后都进事务，后提交的那个撞唯一索引直接抛。
+   *
+   * 修法（两层，都保留）：
+   *   ① 事务内复查：`tx()` 是 BEGIN IMMEDIATE，事务开头就拿到写锁，
+   *      后到的事务在 BEGIN 处排队（busy_timeout=10s），进入后能看到前一个已提交的记录，
+   *      这一遍才权威 —— 命中就什么也不写、直接结束（alreadyDone）。
+   *   ② 落库改 `INSERT ... ON CONFLICT DO NOTHING` 并看 changes：
+   *      极端情况下（复查之后、插入之前被抢写）不再抛错，changes=0 即「别人刚审完」。
+   *   ③ 最外层 catch 兜底：万一还是抛了 UNIQUE（例如老库索引形态不同），
+   *      翻译成「今日夜审已完成」而不是把天书甩给用户 / 变成 500。
+   *
+   * 业务语义没变：夜审一天只能成功一次；变的只是**失败那几次的提示方式**。
+   */
+  let alreadyDone = false;
+
+  /*
+   * 夜审的事务体。
+   * 抽成函数只为了下面 `try { tx(runAudit) } catch` 能兜住 tx 抛出的 UNIQUE ——
+   * 事务体本身与原实现逐行一致（除了开头的事务内复查和结尾的 ON CONFLICT）。
+   */
+  const runAudit = () => {
+    /*
+     * ① 事务内复查（权威判定）
+     *    命中说明另一个夜审请求已经提交：本次不补房费、不标 NOSHOW、不写汇总，
+     *    空事务直接提交（什么都不写比回滚更干净，也不会让 tx 抛错）。
+     */
+    const done = get<{ id: number }>(
+      `SELECT id FROM night_audits WHERE hotel_id = ? AND biz_date = ?`,
+      [hotelId, today]
+    );
+    if (done) {
+      alreadyDone = true;
+      return;
+    }
+
     // 为每间在住房补今日房费，已有当日 ROOM 明细的跳过（幂等）
     for (const stay of inhouseStays) {
       const folioId = stay.folio_id;
@@ -324,12 +372,23 @@ export async function runNightAuditAction(): Promise<{ error: string } | { ok: t
     const netRevenue = round2(grossRevenue - refundTotal);
     const occupancy = sellableRooms > 0 ? roomNights / sellableRooms : 0;
 
-    run(
+    /*
+     * ② 落库：`ON CONFLICT DO NOTHING` + 看 changes
+     *
+     * 不再直接 INSERT 让唯一索引抛错。changes = 0 表示「唯一键把这行吞了」，
+     * 也就是另一个夜审事务刚提交 —— 本次按「今日已完成」处理，不报 500。
+     * ⚠ 不能看 lastInsertRowid：被 DO NOTHING 吞掉的插入也返回上一行的 rowid。
+     *
+     * ⚠ INSERT 的列清单与 VALUES 占位符必须保持原样：
+     *   scripts/test-night-audit-metrics.mjs 会拿它们与源码逐字比对。
+     */
+    const inserted = run(
       `INSERT INTO night_audits
          (hotel_id, biz_date, status, rooms_sold, hourly_rooms, revenue, occupancy,
           revenue_room, revenue_food, revenue_other, refund_total, revenue_net,
           operator, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       ON CONFLICT DO NOTHING`,
       [
         hotelId,
         today,
@@ -347,7 +406,27 @@ export async function runNightAuditAction(): Promise<{ error: string } | { ok: t
         now,
       ]
     );
-  });
+    if (inserted.changes === 0) alreadyDone = true;
+  };
+
+  try {
+    tx(runAudit);
+  } catch (e) {
+    /*
+     * ③ 方案 B 兜底：把「唯一索引抛出来的重复夜审」翻译成人话。
+     *    能走到这里说明事务内复查 + ON CONFLICT 都没挡住（例如老库缺唯一索引形态），
+     *    仍然按「今日已完成」返回，绝不把 UNIQUE 天书变成 500。
+     *    其它异常（磁盘、锁超时之外的未知错误）继续抛，保留第一手线索。
+     */
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/UNIQUE constraint failed: night_audits/i.test(msg)) {
+      alreadyDone = true;
+    } else {
+      throw e;
+    }
+  }
+
+  if (alreadyDone) return { error: "今日夜审已完成，无需重复执行（另一个夜审请求刚刚完成）" };
 
   /*
    * 渠道库存（整改 4.1 缺口）：夜审的事务已在上面提交完成（任一步失败都会整体回滚，
