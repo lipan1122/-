@@ -152,7 +152,14 @@ let cancelled = 0;
 db.exec("BEGIN");
 try {
   for (const [id, info] of toCancel) {
-    run(`UPDATE bookings SET status = 'CANCELLED', updated_at = ? WHERE id = ? AND hotel_id = ?`, [
+    /*
+     * 主单的 room_id 也必须清空
+     *
+     * 只清 booking_rooms 不够：test-cancel-assign 有一条断言
+     * 「已取消订单主单 room_id 已清空」。留着 room_id 会让这间房
+     * 在按主单统计的地方仍被算成被占用。
+     */
+    run(`UPDATE bookings SET status = 'CANCELLED', room_id = NULL, updated_at = ? WHERE id = ? AND hotel_id = ?`, [
       new Date().toISOString(),
       id,
       HOTEL,
