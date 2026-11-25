@@ -90,6 +90,56 @@ fi
 
 export NODE_ENV=production
 
+# ─────────────────── 3.5 部署前强制备份（保护现有数据）───────────────────
+#
+# 为什么必须放在「构建」之前、而且要单独一步：
+#
+#   `npm run build` 时 src/lib/db.ts 会 new DatabaseSync(DB_FILE)，
+#   也就是**构建过程本身会打开数据库文件**。如果那个文件状态不对
+#   （例如另一套结构、或者被别的进程写过半截），构建期间就可能把它改掉；
+#   等构建完再备份，备份到的已经不是「部署前的库」了。
+#
+#   实测过一次丢数据的教训：某次部署后业务表全 0（guests/bookings/stays/folios/payments），
+#   而备份目录里最新的一份也已经是空库 —— 没有一份能回到「有数据」的状态，
+#   最后是用两天前的一份旧备份恢复的，丢了两天的操作记录。
+#
+# 所以：只要 data/pms.db 存在且非空，就先 VACUUM INTO 一份带时间戳的快照。
+if [ -f data/pms.db ]; then
+  BEFORE_SIZE=$(stat -c '%s' data/pms.db 2>/dev/null || echo 0)
+  if [ "$BEFORE_SIZE" -gt 102400 ]; then
+    mkdir -p data/backup
+    SNAP="data/backup/pms.before-deploy.$(date +%Y%m%d-%H%M%S).db"
+    if node -e "
+      const {DatabaseSync} = require('node:sqlite');
+      const db = new DatabaseSync('data/pms.db', { readOnly: true });
+      db.exec(\"VACUUM INTO '\$SNAP'\");
+      db.close();
+    " 2>/dev/null && [ -f "$SNAP" ]; then
+      log "部署前快照：$SNAP（$(du -h "$SNAP" | cut -f1)）"
+      # 快照必须能读出业务数据，否则宁可不往下走
+      SNAP_ROWS=$(node -e "
+        const {DatabaseSync} = require('node:sqlite');
+        const db = new DatabaseSync('$SNAP', { readOnly: true });
+        const c = db.prepare('SELECT COUNT(*) AS c FROM stays').get().c;
+        db.close(); console.log(c);
+      " 2>/dev/null | tail -1)
+      log "快照自检：$SNAP_ROWS 张入住单"
+      if [ "${SNAP_ROWS:-0}" -eq 0 ] && [ "$(node -e "
+        const {DatabaseSync} = require('node:sqlite');
+        const db = new DatabaseSync('data/pms.db', { readOnly: true });
+        const c = db.prepare('SELECT COUNT(*) AS c FROM stays').get().c;
+        db.close(); console.log(c);
+      " 2>/dev/null | tail -1)" != "0" ]; then
+        warn "快照读不出业务数据，但当前库有 —— 快照可能不完整，请人工确认后再继续"
+      fi
+    else
+      warn "部署前快照失败（VACUUM INTO 出错）—— 请手动备份 data/pms.db 后再部署"
+    fi
+  else
+    log "数据库为空或很小（$BEFORE_SIZE 字节），跳过部署前快照"
+  fi
+fi
+
 # ─────────────────────────── 4. 构建 ───────────────────────────
 log "安装依赖（约 1-2 分钟）"
 npm ci --include=dev >/dev/null 2>&1 || npm install --include=dev >/dev/null 2>&1
