@@ -2,10 +2,12 @@ import type { ReactNode } from "react";
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { ensureArAccountSchema, listArAgingDetail, listArLedgerDrift } from "@/lib/ar";
+import { bizToday } from "@/lib/biz-date";
 import { all, get } from "@/lib/db";
 import { ensureWalletSchema } from "@/lib/member-wallet";
 import {
   dayCount,
+  estimatedHint,
   nightSeries,
   occupancyMetrics,
   occupancyOfDay,
@@ -98,6 +100,10 @@ const REPORTS: Record<string, ReportMeta> = {
   "hourly-orders": { label: "时租房报表", desc: "钟点房（nights = 0）订单与在店时长" },
   "package-report": { label: "包价报表", desc: "使用包价的订单与包价设置对照" },
   "breakfast-report": { label: "早餐报表", desc: "按日期 / 房号统计早餐核销份数" },
+  "pending-assign-audit": {
+    label: "待排房明细核对",
+    desc: "已确认未排房明细按「正常 / 需要关注 / 异常」分类核对（只读，不改订单状态）",
+  },
 };
 
 const DEFAULT_KEY = "summary";
@@ -172,7 +178,7 @@ const MENU: MenuNode[] = [
   {
     kind: "group",
     title: "异常与催收",
-    keys: ["quick-biz-type", "quick-ar", "quick-dun", "quick-fin-ex", "quick-fd-ex"],
+    keys: ["quick-biz-type", "quick-ar", "quick-dun", "quick-fin-ex", "quick-fd-ex", "pending-assign-audit"],
   },
 ];
 
@@ -3575,7 +3581,17 @@ function ReportFinanceOverview({ ctx }: ReportProps) {
         <StatCard label="营业收入" value={fmtMoney(cur.income)} hint="房费 + 餐饮 + 其他" />
         <StatCard label="营业成本" value={fmtMoney(cost)} hint="本期未归集成本，按 0 计" />
         <StatCard label="毛利" value={fmtMoney(gross)} />
-        <StatCard label="出租率" value={fmtPct(occupancy)} hint={`间夜 ${cur.nights} ÷ 可售房晚 ${capNights}`} />
+        <StatCard
+          label="出租率"
+          value={fmtPct(occupancy)}
+          hint={[
+            `间夜 ${cur.nights} ÷ 可售房晚 ${capNights}`,
+            /* 缺夜审快照的日期是拿当前房态估算的，必须让看数的人知道 */
+            estimatedHint(ctx.occupancy),
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        />
       </div>
 
       <SectionCard title="财务概况" right={`${rangeText(ctx)} · ${days} 天 · 可售房 ${sellableRooms} 间`}>
@@ -11605,7 +11621,15 @@ function ReportRoomBizDaily({ ctx }: ReportProps) {
         <StatCard
           label="出租率"
           value={fmtPct(occ.occupancy)}
-          hint={`${fmtInt(occ.roomNights)} 间夜 ÷ 可售房晚 ${fmtInt(sellableNights)}（可售 ${sellableRooms} 间 × ${days} 天）`}
+          hint={
+            /* 同上：${sellableRooms} 如果是估算值，这里必须标出来 */
+            [
+              `${fmtInt(occ.roomNights)} 间夜 ÷ 可售房晚 ${fmtInt(sellableNights)}（可售 ${sellableRooms} 间 × ${days} 天）`,
+              estimatedHint(occ),
+            ]
+              .filter(Boolean)
+              .join(" · ")
+          }
         />
       </div>
 
@@ -11785,6 +11809,781 @@ function ReportRoomBizDaily({ ctx }: ReportProps) {
 }
 
 /* ================================================================== *
+ * 八点六、待排房明细核对（上线评审 P1）
+ *
+ * ── 这张报表要解决的问题 ──
+ * 本地副本数据体检报出一句「未排房已确认明细：63 条警告」。
+ * 如果把这 63 条当成 63 个异常、顺手批量改状态，就会误伤其中绝大多数正常单 ——
+ * 酒店里「已担保、已确认、还没排房」是完全合法的在途状态：
+ * 排房本来就是临近入住（甚至到店当天）才做的动作，不是确认时就该做的事。
+ *
+ * ── 所以这里只做三件事 ──
+ *   ① 把 63 条按「正常 / 需要关注 / 异常」分开，每条给判定理由；
+ *   ② 每类给条数 / 间夜 / 房费小计，异常再按成因分组；
+ *   ③ 异常逐条给「建议处理方式」——人工确认后再动，本报表不提供任何批量入口。
+ *
+ * ── 只读 ──
+ * 全部查询都是 SELECT：不改订单状态、不改明细状态、不写 room_id。
+ *
+ * ── 与 scripts/audit-pending-details.mjs 的关系 ──
+ * 同一套判据的两个出口：脚本给运维/CI 复跑，报表给店长/前台按天看。
+ * 改判据时两处都要改（脚本里也有同样的注释）。
+ * ================================================================== */
+
+/** 「临近预抵」窗口：排房前置工作一般提前 3 天做 */
+const PENDING_AUDIT_SOON_DAYS = 3;
+
+/** 渠道类型里的 OTA（在线旅行社）——与 /channels 的分组口径一致 */
+const PENDING_AUDIT_OTA = new Set([
+  "ctrip",
+  "meituan",
+  "qunar",
+  "elong",
+  "fliggy",
+  "douyin",
+  "meituan_homestay",
+]);
+
+/** 异常成因的中文说明（key 与脚本里的 code 一一对应） */
+const PENDING_AUDIT_CODE_LABEL: Record<string, string> = {
+  NO_SHOW_OVERDUE: "整段住宿日期已过，仍 CONFIRMED 且从未排房",
+  IN_WINDOW_NO_STAY: "入住日已过、离店日未到，无房号无住宿单",
+  BOOKING_STATE: "主单状态已不是确认 / 待排（取消、失联、离店等），明细仍 CONFIRMED",
+  ROOM_TYPE_MISSING: "房型已被删除",
+  CAPACITY_SHORT: "当夜该房型剩余可排房不足（排不出房）",
+};
+
+type PendingAuditBucket = "NORMAL" | "ATTENTION" | "ANOMALY";
+
+type PendingAuditRow = {
+  detailId: number;
+  bookingId: number;
+  bookingNo: string;
+  bookingStatus: string;
+  guest: string;
+  mobile: string;
+  roomType: string;
+  channel: string;
+  channelType: string;
+  checkInDate: string;
+  checkOutDate: string;
+  nights: number;
+  rate: number;
+  amount: number;
+  bucket: PendingAuditBucket;
+  code: string;
+  severity: string;
+  reason: string;
+  marks: string[];
+  advice: string;
+};
+
+type PendingAuditRaw = {
+  detail_id: number;
+  booking_id: number;
+  booking_no: string | null;
+  booking_status: string | null;
+  room_type_id: number | null;
+  check_in_date: string | null;
+  check_out_date: string | null;
+  rate: number | null;
+  guest: string | null;
+  mobile: string | null;
+  channel_name: string | null;
+  channel_type: string | null;
+  channel_enabled: number | null;
+  channel_id: number | null;
+  room_type_name: string | null;
+  guarantee: string | null;
+  team_name: string | null;
+  booking_type: string | null;
+};
+
+/** 目标明细：明细已确认、但 room_id 为空（或 0 = 早期版本的「未排」写法） */
+function pendingAuditRawRows(hotelId: number): PendingAuditRaw[] {
+  return all<PendingAuditRaw>(
+    `SELECT br.id                                   AS detail_id,
+            br.booking_id,
+            br.room_type_id,
+            br.check_in_date,
+            br.check_out_date,
+            COALESCE(NULLIF(br.rate, 0), b.rate, 0) AS rate,
+            COALESCE(br.guest_name, b.guest_name)   AS guest,
+            b.booking_no,
+            b.mobile,
+            b.status                                AS booking_status,
+            b.channel_id,
+            b.guarantee,
+            b.team_name,
+            b.booking_type,
+            c.name                                  AS channel_name,
+            c.channel_type,
+            c.enabled                               AS channel_enabled,
+            rt.name                                 AS room_type_name
+       FROM booking_rooms br
+       JOIN bookings b         ON b.id = br.booking_id
+       LEFT JOIN channels c    ON c.id = b.channel_id
+       LEFT JOIN room_types rt ON rt.id = br.room_type_id
+      WHERE br.hotel_id = ?
+        AND br.status = 'CONFIRMED'
+        AND (br.room_id IS NULL OR br.room_id = 0)
+      ORDER BY br.check_in_date, br.id`,
+    [hotelId]
+  );
+}
+
+/** 两个日期之间的晚数（date-only；钟点房可能是 0，所以不用 nightsBetween 的 max(1)） */
+function pendingAuditNights(from: string, to: string): number {
+  const ms = Date.parse(`${to}T00:00:00`) - Date.parse(`${from}T00:00:00`);
+  return Number.isFinite(ms) ? Math.max(0, Math.round(ms / 86400000)) : 0;
+}
+
+/**
+ * 每个房型的物理可卖房量（扣掉维修房 OOO / 锁房 LOCK）
+ * 口径与 src/lib/room-stock.ts 的 RoomTypeStock.capacity 一致。
+ */
+function pendingAuditCapacity(hotelId: number): Map<number, { capacity: number; ooo: number; lock: number }> {
+  const map = new Map<number, { capacity: number; ooo: number; lock: number }>();
+  for (const r of all<{ rt: number | null; capacity: number | null; ooo: number | null; lock: number | null }>(
+    `SELECT room_type_id AS rt,
+            SUM(CASE WHEN status IN ('OOO','LOCK') THEN 0 ELSE 1 END) AS capacity,
+            SUM(CASE WHEN status = 'OOO' THEN 1 ELSE 0 END)          AS ooo,
+            SUM(CASE WHEN status = 'LOCK' THEN 1 ELSE 0 END)         AS lock
+       FROM rooms WHERE hotel_id = ? GROUP BY room_type_id`,
+    [hotelId]
+  )) {
+    if (r.rt === null) continue;
+    map.set(Number(r.rt), { capacity: num(r.capacity), ooo: num(r.ooo), lock: num(r.lock) });
+  }
+  return map;
+}
+
+/**
+ * 某个「夜」某房型已被占掉几间：已排房 + 人在住
+ *
+ * 为什么不直接用 room-stock 的 todayRoomTypeStock：那个函数用 rooms.status 判断在住，
+ * 只对「今天」成立。这张报表要核对的是未来某一晚（比如 12 月 20 日），
+ * 今天的 OC 房态跟那一晚没有关系，所以改按住期(stays)与 booking_rooms 的日期重叠来算。
+ */
+function pendingAuditOccupancy(
+  hotelId: number,
+  day: string
+): { assigned: Map<number, number>; inhouse: Map<number, number> } {
+  const assigned = new Map<number, number>();
+  for (const r of all<{ rt: number | null; cnt: number | null }>(
+    `SELECT br.room_type_id AS rt, COUNT(*) AS cnt
+       FROM booking_rooms br
+       JOIN bookings b ON b.id = br.booking_id AND b.hotel_id = br.hotel_id
+      WHERE br.hotel_id = ?
+        AND br.status IN ('PENDING','CONFIRMED')
+        AND b.status  IN ('PENDING','CONFIRMED')
+        AND br.room_id IS NOT NULL AND br.room_id > 0
+        AND br.check_in_date <= ? AND br.check_out_date > ?
+      GROUP BY br.room_type_id`,
+    [hotelId, day, day]
+  )) {
+    if (r.rt === null) continue;
+    assigned.set(Number(r.rt), num(r.cnt));
+  }
+
+  const inhouse = new Map<number, number>();
+  for (const r of all<{ rt: number | null; cnt: number | null }>(
+    `SELECT rm.room_type_id AS rt, COUNT(*) AS cnt
+       FROM stays s
+       JOIN rooms rm ON rm.id = s.room_id
+      WHERE s.hotel_id = ?
+        AND s.status = 'INHOUSE'
+        AND substr(s.check_in_time, 1, 10) <= ?
+        AND COALESCE(s.expect_check_out, '9999-12-31') > ?
+      GROUP BY rm.room_type_id`,
+    [hotelId, day, day]
+  )) {
+    if (r.rt === null) continue;
+    inhouse.set(Number(r.rt), num(r.cnt));
+  }
+
+  return { assigned, inhouse };
+}
+
+type PendingAuditCheck = {
+  bizDay: string;
+  arrivalTotal: number;
+  arrivalAssigned: number;
+  arrivalUnassigned: number;
+  arrivalPending: number;
+  arrivalConfirmed: number;
+  inWindowUnassigned: number;
+  soonTo: string;
+  soonUnassigned: number;
+  physicalRooms: number;
+  oooRooms: number;
+  lockRooms: number;
+};
+
+type PendingAuditResult = {
+  bizDay: string;
+  rows: PendingAuditRow[];
+  normal: PendingAuditRow[];
+  attention: PendingAuditRow[];
+  anomaly: PendingAuditRow[];
+  anomalyGroups: { code: string; label: string; rows: PendingAuditRow[] }[];
+  sources: { label: string; rows: PendingAuditRow[] }[];
+  marks: { name: string; rows: PendingAuditRow[] }[];
+  check: PendingAuditCheck;
+};
+
+/**
+ * 营业日核对：今日预抵 / 待排 / 可售
+ *
+ * 这套数和上面 63 条是两回事：63 条只回答「已确认未排房的明细该怎么分」，
+ * 而今天的工作面还包括 PENDING 未排、已排房和全店可卖房量。
+ */
+function pendingAuditBizDayCheck(
+  hotelId: number,
+  bizDay: string,
+  capacity: Map<number, { capacity: number; ooo: number; lock: number }>
+): PendingAuditCheck {
+  const check: PendingAuditCheck = {
+    bizDay,
+    arrivalTotal: 0,
+    arrivalAssigned: 0,
+    arrivalUnassigned: 0,
+    arrivalPending: 0,
+    arrivalConfirmed: 0,
+    inWindowUnassigned: 0,
+    soonTo: todayStr(addDays(bizDay, PENDING_AUDIT_SOON_DAYS)),
+    soonUnassigned: 0,
+    physicalRooms: 0,
+    oooRooms: 0,
+    lockRooms: 0,
+  };
+
+  for (const r of all<{ detail_status: string | null; assigned: number | null; cnt: number | null }>(
+    `SELECT br.status AS detail_status,
+            CASE WHEN br.room_id IS NULL OR br.room_id = 0 THEN 0 ELSE 1 END AS assigned,
+            COUNT(*) AS cnt
+       FROM booking_rooms br
+       JOIN bookings b ON b.id = br.booking_id
+      WHERE br.hotel_id = ?
+        AND br.check_in_date = ?
+        AND br.status IN ('PENDING','CONFIRMED')
+        AND b.status  IN ('PENDING','CONFIRMED')
+      GROUP BY br.status, assigned`,
+    [hotelId, bizDay]
+  )) {
+    const cnt = num(r.cnt);
+    check.arrivalTotal += cnt;
+    if (num(r.assigned) === 1) check.arrivalAssigned += cnt;
+    else check.arrivalUnassigned += cnt;
+    if (r.detail_status === "PENDING") check.arrivalPending += cnt;
+    else check.arrivalConfirmed += cnt;
+  }
+
+  const inWindow = get<{ c: number | null }>(
+    `SELECT COUNT(*) AS c
+       FROM booking_rooms br
+       JOIN bookings b ON b.id = br.booking_id
+      WHERE br.hotel_id = ?
+        AND (br.room_id IS NULL OR br.room_id = 0)
+        AND br.status = 'CONFIRMED'
+        AND b.status IN ('PENDING','CONFIRMED')
+        AND br.check_in_date <= ? AND br.check_out_date > ?`,
+    [hotelId, bizDay, bizDay]
+  );
+  check.inWindowUnassigned = num(inWindow?.c);
+
+  const soon = get<{ c: number | null }>(
+    `SELECT COUNT(*) AS c
+       FROM booking_rooms br
+       JOIN bookings b ON b.id = br.booking_id
+      WHERE br.hotel_id = ?
+        AND (br.room_id IS NULL OR br.room_id = 0)
+        AND br.status IN ('PENDING','CONFIRMED')
+        AND b.status IN ('PENDING','CONFIRMED')
+        AND br.check_in_date > ? AND br.check_in_date <= ?`,
+    [hotelId, bizDay, check.soonTo]
+  );
+  check.soonUnassigned = num(soon?.c);
+
+  for (const v of capacity.values()) {
+    check.physicalRooms += v.capacity;
+    check.oooRooms += v.ooo;
+    check.lockRooms += v.lock;
+  }
+
+  return check;
+}
+
+/**
+ * 分类主函数（判据与 scripts/audit-pending-details.mjs 完全一致）
+ *
+ * 判定顺序就是优先级：先看「订单本身是否自相矛盾 / 历史残留」，
+ * 再看「今天要不要处理」，最后才挂主数据标记。
+ * 顺序反了会得出「已取消的单被算成今日预抵」这种结论。
+ */
+function pendingAssignAudit(hotelId: number): PendingAuditResult {
+  const bizDay = bizToday(hotelId);
+  const capacity = pendingAuditCapacity(hotelId);
+  const raw = pendingAuditRawRows(hotelId);
+  const roomTypeIds = new Set(
+    all<{ id: number }>(`SELECT id FROM room_types WHERE hotel_id = ?`, [hotelId]).map((r) => Number(r.id))
+  );
+
+  /* 同一晚同房型的「待排间数」要一起算：3 条明细挤 1 间房时，单看每条都「排得出」 */
+  const needByKey = new Map<string, number>();
+  for (const r of raw) {
+    const key = `${r.check_in_date ?? ""}|${r.room_type_id ?? 0}`;
+    needByKey.set(key, (needByKey.get(key) ?? 0) + 1);
+  }
+  const occCache = new Map<string, { assigned: Map<number, number>; inhouse: Map<number, number> }>();
+  const freeRoomsFor = (day: string, roomTypeId: number): number => {
+    if (!occCache.has(day)) occCache.set(day, pendingAuditOccupancy(hotelId, day));
+    const occ = occCache.get(day);
+    const cap = capacity.get(roomTypeId);
+    if (!occ || !cap) return 0;
+    return cap.capacity - (occ.assigned.get(roomTypeId) ?? 0) - (occ.inhouse.get(roomTypeId) ?? 0);
+  };
+
+  const soonTo = todayStr(addDays(bizDay, PENDING_AUDIT_SOON_DAYS));
+  const rows: PendingAuditRow[] = [];
+
+  for (const r of raw) {
+    const checkIn = r.check_in_date ?? "";
+    const checkOut = r.check_out_date ?? "";
+    const nights = pendingAuditNights(checkIn, checkOut);
+    const rate = num(r.rate);
+    const channelId = r.channel_id === null ? null : Number(r.channel_id);
+
+    const marks: string[] = [];
+    if (Number(r.channel_enabled) === 0) marks.push("渠道已停用");
+    if (channelId === null) marks.push("无客源渠道");
+    if (checkIn > bizDay && checkIn <= soonTo) marks.push(`临近预抵(${PENDING_AUDIT_SOON_DAYS}天内)`);
+    if ((r.guarantee ?? "") !== "") marks.push(`已担保(${r.guarantee})`);
+
+    let bucket: PendingAuditBucket = "NORMAL";
+    let code = "NORMAL";
+    let severity = "低";
+    let reason = `未来入住（${checkIn}），属正常在途预订`;
+    let advice = "";
+
+    const rtId = r.room_type_id === null ? null : Number(r.room_type_id);
+
+    if (r.booking_status !== "CONFIRMED" && r.booking_status !== "PENDING") {
+      bucket = "ANOMALY";
+      code = "BOOKING_STATE";
+      severity = "高";
+      reason = `主单 ${r.booking_status ?? "状态缺失"}，明细仍 CONFIRMED`;
+      advice =
+        `主单已是 ${r.booking_status ?? "非确认状态"}，明细还挂在 CONFIRMED。` +
+        `先核对取消时间与退款流水，确认后把该明细同步为取消（逐笔），并检查渠道侧是否已回传取消。`;
+    } else if (rtId === null || !roomTypeIds.has(rtId)) {
+      bucket = "ANOMALY";
+      code = "ROOM_TYPE_MISSING";
+      severity = "中";
+      reason = "房型不存在（已被删除）";
+      advice = "原房型已被删除，明细挂着的房型不存在。核对订单原始房型后改排到在售房型（逐笔）。";
+    } else if (checkOut < bizDay) {
+      bucket = "ANOMALY";
+      code = "NO_SHOW_OVERDUE";
+      severity = "高";
+      reason = `整段住宿已过（${checkIn}~${checkOut} < 营业日 ${bizDay}）`;
+      advice =
+        `整段住宿（${checkIn}~${checkOut}）已过且从未排房、没有住宿单。` +
+        `先联系客人/渠道确认是否到店：确认未到的按「不能到店/失约(NO-SHOW)」结案；` +
+        `确认来过的补建住宿单并补排房。两种都要逐笔做，不要批量改状态。`;
+    } else if (checkIn < bizDay) {
+      bucket = "ANOMALY";
+      code = "IN_WINDOW_NO_STAY";
+      severity = "高";
+      reason = `入住日已过但离店日未到（${checkIn}~${checkOut}）`;
+      advice =
+        `入住日已过、离店日（${checkOut}）未到，既没房号也没有住宿单 —— ` +
+        `客人可能已经在店里却没建单。立即核对当日到店登记与监控：` +
+        `在店就补排房 + 补建住宿单，未到店按 NO-SHOW 结案。`;
+    } else {
+      const free = freeRoomsFor(checkIn, rtId);
+      const need = needByKey.get(`${checkIn}|${rtId}`) ?? 1;
+      if (free < need) {
+        bucket = "ANOMALY";
+        code = "CAPACITY_SHORT";
+        severity = "中";
+        reason = `当夜剩余可排房 ${free} 间 < 待排 ${need} 间`;
+        advice =
+          `当夜「${r.room_type_name ?? "房型"}」剩余可排房 ${free} 间、待排 ${need} 间：排不出房。` +
+          `先看能否升级/换房型或与渠道协调，不要硬排造成超售。`;
+      } else if (checkIn === bizDay) {
+        bucket = "ATTENTION";
+        code = "DUE_TODAY";
+        severity = "中";
+        reason = "今日预抵，尚未排房";
+        advice =
+          "今日预抵还没排房。属于今天的前台排房工作，按到店时间先后排房即可 —— 订单本身没问题，不需要改状态。";
+      }
+    }
+
+    rows.push({
+      detailId: r.detail_id,
+      bookingId: r.booking_id,
+      bookingNo: r.booking_no ?? "",
+      bookingStatus: r.booking_status ?? "",
+      guest: r.guest ?? "",
+      mobile: r.mobile ?? "",
+      roomType: r.room_type_name ?? "（房型已删除）",
+      channel: r.channel_name ?? "无渠道",
+      channelType: r.channel_type ?? "",
+      checkInDate: checkIn,
+      checkOutDate: checkOut,
+      nights,
+      rate,
+      amount: round2(rate * nights),
+      bucket,
+      code,
+      severity,
+      reason,
+      marks,
+      advice,
+    });
+  }
+
+  const pick = (b: PendingAuditBucket) => rows.filter((r) => r.bucket === b);
+  const normal = pick("NORMAL");
+  const attention = pick("ATTENTION");
+  const anomaly = pick("ANOMALY");
+
+  /* 异常按成因分组（顺序固定，严重的在前） */
+  const codeOrder = ["BOOKING_STATE", "ROOM_TYPE_MISSING", "NO_SHOW_OVERDUE", "IN_WINDOW_NO_STAY", "CAPACITY_SHORT"];
+  const anomalyGroups = codeOrder
+    .map((code) => ({
+      code,
+      label: PENDING_AUDIT_CODE_LABEL[code] ?? code,
+      rows: anomaly.filter((r) => r.code === code),
+    }))
+    .filter((g) => g.rows.length > 0);
+
+  /* 正常桶的客源细分 */
+  const sources = [
+    { label: "渠道单（OTA）", rows: normal.filter((r) => PENDING_AUDIT_OTA.has(r.channelType)) },
+    {
+      label: "直连 / 直销",
+      rows: normal.filter((r) => r.channelType === "direct" && r.channel !== "无渠道"),
+    },
+    {
+      label: "线下及其他",
+      rows: normal.filter(
+        (r) => r.channel !== "无渠道" && !PENDING_AUDIT_OTA.has(r.channelType) && r.channelType !== "direct"
+      ),
+    },
+    { label: "无客源渠道", rows: normal.filter((r) => r.channel === "无渠道") },
+  ].filter((s) => s.rows.length > 0);
+
+  const marks = [
+    { name: "渠道已停用", rows: rows.filter((r) => r.marks.includes("渠道已停用")) },
+    { name: `临近预抵(${PENDING_AUDIT_SOON_DAYS}天内)`, rows: rows.filter((r) => r.marks.some((m) => m.startsWith("临近预抵"))) },
+    { name: "已担保", rows: rows.filter((r) => r.marks.some((m) => m.startsWith("已担保"))) },
+  ].filter((m) => m.rows.length > 0);
+
+  return {
+    bizDay,
+    rows,
+    normal,
+    attention,
+    anomaly,
+    anomalyGroups,
+    sources,
+    marks,
+    check: pendingAuditBizDayCheck(hotelId, bizDay, capacity),
+  };
+}
+
+/** 三类共用的明细表（带间夜 / 房费小计行）；advice=true 时多出「现状 + 建议」两列 */
+function PendingAuditTable({
+  rows,
+  advice,
+  emptyText,
+}: {
+  rows: PendingAuditRow[];
+  advice?: boolean;
+  emptyText?: string;
+}) {
+  const nights = rows.reduce((s, r) => s + r.nights, 0);
+  const amount = rows.reduce((s, r) => s + r.amount, 0);
+  const colSpan = advice ? 11 : 9;
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full">
+        <thead>
+          <tr>
+            <th className="th">预抵日期</th>
+            <th className="th">订单号 / 明细</th>
+            <th className="th">客人</th>
+            <th className="th">房型</th>
+            <th className="th">渠道</th>
+            <th className="th">入离日期</th>
+            <th className="th text-right">间夜</th>
+            <th className="th text-right">房费</th>
+            <th className="th">标记</th>
+            {advice && <th className="th">现状</th>}
+            {advice && <th className="th">建议处理方式（人工确认后再改）</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.length === 0 && (
+            <EmptyRow colSpan={colSpan} text={emptyText ?? (advice ? "没有订单级异常 ✔" : "暂无数据")} />
+          )}
+          {rows.map((r) => (
+            <tr key={r.detailId} className="hover:bg-gray-50 align-top">
+              <td className="td tabular-nums font-medium text-gray-700">{r.checkInDate}</td>
+              <td className="td tabular-nums text-gray-600">
+                <div>{dash(r.bookingNo)}</div>
+                <div className="text-[11px] text-gray-400">明细 #{r.detailId}</div>
+              </td>
+              <td className="td text-gray-700">
+                {dash(r.guest)}
+                {r.mobile ? <span className="ml-1 text-[11px] text-gray-400">{r.mobile}</span> : null}
+              </td>
+              <td className="td text-gray-600">{dash(r.roomType)}</td>
+              <td className="td text-gray-600">{dash(r.channel)}</td>
+              <td className="td tabular-nums text-gray-500">
+                {r.checkInDate} ~ {r.checkOutDate}
+              </td>
+              <td className="td text-right tabular-nums">{fmtInt(r.nights)}</td>
+              <td className="td text-right tabular-nums text-gray-900">{fmtMoney(r.amount)}</td>
+              <td className="td">
+                {r.marks.length === 0 ? (
+                  <span className="text-gray-300">-</span>
+                ) : (
+                  <div className="flex flex-wrap gap-1">
+                    {r.marks.map((m) => (
+                      <span
+                        key={m}
+                        className={`rounded border px-1.5 py-0.5 text-[11px] ${
+                          m === "渠道已停用"
+                            ? "border-amber-200 bg-amber-50 text-amber-700"
+                            : "border-gray-200 bg-gray-50 text-gray-600"
+                        }`}
+                      >
+                        {m}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </td>
+              {advice && <td className="td max-w-[240px] text-gray-600">{r.reason}</td>}
+              {advice && <td className="td max-w-[360px] text-gray-600">{r.advice}</td>}
+            </tr>
+          ))}
+          <TotalRow>
+            <td className="td font-medium text-gray-800">小计</td>
+            <td className="td text-gray-500">{rows.length} 条</td>
+            <td className="td" />
+            <td className="td" />
+            <td className="td" />
+            <td className="td" />
+            <td className={SUM_TD}>{fmtInt(nights)}</td>
+            <td className={SUM_TD}>{fmtMoney(amount)}</td>
+            <td className="td" />
+            {advice && <td className="td" />}
+            {advice && <td className="td" />}
+          </TotalRow>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* -------------------- 69. 待排房明细核对 -------------------- */
+function ReportPendingAssignAudit({ ctx }: ReportProps) {
+  const audit = pendingAssignAudit(ctx.hotelId);
+  const { normal, attention, anomaly, check } = audit;
+  const sum = (list: PendingAuditRow[]) => ({
+    nights: list.reduce((s, r) => s + r.nights, 0),
+    amount: list.reduce((s, r) => s + r.amount, 0),
+  });
+  const sN = sum(normal);
+  const sA = sum(attention);
+  const sX = sum(anomaly);
+  const disabledMarks = audit.marks.find((m) => m.name === "渠道已停用")?.rows ?? [];
+  const sellableCap = check.physicalRooms - check.oooRooms - check.lockRooms;
+
+  return (
+    <>
+      <div className="rounded-[4px] border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-[12px] leading-5 text-amber-800">
+        <b>本报表只读</b>：只做分类核对与处置建议，不改任何订单 / 明细状态，也没有批量操作入口。
+        「已确认、已担保、还没排房」是合法的在途状态（本店 {normal.length} 条）——
+        排房本来就该临近入住再做，<b>请勿按条数批量改状态</b>。
+      </div>
+
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-4">
+        <StatCard
+          label="未排房已确认明细"
+          value={fmtInt(audit.rows.length)}
+          hint="booking_rooms.status = CONFIRMED 且 room_id 为空 / 0"
+        />
+        <StatCard
+          label="正常（不改状态）"
+          value={fmtInt(normal.length)}
+          hint={`间夜 ${sN.nights} · 房费 ${fmtMoney(sN.amount)}`}
+        />
+        <StatCard
+          label="需要关注（今日排房）"
+          value={fmtInt(attention.length)}
+          hint={`营业日 ${audit.bizDay} 预抵未排房 · 间夜 ${sA.nights}`}
+        />
+        <StatCard
+          label="异常（人工逐笔）"
+          value={fmtInt(anomaly.length)}
+          hint={`间夜 ${sX.nights} · 房费 ${fmtMoney(sX.amount)}`}
+        />
+      </div>
+
+      <SectionCard title="营业日核对：今日预抵 / 待排 / 可售" right={`营业日 ${audit.bizDay}`}>
+        <div className="grid grid-cols-1 gap-2.5 px-3.5 py-3 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="rounded border border-[#eee] px-3 py-2">
+            <div className="text-[11px] text-gray-500">今日预抵明细</div>
+            <div className="mt-0.5 text-[15px] font-semibold tabular-nums text-gray-900">
+              {fmtInt(check.arrivalTotal)} 行
+            </div>
+            <div className="mt-0.5 text-[11px] text-gray-500">
+              已排房 {check.arrivalAssigned} · 待排房 {check.arrivalUnassigned}
+            </div>
+          </div>
+          <div className="rounded border border-[#eee] px-3 py-2">
+            <div className="text-[11px] text-gray-500">今日预抵状态构成</div>
+            <div className="mt-0.5 text-[15px] font-semibold tabular-nums text-gray-900">
+              {check.arrivalPending} / {check.arrivalConfirmed}
+            </div>
+            <div className="mt-0.5 text-[11px] text-gray-500">PENDING / CONFIRMED</div>
+          </div>
+          <div className="rounded border border-[#eee] px-3 py-2">
+            <div className="text-[11px] text-gray-500">在住窗口内仍无房号</div>
+            <div
+              className={`mt-0.5 text-[15px] font-semibold tabular-nums ${
+                check.inWindowUnassigned > 0 ? "text-[#e2483a]" : "text-gray-900"
+              }`}
+            >
+              {fmtInt(check.inWindowUnassigned)} 条
+            </div>
+            <div className="mt-0.5 text-[11px] text-gray-500">入住日 ≤ 今天 &lt; 离店日</div>
+          </div>
+          <div className="rounded border border-[#eee] px-3 py-2">
+            <div className="text-[11px] text-gray-500">可售房量上限</div>
+            <div className="mt-0.5 text-[15px] font-semibold tabular-nums text-gray-900">
+              {fmtInt(sellableCap)} 间
+            </div>
+            <div className="mt-0.5 text-[11px] text-gray-500">
+              物理 {check.physicalRooms} − 维修 {check.oooRooms} − 锁房 {check.lockRooms}
+            </div>
+          </div>
+        </div>
+        <div className="border-t border-[#f2f2f2] px-3.5 py-2 text-[11px] text-gray-500">
+          未来 {PENDING_AUDIT_SOON_DAYS} 天内（≤ {check.soonTo}）另有 {check.soonUnassigned} 条预抵待排 ——
+          属于正常的排房前置工作，已计入「正常」桶（看「临近预抵」标记）。
+        </div>
+      </SectionCard>
+
+      <SectionCard
+        title={`【正常】${normal.length} 条 · 不必改状态`}
+        right={`间夜 ${sN.nights} · 房费 ${fmtMoney(sN.amount)}`}
+      >
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-[#f2f2f2] px-3.5 py-2 text-[11px] text-gray-500">
+          <span>判定依据：入住日晚于营业日、房型在售、当夜剩余可排房 ≥ 当日待排间数</span>
+          {audit.sources.map((s) => (
+            <span key={s.label} className="tabular-nums">
+              {s.label} {s.rows.length} 条
+            </span>
+          ))}
+        </div>
+        <PendingAuditTable rows={normal} emptyText="没有符合「正常」口径的明细" />
+      </SectionCard>
+
+      <SectionCard
+        title={`【需要关注】${attention.length} 条 · 今日排房工作`}
+        right={`间夜 ${sA.nights} · 房费 ${fmtMoney(sA.amount)}`}
+      >
+        <div className="border-b border-[#f2f2f2] px-3.5 py-2 text-[11px] text-gray-500">
+          口径：营业日 {audit.bizDay} 当天预抵（入住日 = 营业日）却仍未排房。这类订单本身没问题，
+          是前台今天要排的房 —— 排完即可，不需要改状态。
+        </div>
+        <PendingAuditTable rows={attention} emptyText="今天没有预抵未排房的已确认明细 ✔" />
+      </SectionCard>
+
+      <SectionCard
+        title={`【异常】${anomaly.length} 条 · 人工逐笔确认后再处理`}
+        right={`间夜 ${sX.nights} · 房费 ${fmtMoney(sX.amount)}`}
+      >
+        {audit.anomalyGroups.length > 0 && (
+          <div className="border-b border-[#f2f2f2] px-3.5 py-2">
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-gray-500">
+              {audit.anomalyGroups.map((g) => {
+                const s = sum(g.rows);
+                return (
+                  <span key={g.code} className="tabular-nums">
+                    <span className="text-gray-700">{g.label}</span> {g.rows.length} 条 · 间夜 {s.nights} ·{" "}
+                    {fmtMoney(s.amount)}
+                  </span>
+                );
+              })}
+            </div>
+          </div>
+        )}
+        <PendingAuditTable rows={anomaly} advice />
+      </SectionCard>
+
+      {audit.marks.length > 0 && (
+        <SectionCard title="标记（可叠加，不改变分类；这些不是订单异常）" right={`共 ${audit.marks.length} 类`}>
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead>
+                <tr>
+                  <th className="th">标记</th>
+                  <th className="th text-right">条数</th>
+                  <th className="th text-right">间夜</th>
+                  <th className="th text-right">房费</th>
+                  <th className="th text-right">其中正常单</th>
+                  <th className="th">说明</th>
+                </tr>
+              </thead>
+              <tbody>
+                {audit.marks.map((m) => {
+                  const s = sum(m.rows);
+                  const inNormal = m.rows.filter((r) => r.bucket === "NORMAL").length;
+                  return (
+                    <tr key={m.name} className="hover:bg-gray-50">
+                      <td className="td text-gray-700">{m.name}</td>
+                      <td className="td text-right tabular-nums">{fmtInt(m.rows.length)}</td>
+                      <td className="td text-right tabular-nums">{fmtInt(s.nights)}</td>
+                      <td className="td text-right tabular-nums text-gray-900">{fmtMoney(s.amount)}</td>
+                      <td className="td text-right tabular-nums text-gray-600">{fmtInt(inNormal)}</td>
+                      <td className="td text-gray-500">
+                        {m.name === "渠道已停用"
+                          ? "channels.enabled = 0 的客源渠道。渠道主数据被下线，历史订单保留 channel_id 是设计如此 —— 订单仍然要接待，只需在「渠道直连」里核对主数据，别改订单状态。"
+                          : m.name.startsWith("临近预抵")
+                            ? "入住日已在排房前置窗口内，属于正常待排房，按到期日排房即可。"
+                            : "订单带担保（b.guarantee 非空），已锁量，取消需要走渠道/担保规则。"}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </SectionCard>
+      )}
+
+      <NoteCard>
+        口径说明：本表固定检查「明细已确认（booking_rooms.status = &apos;CONFIRMED&apos;）但 room_id 为空或 0」的全部房，
+        不受顶部营业日区间影响；&ldquo;营业日&rdquo;取 settings.biz_day_cutoff（默认 05:00），口径与 src/lib/biz-date.ts 一致。
+        判定顺序：主单状态 → 房型是否存在 → 整段是否已过 → 是否仍在住窗口 → 当夜可排房是否够 → 是否今日预抵 → 正常。
+        「剩余可排房」= 物理房量 − 维修房(OOO) − 锁房(LOCK) − 已排房 − 在住，按该明细入住当晚逐夜核算。
+        同一套判据的可复跑脚本：<b>node scripts/audit-pending-details.mjs</b>（只读）。
+        <b>本报表不改任何订单状态</b>；异常请按建议人工逐笔确认后，走前台页面处理。
+      </NoteCard>
+    </>
+  );
+}
+
+/* ================================================================== *
  * 九、报表分发
  * ================================================================== */
 
@@ -11848,6 +12647,7 @@ const REPORT_VIEWS: Record<string, ReportComponent> = {
   "hourly-orders": ReportHourlyOrders,
   "package-report": ReportPackageReport,
   "breakfast-report": ReportBreakfast,
+  "pending-assign-audit": ReportPendingAssignAudit,
   "credit-checkin": ReportCreditCheckin,
   "sms-report": ReportSms,
   /*

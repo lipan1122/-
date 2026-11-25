@@ -31,6 +31,7 @@
  */
 
 import { all, get, run } from "@/lib/db";
+import { isBlockStatus, loadRoomBlocks, roomBlockedOn } from "@/lib/room-stock-nightly";
 import { addDays, nowIso, todayStr } from "@/lib/utils";
 import type { ChannelOrderPayload, RatePush } from "@/lib/channels/types";
 
@@ -90,12 +91,15 @@ export function toChannelAllotment(rawAllotment: number, oversell: boolean): num
 /**
  * 组装「未来 N 天 × 每房型」的推送行（整改清单 4.1 的房量 / 房态回传口径）。
  *
- *   allotment = 该房型房间数 - 该区间在住 - 该区间已排预订 - 维修房(OOO)
+ *   allotment = 该房型房间数 − 当天的在住/预订占用 − 当天处于维修/锁房窗口内的房间数
  *   price     = rate_calendar 当天该房型价格；没有配置就用 room_types.base_price
  *   closed    = 当天 allotment 为 0（满房关房）。
  *               负数代表「开了超售，还能再卖 N 间」，不是关房，所以不置 closed。
  *
  * 区间口径统一按 [入住日, 退房日) 左闭右开，与房态页的可售计算保持一致。
+ * 维修 / 锁房**逐天**判定（rooms.block_from / block_to，见下方 blockRows）：
+ * 登记了 11-26~11-28 维修的房间只关这三天的房量（结束日不含），
+ * 没有登记窗口的老数据与改造前一样整段排除。
  * 超售策略由 toChannelAllotment 统一处理（oversell=0 clamp 到 0；=1 保留负数）。
  *
  * 为什么放在这个文件而不是 sync-actions.ts：
@@ -127,22 +131,33 @@ export function buildRateRows(
     totals.set(Number(r.room_type_id), Number(r.c));
   }
 
-  // 维修房（OOO）：整段日期都按这个数扣减 —— 维修房永远不能卖
-  const maintenance = new Map<number, number>();
-  for (const r of all<{ room_type_id: number; c: number }>(
-    `SELECT room_type_id, COUNT(*) AS c FROM rooms WHERE hotel_id = ? AND status = 'OOO' GROUP BY room_type_id`,
-    [hotelId]
-  )) {
-    maintenance.set(Number(r.room_type_id), Number(r.c));
-  }
-
-  /* 锁房（LOCK）：同样整段日期都不能卖 —— 旧实现漏了这一项，会把锁房推给渠道（超卖） */
-  const locked = new Map<number, number>();
-  for (const r of all<{ room_type_id: number; c: number }>(
-    `SELECT room_type_id, COUNT(*) AS c FROM rooms WHERE hotel_id = ? AND status = 'LOCK' GROUP BY room_type_id`,
-    [hotelId]
-  )) {
-    locked.set(Number(r.room_type_id), Number(r.c));
+  /*
+   * 维修房(OOO) / 锁房(LOCK)：**按天**判定，不再「整段日期都按这个数扣减」
+   *
+   * 改造前这里只 COUNT 了 status='OOO' / 'LOCK' 的房间数，然后对推送区间里的
+   * 每一天都扣同一个数 —— 等于「房间一旦标维修，未来所有日期都不可售」，
+   * 哪怕维修明天就结束（多扣房 = 渠道侧关房 = 少卖），反过来也不会少扣。
+   *
+   * 现在每间房带 block_from / block_to（第 25 段迁移补列，房态操作写入）：
+   *   · 两列为空（老数据）→ 该房所有日期都不可售（行为与改造前完全一致）；
+   *   · 两列都有值        → 只有 [block_from, block_to) 内的日期不可售；
+   *   · 只有 block_from   → 从该日起不可售。
+   * 判定走 `roomBlockedOn()`（@/lib/room-stock-nightly 的唯一实现），
+   * 与 PC 建单（stockShortage）/ 房态页（room-stock.ts）同一份口径 ——
+   * 否则会出现「前台能卖、渠道那边已经关房」或者反过来超卖。
+   *
+   * loadRoomBlocks 自带老库兜底：block 列不存在时退回「两列为空」，
+   * 也就是改造前的整段排除，不会因为读不到日期把维修房推给渠道。
+   */
+  const blockRows = loadRoomBlocks({ all }, hotelId);
+  /** 房型 id → 该房型的维修/锁房房间（含窗口），逐天判定时只看这几间 */
+  const blockRoomsOfType = new Map<number, typeof blockRows>();
+  for (const r of blockRows) {
+    if (!isBlockStatus(r.status)) continue;
+    const typeId = Number(r.room_type_id);
+    const list = blockRoomsOfType.get(typeId);
+    if (list) list.push(r);
+    else blockRoomsOfType.set(typeId, [r]);
   }
 
   /*
@@ -250,10 +265,16 @@ export function buildRateRows(
   const rows: RatePush[] = [];
   for (const rt of roomTypes) {
     const total = totals.get(rt.id) ?? 0;
-    /* 维修(OOO) + 锁房(LOCK)：两种情况整段日期都不能卖 */
-    const ooo = maintenance.get(rt.id) ?? 0;
-    const lock = locked.get(rt.id) ?? 0;
+    /* 本房型的维修 / 锁房房间（含维修窗口）：每一天单独判，窗口外的天数照常可售 */
+    const blockedOfType = blockRoomsOfType.get(Number(rt.id)) ?? [];
     for (const day of dates) {
+      let ooo = 0;
+      let lock = 0;
+      for (const b of blockedOfType) {
+        if (!roomBlockedOn(b, day)) continue;
+        if (String(b.status ?? "").toUpperCase() === "OOO") ooo += 1;
+        else lock += 1;
+      }
       let used = 0;
       for (const o of occupied) {
         if (!o.from_date || !o.to_date) continue;

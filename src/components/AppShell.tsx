@@ -320,9 +320,18 @@ export default function AppShell({
   user,
   bizDate,
   pendingChannelOrders,
+  demoMode = false,
   children,
 }: {
   user: { realName: string; role: string; hotelName: string };
+  /**
+   * 是否演示模式（服务端 isDemoMode() 传下来）
+   *
+   * AppShell 是客户端组件，process.env 在浏览器里是构建期空值，
+   * 所以不能在这里自己读环境变量 —— 必须由服务端 layout 传。
+   * 控制「顶部导航里的『演示数据』入口」是否出现。
+   */
+  demoMode?: boolean;
   /** 服务端算好的营业日（按设置的切换时间） */
   bizDate?: string;
   /** 待处理渠道订单数；不传时「渠道预订」旁只显示一个小红点 */
@@ -454,7 +463,7 @@ export default function AppShell({
 
         {/* 2 ─ 导航（项间 gap 更紧，当前项白底深绿字） */}
         <nav className="flex h-10 items-center gap-0.5 px-2 pb-1">
-          {MAIN_NAV.filter((item) => !item.adminOnly || user.role === "admin").map((item) => {
+          {MAIN_NAV.filter((item) => (!item.adminOnly || user.role === "admin") && (item.href !== "/settings?tab=demo" || demoMode)).map((item) => {
             const active = isNavActive(item.href, pathname);
             return (
               <Link

@@ -16,6 +16,8 @@ const KEYS = [
   "goods-stock", "channel-report", "channel-report-detail",
   "credit-checkin", "sms-report", "police-report", "recharge-sum",
   "recharge-salesman", "room-biz-daily",
+  /* 待排房明细核对：63 条未排房已确认明细的三桶分类（正常/需关注/异常），只读 */
+  "pending-assign-audit",
 ];
 async function main() {
   const r = await fetch(`${base}/api/login`, {

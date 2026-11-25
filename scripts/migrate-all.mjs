@@ -3296,6 +3296,38 @@ export function runMigrations(db, { checkOnly = false } = {}) {
     }
   }
 
+  /*
+   * ── 第 25 段：维修 / 锁房的起止日期（rooms.block_from / block_to）──
+   *
+   * ── 为什么需要 ──
+   * `rooms.status` 只是一个**快照**（VC/VD/OC/OD/OOO/LOCK），没有时间维度。
+   * 于是「房间 A 11-26 ~ 11-28 维修」只能被表达成「A 现在是维修房」，
+   * 所有库存口径（PC 建单 / 小程序查房 / 房态页可售 / 渠道推送）都只能
+   * 把 A **永久**从物理可售里剔除：维修明天就结束，未来仍然一间都卖不出去
+   * （多扣房 = 少卖 = 直接损失营收；而少扣则超卖）。
+   *
+   * ── 语义（三处库存口径 + 房态操作共用，唯一实现见
+   *    src/lib/room-stock-nightly.ts 的 roomBlockedOn / physicalCapByNight）──
+   *   · status ∈ {OOO, LOCK} 且两列为空        → **整段不可售**（老数据兼容，行为不变）
+   *   · 两列都有值                             → 只在 [block_from, block_to) 内不可售
+   *   · 只有 block_from                        → 从那天起永久不可售
+   *   · 只有 block_to（没开始日）              → 按老数据整段不可售（保守，绝不放开维修房）
+   *   日期都是 YYYY-MM-DD 文本，入住日含、离店/结束日不含（与项目里所有日期口径一致）。
+   *
+   * ── 为什么只加列、不回填 ──
+   * 回填需要「这间房什么时候修完」的信息，库里根本没有；任何猜测（例如
+   * 按 room_logs 第一次 OOO 的时间 + 7 天）都会凭空造出一个可售房晚，
+   * 属于拿无法证明的数据放量。所以老数据一律保持两列为空 = 整段排除，
+   * 由前台在房态页重新登记维修窗口后再按窗口算。
+   *
+   * 幂等：addColumn 自己判 PRAGMA，第二次跑只进 skipped、changed 不增。
+   */
+  {
+    /* 表不存在（半初始化的库）：addColumn 会推一条 skipped，不崩 */
+    addColumn("rooms", "block_from", "TEXT");
+    addColumn("rooms", "block_to", "TEXT");
+  }
+
   return { changed, applied, skipped, notes, checkOnly };
 }
 

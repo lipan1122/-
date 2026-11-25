@@ -35,6 +35,7 @@ import { revalidatePath } from "next/cache";
 import { get, run } from "@/lib/db";
 import { requireAdmin, requirePermissionOrRedirect, requireUser } from "@/lib/session";
 import { seedUniformDemo } from "@/lib/seed-uniform";
+import { DEMO_SEED_DISABLED_MESSAGE, isDemoSeedEnabled } from "@/lib/demo-mode";
 
 export type DemoLoadResult =
   | { ok: string }
@@ -44,12 +45,21 @@ const SQL_FILE = join(process.cwd(), "scripts", "demo-data", "demo-data.sql.gz")
 
 /** 当前库里有多少业务数据（用于提示会覆盖什么） */
 export async function countBusinessDataAction(): Promise<{
+
   rooms: number;
   bookings: number;
   stays: number;
   folios: number;
 }> {
   await requireAdmin();
+  /*
+   * 非演示模式：不暴露「库里有多少业务数据」
+   *
+   * 这不是权限问题（下面还有 requireAdmin），是**场景问题**：
+   * 正式环境不该存在「演示数据」这个概念，返回真实计数只会让人以为
+   * 这个功能在生产可用（然后真的去点「一键导入」）。
+   */
+  if (!isDemoSeedEnabled()) return { rooms: 0, bookings: 0, stays: 0, folios: 0 };
   const q = (t: string) => {
     try {
       return Number(get<{ c: number }>(`SELECT COUNT(*) AS c FROM ${t}`)?.c ?? 0);
@@ -71,6 +81,14 @@ export async function countBusinessDataAction(): Promise<{
  */
 export async function loadDemoDataAction(): Promise<DemoLoadResult> {
   const user = await requireAdmin();
+  /*
+   * 关键：UI 隐藏 ≠ 动作禁止
+   *
+   * 藏掉「一键导入」按钮只让人看不见，直接 POST 这个 action 照样能往**正式库**
+   * 灌一整套虚构业务数据（46 房 / 588 预订 / 200 账单，而且会覆盖现有业务数据）。
+   * 所以动作层也必须挡，与登录页同一个 env 判据。
+   */
+  if (!isDemoSeedEnabled()) return { error: DEMO_SEED_DISABLED_MESSAGE };
 
   if (!existsSync(SQL_FILE)) {
     return {
@@ -240,6 +258,8 @@ export async function loadDemoDataAction(): Promise<DemoLoadResult> {
  */
 export async function fillUniformDemoAction(): Promise<{ ok?: string; error?: string }> {
   const user = await requireUser();
+  /* 同上：这个动作会写 183 张演示单，正式环境必须挡住 */
+  if (!isDemoSeedEnabled()) return { error: DEMO_SEED_DISABLED_MESSAGE };
   /*
    * ⚠️ 这个 await 不能少
    *

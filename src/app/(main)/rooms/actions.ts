@@ -276,6 +276,86 @@ function checkStayRoomConflicts(
   return { error: conflictMessage(conflicts, input.roomNo ?? stay.room_no ?? undefined) };
 }
 
+/**
+ * 维修 / 锁房的起止日期（`rooms.block_from` / `block_to`，第 25 段迁移补列）
+ *
+ * 语义见 `src/lib/room-stock-nightly.ts` 的 roomBlockedOn / physicalCapByNight：
+ *   · 两列为空 → 整段不可售（老行为）；
+ *   · 两列都有值 → 只有 [from, to) 这些房晚不可售（`to` 当天可售）；
+ *   · 只有 from → 从该日起永久不可售。
+ */
+type BlockWindow = { from: string | null; to: string | null };
+
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * 把表单里的起止日期解析成窗口
+ *
+ * 允许 `<input type="date">` 的 `YYYY-MM-DD`，也允许 `datetime-local` 的
+ * `YYYY-MM-DDTHH:MM`（截到日，与项目里「日期口径只认日」一致）。
+ * 脏值一律**报错**而不是静默丢弃 —— 前台以为登记了维修到 11-28，
+ * 实际存了空窗口（= 永久不可售）是最难排查的一类库存问题。
+ *
+ * @param raw 表单原值
+ * @param isBlock 目标房态是不是维修 / 锁房（VC/VD 之类一律清空，不接受日期）
+ */
+function parseBlockWindow(isBlock: boolean, fromRaw: string, toRaw: string): BlockWindow {
+  /* 改回空房（VC/VD）：不管表单传了什么，都清空窗口 —— 房间已经恢复，没有维修期可言 */
+  if (!isBlock) return { from: null, to: null };
+
+  const norm = (v: string) => v.trim().slice(0, 10);
+  const from = norm(fromRaw);
+  const to = norm(toRaw);
+
+  const valid = (d: string) => {
+    if (!DATE_ONLY.test(d)) return false;
+    const dt = new Date(`${d}T00:00:00`);
+    if (Number.isNaN(dt.getTime())) return false;
+    /* 回读校验：挡掉 2026-02-31 这种会被 Date 顺延成 3 月的假日期 */
+    const p = (n: number) => String(n).padStart(2, "0");
+    return `${dt.getFullYear()}-${p(dt.getMonth() + 1)}-${p(dt.getDate())}` === d;
+  };
+
+  if (from === "" && to === "") {
+    /* 允许不填：等于「整段不可售」（老行为），前台只标维修不排工期时就走这支 */
+    return { from: null, to: null };
+  }
+  if (from === "") {
+    throw new Error("填了维修结束日就必须同时填开始日（只有结束日无法判断从哪天开始不可售）");
+  }
+  if (!valid(from)) throw new Error(`维修开始日不是合法日期：${fromRaw}（格式 YYYY-MM-DD）`);
+  if (to === "") {
+    /* 只填开始日：从那天起不可售，修完由前台改回 VC/VD 时清空 */
+    return { from, to: null };
+  }
+  if (!valid(to)) throw new Error(`维修结束日不是合法日期：${toRaw}（格式 YYYY-MM-DD）`);
+  if (to <= from) {
+    throw new Error(`维修结束日必须晚于开始日（结束日当天可售）：${from} ~ ${to}`);
+  }
+  return { from, to };
+}
+
+/**
+ * 维修 / 锁房的起止日期写库（与房态变更分开，见下面为什么不在同一个事务）
+ *
+ * 只吞「列不存在」（老库还没跑第 25 段迁移）：这时退回改造前的行为
+ * —— 房间整段不可售，绝不会因为读不到日期就把维修房放开。
+ * 其它异常（库忙 / 磁盘问题）继续抛给调用方，不能悄悄丢一个窗口。
+ */
+function saveBlockWindow(hotelId: number, roomId: number, win: BlockWindow): void {
+  try {
+    run(`UPDATE rooms SET block_from = ?, block_to = ? WHERE id = ? AND hotel_id = ?`, [
+      win.from,
+      win.to,
+      roomId,
+      hotelId,
+    ]);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!/no such column/i.test(msg)) throw e;
+  }
+}
+
 export async function setRoomStatusAction(formData: FormData) {
   const user = await requirePermission("room.change_status");
   const roomId = Number(formData.get("roomId"));
@@ -283,6 +363,20 @@ export async function setRoomStatusAction(formData: FormData) {
   const reason = String(formData.get("reason") ?? "").trim();
   if (!roomId || !status) return;
   if (!(status in ROOM_STATUS_LIB)) return;
+
+  /*
+   * 维修 / 锁房的起止日期（可选，`block_from` / `block_to`）
+   *
+   * 为什么放在读房态之前校验：日期不合法要在**改房态之前**就拒绝，
+   * 否则房间已经置成 OOO、窗口却没写进去，库存会按「整段不可售」算 ——
+   * 前台以为自己排了工期，实际把房间永久关掉了。
+   */
+  const isBlock = status === "OOO" || status === "LOCK";
+  const block = parseBlockWindow(
+    isBlock,
+    String(formData.get("block_from") ?? ""),
+    String(formData.get("block_to") ?? "")
+  );
 
   /*
    * P0-9：在住房不能被手工置成空房状态
@@ -312,11 +406,29 @@ export async function setRoomStatusAction(formData: FormData) {
   if (!r.ok) return;
 
   /*
+   * 写维修 / 锁房的起止日期
+   *
+   * ── 为什么在 changeRoomStatus 之后单独写 ──
+   * changeRoomStatus（@/lib/room-status）自己开写事务并做了 CAS 重试，
+   * 它只管 `status` 流转、不认 `block_from/block_to`（本轮的改动范围不包括它）。
+   * 所以在它提交成功之后补一次 UPDATE：房态已经是 OOO/LOCK 了，窗口随后落到同一行上。
+   *
+   * 幂等：重复提交同一个房态时 changeRoomStatus 走 `from === to` 直接返回 ok，
+   * 这里照样执行 —— 于是「改维修窗口」也可以靠重新提交一次 OOO 来完成。
+   *
+   * 改回 VC / VD（或其它非维修状态）时 block 是 `{null, null}`：**清空窗口**，
+   * 否则房间恢复后残留的旧窗口会在下次维修时把一批不相干的日期一起关掉。
+   */
+  saveBlockWindow(user.hotelId, roomId, block);
+
+  /*
    * 渠道库存（整改 4.1 缺口）：房态变更里 OOO（维修）/ LOCK（锁房）直接减少可售房量，
    * VC / VD 之类互转也会影响「可卖」口径，所以统一记一条待同步。
    * changeRoomStatus 内部已经提交自己的写事务，这里处于提交后，不会「回滚了还推渠道」。
+   * 维修窗口也写进原因里：排查「渠道为什么只关了三天」时能直接看到依据。
    */
-  markStockDirty(user.hotelId, `改房态 房间#${roomId} → ${status}${reason ? `（${reason}）` : ""}`);
+  const windowText = block.from ? `（窗口 ${block.from}~${block.to ?? "至今"}）` : "";
+  markStockDirty(user.hotelId, `改房态 房间#${roomId} → ${status}${windowText}${reason ? `（${reason}）` : ""}`);
 
   revalidatePath("/rooms");
   revalidatePath("/housekeeping");

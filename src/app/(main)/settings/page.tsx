@@ -16,6 +16,7 @@ import { createCreditItemFormAction, createDebitItemFormAction, createDictItemFo
 import { getMiniProgramConfig, maskAppId } from "@/lib/mini-config";
 /* 演示数据一键导入面板（设置页「演示数据」Tab） */
 import DemoDataPanel from "./DemoDataPanel";
+import { isDemoMode } from "@/lib/demo-mode";
 
 export const dynamic = "force-dynamic";
 
@@ -268,7 +269,15 @@ const NAV_GROUPS: NavGroup[] = [
        *   · 这里的 NAV_GROUPS（左侧菜单实际渲染的就是它）
        * 只加 TABS 的话 `?tab=demo` 能打开，但菜单里找不到入口（踩过）。
        */
-      { label: "演示数据", tab: "demo" },
+      /*
+       * 演示数据：只在演示模式下列进菜单
+       *
+       * 注意这和上面的  是**两道**：
+       *   · 菜单项不列出 → 正常用户根本看不到入口
+       *   · 内容区块 gate → 就算手工输 ?tab=demo 也不会渲染
+       * 只做一道都会漏（原来只做了内容那一道，菜单里还挂着）。
+       */
+      ...(isDemoMode() ? [{ label: "演示数据", tab: "demo" as const }] : []),
     ],
   },
   {
@@ -3776,7 +3785,7 @@ export default async function SettingsPage({ searchParams }: { searchParams: Pro
       </div>
 
       {/* ===== 演示数据（一键导入 46 房 / 588 预订 / 200 账单，给客户演示用） ===== */}
-      {activeTab === "demo" && (
+      {isDemoMode() && activeTab === "demo" && (
         <Section
           id="demo"
           title="演示数据"

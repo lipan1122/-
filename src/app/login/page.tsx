@@ -1,4 +1,5 @@
 import DemoLoginFill, { type DemoAccount } from "@/components/DemoLoginFill";
+import { isDemoLoginEnabled } from "@/lib/demo-mode";
 
 export default async function LoginPage({
   searchParams,
@@ -29,18 +30,26 @@ export default async function LoginPage({
    */
 
   /*
-   * 演示账号一键填入（上线前安全加固的可控版本）
+   * 演示账号一键填入（上线评审 P0：缺省必须关闭）
    *
    * 上线前审计指出「登录页明文展示 admin/admin123」是高危问题，已删。
-   * 但演示/自测时手输 4 个账号很麻烦，所以加这个「点一下填入」，
-   * 由环境变量 PMS_DEMO_LOGIN 控制：
-   *   · "0"      → 完全不渲染（生产环境用这个）
-   *   · 其他/未设 → 渲染（本地演示、培训、验收用）
+   * 但演示/自测时手输 4 个账号很麻烦，所以保留这个「点一下填入」，由开关控制。
+   *
+   * ── 改前（fail-open，评审 P0）──
+   *   const demoLoginEnabled = process.env.PMS_DEMO_LOGIN !== "0";
+   *   变量**缺省**时 !== "0" 成立 → 正式环境只要忘了配这一行，演示入口就在登录页上。
+   *   这正是评审写的「PMS_DEMO_LOGIN 缺省时会展示演示入口，正式环境需显式配置」。
+   *
+   * ── 改后（fail-safe）──
+   *   判据统一在 src/lib/demo-mode.ts 的 isDemoLoginEnabled()：
+   *     · 显式 PMS_DEMO_LOGIN=1（或 true / yes / on）→ 渲染
+   *     · 未设置 / 空 / 0 / false / 拼错的值      → 不渲染
+   *   开关关闭时连 props 都不传，页面 HTML 里一个账号口令都不会出现。
    *
    * 账号口令只在这里出现一次（服务端），组件本身不写死，
    * 改演示账号时只改这一处。
    */
-  const demoLoginEnabled = process.env.PMS_DEMO_LOGIN !== "0";
+  const demoLoginEnabled = isDemoLoginEnabled();
   const demoAccounts: DemoAccount[] = demoLoginEnabled
     ? [
         { label: "管理员", username: "admin", password: "admin123" },
@@ -159,7 +168,10 @@ export default async function LoginPage({
             </button>
           </form>
 
-          {/* 一键填入演示账号（PMS_DEMO_LOGIN=0 时不渲染） */}
+          {/*
+            一键填入演示账号：只有显式 PMS_DEMO_LOGIN=1/true/yes 才渲染。
+            缺省（正式环境）不渲染 —— 页面 HTML 里没有按钮、也没有任何账号口令。
+          */}
           {demoLoginEnabled && <DemoLoginFill accounts={demoAccounts} />}
         </div>
       </div>

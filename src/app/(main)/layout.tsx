@@ -4,6 +4,7 @@ import AppShell from "@/components/AppShell";
 import { PATHNAME_HEADER, getSession, normalizePathname, pageAccessOf } from "@/lib/session";
 import { bizToday } from "@/lib/biz-date";
 import { countPendingChannelOrders } from "@/lib/channel-orders";
+import { isDemoMode } from "@/lib/demo-mode";
 
 /**
  * 主布局
@@ -72,6 +73,7 @@ export default async function MainLayout({ children }: { children: React.ReactNo
       user={{ realName: user.realName, role: user.role, hotelName: user.hotelName }}
       bizDate={bizToday(user.hotelId)}
       pendingChannelOrders={countPendingChannelOrders(user.hotelId)}
+      demoMode={isDemoMode()}
     >
       {children}
     </AppShell>

@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 
-import { get, run, tx } from "@/lib/db";
+import { all, get, run, tx } from "@/lib/db";
 import { requirePermission } from "@/lib/session";
 import { changeRoomStatus } from "@/lib/room-status";
 import { conflictMessage, findRoomConflicts } from "@/lib/room-availability";
@@ -886,4 +886,208 @@ export async function checkInAction(
   // useActionState 下不能直接 redirect（会以 NEXT_REDIRECT 形式显示成错误），
   // 改为返回成功态，由表单组件跳转。
   return { ok: `已办理入住：${primary.name}（${roomIds.length} 间）` };
+}
+
+/* ========================================================================== *
+ * 客史检索（入住表单「选择已有客史」· 上线评审 P1）
+ *
+ * ── 缺陷 ──
+ * `checkInAction` 早就支持 `guest_id_<i>` 逐间指定客史（见上面第 1 段的 ①），
+ * 但入住表单**没有任何客史选择入口**：前台遇到同名客人（比如两份「张伟」档案）
+ * 既看不到候选，也没法指定，只能凭运气填身份证号 / 手机号；
+ * 填错就等于把入住单、历史账单、会员储值挂到另一个人头上。
+ *
+ * ── 本组函数只负责「检索」──
+ *   · 不建档、不改档，不碰 stays / folios / wallet；
+ *   · 结果按「精确证件号 → 精确手机号 → 姓名或号码尾号」排优先级，最多 10 条；
+ *   · 权限用 guest.view_sensitive（权限矩阵里只有 admin / frontdesk）——
+ *     查询条件本身就是客人的敏感字段，即使响应已经脱敏，也不该让收银等岗位去搜客人证件号。
+ *
+ * ── 为什么脱敏放在服务端 ──
+ * 把明文手机号/证件号发给浏览器再在 JS 里打码，等于「先泄露再遮挡」：
+ * 打开 devtools 或抓一条请求就拿到了原文。所以这里返回的 mobileMasked / idNoMasked
+ * 是**唯一**的号码信息，客户端拿不到原文，选中客史后也不需要原文
+ * （`checkInAction` 只认 `guest_id_<i>` 这个编号）。
+ * ========================================================================== */
+
+/** 单条客史候选：号码一律脱敏；不含生日、地址、备注等无关信息 */
+export type GuestPickCandidate = {
+  id: number;
+  name: string;
+  gender: string;
+  /** 手机号脱敏：138****1234；档案没有手机号时为空串 */
+  mobileMasked: string;
+  /** 证件号脱敏：3301********1234；档案没有证件号时为空串 */
+  idNoMasked: string;
+  vipLevel: number;
+  /** 该客史名下的历史入住单数（stays.guest_id 口径，与账单 / 储值归属同源） */
+  stayCount: number;
+  /** 最近一次入住时间，没有历史时为 null */
+  lastStayAt: string | null;
+  /** 本次检索命中它的依据，用于前台判断「为什么搜到了」 */
+  matchedBy: "id_no" | "mobile" | "name";
+};
+
+export type GuestSearchResult =
+  | { ok: true; guests: GuestPickCandidate[] }
+  | { ok: false; error: string };
+
+/** 候选上限：同名客人再多也只展示 10 条，避免误点与响应过大 */
+const GUEST_SEARCH_LIMIT = 10;
+
+/**
+ * 手机号脱敏：138****1234（中间 4 位打码）
+ *
+ * 不足 8 位的异常号码（老库里有存座机/工号的）只留末 2 位，
+ * 保证任何长度都不可能把原文带出去。
+ */
+function maskMobile(raw: string | null): string {
+  const v = String(raw ?? "").trim();
+  if (!v) return "";
+  if (v.length < 8) return `****${v.slice(-2)}`;
+  return `${v.slice(0, 3)}****${v.slice(-4)}`;
+}
+
+/**
+ * 证件号脱敏：3301********1234（中间 8 位打码，与 reports/page.tsx 同口径）
+ *
+ * 8 位以内的短证件号（境外证件、内部编号）整段打码，不按「首 4 尾 4」拼，
+ * 否则 8 位号码会被拼回原文。
+ */
+function maskIdNo(raw: string | null): string {
+  const v = String(raw ?? "").trim();
+  if (!v) return "";
+  if (v.length <= 8) return "****";
+  return `${v.slice(0, 4)}${"*".repeat(8)}${v.slice(-4)}`;
+}
+
+/**
+ * LIKE 通配符转义（配合 SQL 里的 ESCAPE '!'）
+ *
+ * 不转义的后果：前台在搜索框里输入一个 `%` 就能列出全店客史，
+ * 输入 `_` 会变成任意单字符匹配 —— 既是信息泄露也是误匹配。
+ */
+function likeEscape(s: string): string {
+  return s.replace(/[!%_]/g, (m) => `!${m}`);
+}
+
+/** 检索行（库里的原始形状，只在服务端内存中出现） */
+type GuestSearchRow = {
+  id: number;
+  name: string;
+  gender: string | null;
+  mobile: string | null;
+  idNo: string | null;
+  vipLevel: number | null;
+  stayCount: number | null;
+  lastStayAt: string | null;
+};
+
+/**
+ * 按「身份证号 / 手机号 / 姓名」查已有客史（入住表单选择老客用）
+ *
+ * 匹配口径（与 lib/guest-match 的「证件号 → 手机号」一致，额外允许姓名/尾号模糊搜）：
+ *   1. 证件号精确命中（唯一部分索引）            → matchedBy = "id_no"
+ *   2. 手机号精确命中（唯一部分索引）            → matchedBy = "mobile"
+ *   3. 纯号码输入时补「尾号」匹配（前台常只报后 4 位）
+ *   4. 姓名 LIKE 包含匹配                        → matchedBy = "name"
+ * 排序：精确命中优先 → 历史入住次数多优先 → id 小的优先（稳定顺序）。
+ *
+ * 注意：**这里不做任何自动选择**。同名多条时全部返回给前台人工核对，
+ * 是否挂到某条客史由 `guest_id_<i>` 显式表达 —— 绝不替客人「选最早的那条」。
+ */
+export async function searchGuestsAction(rawQuery: string): Promise<GuestSearchResult> {
+  try {
+    /*
+     * 权限边界：查客史 = 按证件号/手机号检索客人档案，属于敏感数据读取。
+     * 权限矩阵里没有更窄的 guest.view（只有 guest.view_sensitive / guest.modify），
+     * 所以与 /guests 页面、导出接口同口径用 guest.view_sensitive（admin / frontdesk）。
+     */
+    const user = await requirePermission("guest.view_sensitive");
+    const hotelId = user.hotelId;
+
+    /* 去掉空白（证件号常有手输空格），并限长防止构造超长 LIKE */
+    const query = String(rawQuery ?? "")
+      .replace(/\s+/g, "")
+      .slice(0, 40);
+    if (query.length < 2) return { ok: true, guests: [] };
+
+    const contains = `%${likeEscape(query)}%`;
+    const tail = `%${likeEscape(query)}`;
+    /* 只有「号码形状」的输入才补尾号匹配：姓名搜「张」不该被当成尾号 */
+    const numeric = /^[0-9Xx]+$/.test(query);
+
+    const params: unknown[] = [hotelId, contains, query, query];
+    if (numeric) params.push(tail, tail);
+    params.push(query, query);
+
+    const rows = all<GuestSearchRow>(
+      `SELECT g.id AS id,
+              g.name AS name,
+              COALESCE(g.gender, '') AS gender,
+              g.mobile AS mobile,
+              g.id_no AS idNo,
+              COALESCE(g.vip_level, 0) AS vipLevel,
+              (SELECT COUNT(*) FROM stays s
+                WHERE s.hotel_id = g.hotel_id AND s.guest_id = g.id) AS stayCount,
+              (SELECT MAX(s.check_in_time) FROM stays s
+                WHERE s.hotel_id = g.hotel_id AND s.guest_id = g.id) AS lastStayAt
+         FROM guests g
+        WHERE g.hotel_id = ?
+          AND COALESCE(g.deleted, 0) = 0
+          AND (
+                g.name LIKE ? ESCAPE '!'
+             OR g.id_no = ? COLLATE NOCASE
+             OR g.mobile = ?
+             ${numeric ? "OR g.id_no LIKE ? ESCAPE '!' OR g.mobile LIKE ? ESCAPE '!'" : ""}
+          )
+        ORDER BY CASE WHEN g.id_no = ? COLLATE NOCASE THEN 0
+                      WHEN g.mobile = ? THEN 1
+                      ELSE 2 END,
+                 stayCount DESC,
+                 g.id ASC
+        LIMIT ${GUEST_SEARCH_LIMIT}`,
+      params
+    );
+
+    const upper = query.toUpperCase();
+    const hitOf = (r: GuestSearchRow): GuestPickCandidate["matchedBy"] => {
+      const idNo = String(r.idNo ?? "").trim();
+      const mobile = String(r.mobile ?? "").trim();
+      if (idNo && idNo.toUpperCase() === upper) return "id_no";
+      if (mobile && mobile === query) return "mobile";
+      if (numeric && idNo && idNo.toUpperCase().endsWith(upper)) return "id_no";
+      if (numeric && mobile && mobile.endsWith(query)) return "mobile";
+      return "name";
+    };
+
+    return {
+      ok: true,
+      guests: rows.map((r) => ({
+        id: Math.trunc(Number(r.id)),
+        name: String(r.name ?? ""),
+        gender: String(r.gender ?? ""),
+        mobileMasked: maskMobile(r.mobile),
+        idNoMasked: maskIdNo(r.idNo),
+        vipLevel: Math.trunc(Number(r.vipLevel ?? 0)),
+        stayCount: Math.max(0, Math.trunc(Number(r.stayCount ?? 0))),
+        lastStayAt: r.lastStayAt ? String(r.lastStayAt) : null,
+        matchedBy: hitOf(r),
+      })),
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    /*
+     * 未登录 / 无权限都返回可展示文案：生产构建会把抛出的错误脱敏成 digest，前台只会看到「操作失败」。
+     * 注意 requireUser() 在未登录时走的是 `redirect("/login")`（NEXT_REDIRECT），
+     * 对「查客史」这种局部查询不该把整页跳走，这里转成一句可读提示。
+     */
+    if (msg === "UNAUTHORIZED" || msg.startsWith("NEXT_REDIRECT")) {
+      return { ok: false, error: "登录已过期，请重新登录后再查客史" };
+    }
+    if (msg.startsWith("FORBIDDEN:")) {
+      return { ok: false, error: "没有查询客史的权限（guest.view_sensitive，仅管理员 / 前台）" };
+    }
+    return { ok: false, error: "客史查询失败，请重试" };
+  }
 }

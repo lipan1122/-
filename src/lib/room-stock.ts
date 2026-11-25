@@ -46,13 +46,22 @@
  *   物理可售 = 总房量 − 维修房(OOO) − 锁房(LOCK) − 在住 − 预订占用
  *   今日可售 = 配了 rate_calendar.allotment ? min(物理可售, allotment) : 物理可售
  *
+ *   · 维修 / 锁房**按营业日（维修窗口）判定**（2026-11-25 加 rooms.block_from/block_to）：
+ *       房间 status ∈ {OOO,LOCK} 且两列为空 → 今天仍算不可售（老数据行为，一个字都没变）；
+ *       两列都有值 → 只有 `block_from <= day < block_to` 的营业日不可售，
+ *                    窗口外的营业日照常计入可售（维修明天结束，明天就能卖）。
+ *     判定函数是 `@/lib/room-stock-nightly` 的 `roomBlockedOn()` —— **唯一实现**，
+ *     与 PC 建单 / 小程序查房 / 渠道推送（stock-trigger.ts）共用同一份，
+ *     不存在「房态页说不可售、渠道还在卖」这种分叉。
  *   · 在住：房态是 OC/OD **或者**挂着 INHOUSE 在住单（两者取并集，数据漂移时任一成立都算占用）。
  *     **不看预计离店日** —— 客人逾期没走，房间就是卖不出去；
  *     metrics.ts 里同一个坑已经踩过一次（按 expect_check_out 截断会把逾期房间算成空房，出租率归零）。
  *   · 预订占用：状态 PENDING/CONFIRMED 且区间覆盖今天的房间数。
  *     明细表 booking_rooms 优先（一行 = 一间房，多房订单的权威来源），
  *     没有有效明细行的老数据用主单兜底（已排房按 1 间、未排房按 room_count）。
- *     房间本身已经在住 / 维修 / 锁房时**不再重复扣** —— 否则同一间房被扣两次，可售数偏小。
+ *     房间本身**今天不可售**（在住 / 维修窗口内 / 锁房）时**不再重复扣** ——
+ *     否则同一间房被扣两次，可售数偏小。窗口外的维修房不在此列：它今天是可售的，
+ *     挂在它上面的预订照常扣减。
  *   · allotment（`rate_calendar.allotment`，设置 → 房价日历「修改房量」）：
  *     **当天剩余可卖数量**（2026-11-22 酒店确认）。
  *     它表达的是「今天这个房型还剩几间能卖」，已经是在住/维修/锁房/预订之后的结果，
@@ -68,9 +77,10 @@
  */
 
 import { all } from "@/lib/db";
+import { loadRoomBlocks, roomBlockedOn } from "@/lib/room-stock-nightly";
 import { todayStr } from "@/lib/utils";
 
-/** 房态里「已经卖不了」的两种状态：维修 / 锁房 */
+/** 房态里「已经卖不了」的两种状态：维修 / 锁房（具体到哪一天由维修窗口决定） */
 const BLOCKED_ROOM_STATUSES = new Set(["OOO", "LOCK"]);
 
 /** 房态里「有客人在住」的两种状态（OOO/LOCK 之外的占用口径） */
@@ -140,10 +150,12 @@ export function todayRoomTypeStock(hotelId: number, day: string = todayStr()): R
   if (types.length === 0) return [];
 
   /* ---------- 2. 房间：物理房量 / 维修 / 锁房 / 在住 ---------- */
-  const rooms = all<{ id: number; room_type_id: number | null; status: string | null }>(
-    `SELECT id, room_type_id, status FROM rooms WHERE hotel_id = ?`,
-    [hotelId]
-  );
+  /*
+   * 房间清单走 `loadRoomBlocks()`（与 PC 建单 / 小程序查房 / 渠道推送同一份实现）：
+   * 它比手写 SQL 多返回 block_from / block_to，并且自带老库兜底
+   * （第 25 段迁移还没跑时退回「两列为空」= OOO/LOCK 整段排除，不会放开维修房）。
+   */
+  const rooms = loadRoomBlocks({ all }, hotelId);
 
   /* 在住单的房间号集合：房态字段可能因为手工改房态而与在住单漂移，
      所以「房态 OC/OD」和「挂着 INHOUSE 单」两个条件取并集，任一成立都按占用算（宁可算紧，不算松）。 */
@@ -160,7 +172,7 @@ export function todayRoomTypeStock(hotelId: number, day: string = todayStr()): R
 
   /** 房间 id → 房型 id（预订明细只给 room_id 时用它反查） */
   const typeOfRoom = new Map<number, number>();
-  /** 已经不可卖的房（在住 / 维修 / 锁房）：预订扣减时用来自查重 */
+  /** 今天已经不可卖的房（在住 / 今天在维修窗口内 / 今天锁房）：预订扣减时用来自查重 */
   const blockedRooms = new Set<number>();
 
   for (const room of rooms) {
@@ -175,6 +187,12 @@ export function todayRoomTypeStock(hotelId: number, day: string = todayStr()): R
     agg.physical += 1;
 
     if (BLOCKED_ROOM_STATUSES.has(status)) {
+      /*
+       * 维修 / 锁房：只扣**今天落在窗口内**的。
+       *   · 没登记窗口（老数据）→ roomBlockedOn 恒 true → 与改造前完全一致；
+       *   · 登记了窗口（如 11-26~11-28）→ 窗口外的那天不扣，房间照常可售。
+       */
+      if (!roomBlockedOn(room, day)) continue;
       if (status === "OOO") agg.ooo += 1;
       else agg.lock += 1;
       blockedRooms.add(roomId);

@@ -2,10 +2,10 @@
 
 import Link from "next/link";
 import type { ReactNode, RefObject } from "react";
-import { useActionState, useEffect, useMemo, useRef, useState } from "react";
+import { useActionState, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { checkInAction } from "@/app/(main)/frontdesk/actions";
-import type { CheckInState } from "@/app/(main)/frontdesk/actions";
+import { checkInAction, searchGuestsAction } from "@/app/(main)/frontdesk/actions";
+import type { CheckInState, GuestPickCandidate } from "@/app/(main)/frontdesk/actions";
 import { addDays, fmtMoney, nightsBetween, todayStr } from "@/lib/utils";
 
 export type VacantRoom = {
@@ -97,6 +97,18 @@ type GuestDraft = {
   breakfast: string;
 };
 
+/**
+ * 表单里的一行住客
+ *
+ * rowKey 只给 React 用（稳定 key），**不会**被提交：
+ * 住客可以增删，若拿数组下标当 key，「删除第 2 行」会让第 3 行复用第 2 行的
+ * 本地状态（客史查询结果 / 已选客史），前台看到的就是别人的候选。
+ */
+type GuestRow = GuestDraft & { rowKey: string };
+
+/** 某一行已选中的老客 + 当初是用什么词搜到的（用于回填空字段，且不把脱敏串写进表单） */
+type GuestPick = { candidate: GuestPickCandidate; query: string };
+
 /** 房价代码：与 actions.ts 中的 RATE_FACTORS 保持一致 */
 const RATE_CODES = [
   { value: "门市价", label: "门市价", factor: 1 },
@@ -123,9 +135,28 @@ function round2(n: number): number {
   return Math.round((n + Number.EPSILON) * 100) / 100;
 }
 
-function emptyGuest(): GuestDraft {
-  return { name: "", mobile: "", idType: "身份证", idNo: "", gender: "男", breakfast: "0" };
+/** 住客行的稳定 key 序号（只在本组件实例内递增，与提交字段无关） */
+let guestRowSeq = 0;
+function nextGuestRowKey(): string {
+  guestRowSeq += 1;
+  return `g${guestRowSeq}`;
 }
+
+function emptyGuest(): GuestRow {
+  return {
+    rowKey: nextGuestRowKey(),
+    name: "",
+    mobile: "",
+    idType: "身份证",
+    idNo: "",
+    gender: "男",
+    breakfast: "0",
+  };
+}
+
+/** 身份证号形状：15 位（可带 X）或 18 位（末位可为 X）；手机号 11 位纯数字 */
+const ID_NO_SHAPE = /^\d{15}[0-9Xx]?$|^\d{18}[Xx]?$/;
+const MOBILE_SHAPE = /^\d{11}$/;
 
 /** 入住时间 + 时长 → 预计离店时间（仅用于钟点房提示） */
 function addHoursText(time: string, hours: number): string {
@@ -142,6 +173,205 @@ function addHoursText(time: string, hours: number): string {
 
 function vipText(vipLevel: number): string {
   return vipLevel > 0 ? `VIP${Math.min(3, vipLevel)}` : "普通";
+}
+
+/**
+ * 单行住客的「选择已有客史」控件（上线评审 P1：同名客史无法区分）
+ *
+ * ── 缺陷 ──
+ * 服务端 `checkInAction` 一直支持 `guest_id_<i>`（逐间指定客史），但表单没有入口：
+ * 前台遇到两个「张伟」只能碰运气填证件号/手机号，填错就把入住单、历史账单、
+ * 会员储值全挂到另一个人头上。
+ *
+ * ── 交互 ──
+ *   · 输满 11 位手机号 / 15 或 18 位身份证号 → 自动查客史（防抖 450ms）；
+ *   · 命中 1 条 → 「老客：张伟（138****1234）· 入住 5 次」+「用这个」；
+ *   · 命中多条 → 列表让前台核对后选（候选已脱敏：手机 138****1234、证件 3301********1234）；
+ *   · 不选 → 提交时不带 `guest_id_<i>`，服务端按「证件号 → 手机号 → 唯一同名」匹配，
+ *     确实没有档案才新建（同名多条又没身份信息会被拒绝并提示选择客史）；
+ *   · 也可以点「查老客」按姓名/尾号手动查（同名场景就是搜姓名看列表）。
+ *
+ * ── 为什么填回表单的只有姓名 ──
+ * 服务端返回的是脱敏串，把「138****1234」写进 guest_mobile_0 会存出一条假手机号，
+ * 还会撞掉客史匹配。所以回填只补「姓名」和「前台自己输入的合法号码」；
+ * 选定后真正的关联依据是隐藏字段 `guest_id_<i>`。
+ */
+function GuestHistoryPicker({
+  draft,
+  picked,
+  onPick,
+  onClear,
+}: {
+  draft: GuestRow;
+  picked: GuestPickCandidate | null;
+  onPick: (candidate: GuestPickCandidate, query: string) => void;
+  onClear: () => void;
+}) {
+  const [candidates, setCandidates] = useState<GuestPickCandidate[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  /* 最近一次成功查询用的词（空 = 还没查过），用于「没有匹配」提示与选中时的回填 */
+  const [searched, setSearched] = useState("");
+  const [open, setOpen] = useState(false);
+  /* 请求序号：慢响应回来时若已有更新的查询，直接丢弃，避免候选串行覆盖 */
+  const seqRef = useRef(0);
+
+  const idNo = draft.idNo.replace(/\s+/g, "");
+  const mobile = draft.mobile.replace(/\s+/g, "");
+  const name = draft.name.trim();
+  const autoQuery = ID_NO_SHAPE.test(idNo) ? idNo : MOBILE_SHAPE.test(mobile) ? mobile : "";
+  /* 「查老客」按钮：优先让前台用当前输入的号码查，其次退回姓名 */
+  const manualQuery = autoQuery || idNo || mobile || name;
+
+  const lookup = useCallback(async (raw: string): Promise<void> => {
+    const q = raw.trim();
+    setError("");
+    if (q.length < 2) {
+      setError("请输入至少 2 位姓名 / 手机号 / 证件号");
+      return;
+    }
+    const mySeq = seqRef.current + 1;
+    seqRef.current = mySeq;
+    setLoading(true);
+    try {
+      const res = await searchGuestsAction(q);
+      if (mySeq !== seqRef.current) return;
+      if (!res.ok) {
+        setCandidates([]);
+        setOpen(false);
+        setError(res.error);
+        return;
+      }
+      setCandidates(res.guests);
+      setSearched(q);
+      setOpen(true);
+    } catch {
+      if (mySeq === seqRef.current) {
+        setCandidates([]);
+        setOpen(false);
+        setError("客史查询失败，请重试");
+      }
+    } finally {
+      if (mySeq === seqRef.current) setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    /* 已经选定老客就不再自动查（避免结果面板回来盖掉选择） */
+    if (picked) return;
+    if (!autoQuery) {
+      /* 输入退回不完整状态：旧的候选不再可信，收起面板 */
+      setOpen(false);
+      return;
+    }
+    setOpen(false);
+    const timer = setTimeout(() => {
+      void lookup(autoQuery);
+    }, 450);
+    return () => clearTimeout(timer);
+  }, [autoQuery, picked, lookup]);
+
+  if (picked) {
+    return (
+      <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 rounded border border-emerald-300 bg-emerald-50/70 px-2 py-1.5">
+        <span className="rounded bg-emerald-600 px-1.5 py-0.5 text-[10px] font-medium text-white">
+          老客
+        </span>
+        <span className="text-[11px] text-emerald-800">
+          {picked.name}（{picked.mobileMasked || "无手机号"}）· 入住 {picked.stayCount} 次
+          {picked.idNoMasked ? ` · 证件 ${picked.idNoMasked}` : ""}
+        </span>
+        <span className="text-[10px] text-emerald-700/80">本次入住单挂到这条客史 #{picked.id}</span>
+        <button
+          type="button"
+          onClick={onClear}
+          className="ml-auto text-[11px] text-rose-500 hover:underline"
+        >
+          取消选择（改按证件号/手机号自动匹配）
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-2 rounded border border-gray-200 bg-white/70 px-2 py-1.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-[11px] text-gray-500">客史</span>
+        <button
+          type="button"
+          onClick={() => void lookup(manualQuery)}
+          disabled={loading || manualQuery.length < 2}
+          className="rounded border border-emerald-300 px-2 py-[3px] text-[11px] text-emerald-700 transition-colors hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {loading ? "查询中…" : "查老客"}
+        </button>
+        {!open && !error && (
+          <span className="text-[11px] text-gray-400">
+            输满手机号 / 身份证号自动匹配；点「查老客」也可按姓名查同名客史
+          </span>
+        )}
+      </div>
+
+      {error && <p className="mt-1 text-[11px] text-red-500">{error}</p>}
+
+      {open && candidates.length === 0 && (
+        <p className="mt-1 text-[11px] text-gray-500">
+          没有匹配「{searched}」的客史 → 不选客史直接提交，将按新客建档
+        </p>
+      )}
+
+      {open && candidates.length === 1 && (
+        <div className="mt-1 flex flex-wrap items-center gap-2 rounded border border-emerald-200 bg-emerald-50/60 px-2 py-1">
+          <span className="text-[11px] text-gray-700">
+            老客：{candidates[0].name}（{candidates[0].mobileMasked || "无手机号"}）· 入住{" "}
+            {candidates[0].stayCount} 次
+            {candidates[0].idNoMasked ? ` · 证件 ${candidates[0].idNoMasked}` : ""}
+          </span>
+          <button
+            type="button"
+            onClick={() => onPick(candidates[0], searched)}
+            className="rounded bg-emerald-600 px-2 py-[2px] text-[11px] font-medium text-white hover:bg-emerald-700"
+          >
+            用这个
+          </button>
+          <span className="text-[10px] text-gray-400">不选 → 不指定客史，按身份信息自动匹配</span>
+        </div>
+      )}
+
+      {open && candidates.length > 1 && (
+        <div className="mt-1 overflow-hidden rounded border border-gray-200 bg-white">
+          <div className="border-b border-gray-100 bg-gray-50/70 px-2 py-1 text-[10px] text-gray-500">
+            匹配到 {candidates.length} 位客史（候选已脱敏），请核对后选择；不选任何一位 → 不指定客史（同名又无身份信息会被拒绝）
+          </div>
+          <ul className="divide-y divide-gray-100">
+            {candidates.map((c) => (
+              <li key={c.id}>
+                <button
+                  type="button"
+                  onClick={() => onPick(c, searched)}
+                  className="flex w-full flex-wrap items-center gap-x-2 gap-y-0.5 px-2 py-1 text-left text-[11px] transition-colors hover:bg-emerald-50"
+                >
+                  <span className="font-medium text-gray-800">{c.name}</span>
+                  <span className="text-gray-400">#{c.id}</span>
+                  <span className="tabular-nums text-gray-600">{c.mobileMasked || "无手机号"}</span>
+                  <span className="tabular-nums text-gray-400">{c.idNoMasked || "无证件号"}</span>
+                  <span className="text-gray-500">入住 {c.stayCount} 次</span>
+                  <span className="text-gray-300">{vipText(c.vipLevel)}</span>
+                  {c.matchedBy === "id_no" && (
+                    <span className="rounded bg-brand-50 px-1 text-[10px] text-brand-600">证件匹配</span>
+                  )}
+                  {c.matchedBy === "mobile" && (
+                    <span className="rounded bg-brand-50 px-1 text-[10px] text-brand-600">手机匹配</span>
+                  )}
+                  <span className="ml-auto text-[10px] text-emerald-600 underline">选这位</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function TabLink({ href, active, label }: { href: string; active: boolean; label: string }) {
@@ -280,8 +510,9 @@ export default function CheckInForm({
   const [selfUse, setSelfUse] = useState(false);
 
   // 住客
-  const [guestDrafts, setGuestDrafts] = useState<GuestDraft[]>(() => [
+  const [guestDrafts, setGuestDrafts] = useState<GuestRow[]>(() => [
     {
+      rowKey: nextGuestRowKey(),
       name: prefill?.guestName ?? "",
       mobile: prefill?.mobile ?? "",
       idType: "身份证",
@@ -290,6 +521,14 @@ export default function CheckInForm({
       breakfast: String(prefill?.breakfast ?? 0),
     },
   ]);
+  /*
+   * 每行住客选中的老客（rowKey → 客史）。
+   *
+   * 选中后才在表单里渲染隐藏字段 `guest_id_<i>`：服务端 `checkInAction` 见到它
+   * 就直接用这条客史，不再按证件号/手机号/姓名去猜 —— 同名客人的唯一出路。
+   * 不选就没有这个字段，服务端按「证件号 → 手机号 → 唯一同名」匹配或新建。
+   */
+  const [guestPicks, setGuestPicks] = useState<Record<string, GuestPick>>({});
 
   // 字段聚焦引用
   const teamRef = useRef<HTMLInputElement | null>(null);
@@ -375,16 +614,52 @@ export default function CheckInForm({
     }
   }
 
-  function updateGuest(index: number, patch: Partial<GuestDraft>): void {
-    setGuestDrafts((prev) => prev.map((g, i) => (i === index ? { ...g, ...patch } : g)));
+  /**
+   * 改某一行住客的字段
+   *
+   * 一旦改动姓名 / 手机号 / 证件号，就必须清掉这一行已选中的客史：
+   * 服务端「显式指定的 guest_id」优先级最高，留着旧选择会让前台
+   * 「把身份证号改成了另一个人的，账单却还挂在原来那条客史」——正是本问题要消灭的错挂。
+   */
+  function updateGuest(rowKey: string, patch: Partial<GuestDraft>): void {
+    setGuestDrafts((prev) => prev.map((g) => (g.rowKey === rowKey ? { ...g, ...patch } : g)));
+    if (patch.name !== undefined || patch.mobile !== undefined || patch.idNo !== undefined) {
+      clearPick(rowKey);
+    }
   }
 
   function addGuest(): void {
     setGuestDrafts((prev) => (prev.length >= 9 ? prev : [...prev, emptyGuest()]));
   }
 
-  function removeGuest(index: number): void {
-    setGuestDrafts((prev) => (prev.length <= 1 ? prev : prev.filter((_, i) => i !== index)));
+  function removeGuest(rowKey: string): void {
+    setGuestDrafts((prev) => (prev.length <= 1 ? prev : prev.filter((g) => g.rowKey !== rowKey)));
+    clearPick(rowKey);
+  }
+
+  /** 选中老客：只回填「空着的」姓名 / 前台自己输入的合法号码，绝不写入脱敏串 */
+  function pickGuest(rowKey: string, candidate: GuestPickCandidate, query: string): void {
+    setGuestPicks((prev) => ({ ...prev, [rowKey]: { candidate, query } }));
+    const q = query.trim();
+    setGuestDrafts((prev) =>
+      prev.map((g) => {
+        if (g.rowKey !== rowKey) return g;
+        const next: GuestRow = { ...g };
+        if (!next.name.trim()) next.name = candidate.name;
+        if (!next.mobile.trim() && MOBILE_SHAPE.test(q)) next.mobile = q;
+        if (!next.idNo.trim() && ID_NO_SHAPE.test(q)) next.idNo = q;
+        return next;
+      })
+    );
+  }
+
+  function clearPick(rowKey: string): void {
+    setGuestPicks((prev) => {
+      if (!prev[rowKey]) return prev;
+      const next = { ...prev };
+      delete next[rowKey];
+      return next;
+    });
   }
 
   /** 快捷：切到钟点房并预设 4 小时 */
@@ -906,8 +1181,20 @@ export default function CheckInForm({
               )}
 
               <div className="space-y-2.5">
-                {guestDrafts.map((guest, index) => (
-                  <div key={index} className="rounded-md border border-gray-200 bg-gray-50/60 p-3">
+                {guestDrafts.map((guest, index) => {
+                  /*
+                   * 服务端按「有名住客」的顺序取 guest_id_<i>：
+                   * checkInAction 先把每行读成 guests[]，再 filter(name) 得到 namedGuests，
+                   * 然后 for (gi) 读 guest_id_${gi}。所以后缀必须用「本行前面有几位能提交的住客」，
+                   * 不能直接用行号 —— 表单里若有空白行，用行号会整体错位一格，
+                   * 前台明明选了老客，入住单却悄悄挂到别的档案上。
+                   */
+                  const namedIndex = guestDrafts
+                    .slice(0, index)
+                    .filter((g) => g.name.trim()).length;
+                  const pick = guestPicks[guest.rowKey];
+                  return (
+                  <div key={guest.rowKey} className="rounded-md border border-gray-200 bg-gray-50/60 p-3">
                     <div className="mb-2 flex items-center gap-2">
                       <span className="text-[12px] font-medium text-gray-700">
                         {index === 0 ? "主住客" : `住客 ${index + 1}`}
@@ -916,7 +1203,7 @@ export default function CheckInForm({
                       {index > 0 && (
                         <button
                           type="button"
-                          onClick={() => removeGuest(index)}
+                          onClick={() => removeGuest(guest.rowKey)}
                           className="ml-auto text-[11px] text-rose-500 hover:underline"
                         >
                           删除
@@ -932,7 +1219,7 @@ export default function CheckInForm({
                           name={`guest_name_${index}`}
                           className="input h-[30px] w-full bg-white text-[12px]"
                           value={guest.name}
-                          onChange={(e) => updateGuest(index, { name: e.target.value })}
+                          onChange={(e) => updateGuest(guest.rowKey, { name: e.target.value })}
                           placeholder="请输入姓名"
                           autoComplete="off"
                         />
@@ -946,7 +1233,7 @@ export default function CheckInForm({
                           name={`guest_mobile_${index}`}
                           className="input h-[30px] w-full bg-white text-[12px]"
                           value={guest.mobile}
-                          onChange={(e) => updateGuest(index, { mobile: e.target.value })}
+                          onChange={(e) => updateGuest(guest.rowKey, { mobile: e.target.value })}
                           placeholder="手机号"
                           inputMode="tel"
                           autoComplete="off"
@@ -958,7 +1245,7 @@ export default function CheckInForm({
                           name={`guest_id_type_${index}`}
                           className="input h-[30px] w-full bg-white text-[12px]"
                           value={guest.idType}
-                          onChange={(e) => updateGuest(index, { idType: e.target.value })}
+                          onChange={(e) => updateGuest(guest.rowKey, { idType: e.target.value })}
                         >
                           {ID_TYPES.map((t) => (
                             <option key={t} value={t}>
@@ -974,7 +1261,7 @@ export default function CheckInForm({
                           name={`guest_id_no_${index}`}
                           className="input h-[30px] w-full bg-white text-[12px]"
                           value={guest.idNo}
-                          onChange={(e) => updateGuest(index, { idNo: e.target.value })}
+                          onChange={(e) => updateGuest(guest.rowKey, { idNo: e.target.value })}
                           placeholder="证件号码"
                           autoComplete="off"
                         />
@@ -985,7 +1272,7 @@ export default function CheckInForm({
                           name={`guest_gender_${index}`}
                           className="input h-[30px] w-full bg-white text-[12px]"
                           value={guest.gender}
-                          onChange={(e) => updateGuest(index, { gender: e.target.value })}
+                          onChange={(e) => updateGuest(guest.rowKey, { gender: e.target.value })}
                         >
                           {GENDERS.map((g) => (
                             <option key={g} value={g}>
@@ -1000,7 +1287,7 @@ export default function CheckInForm({
                           name={`guest_breakfast_${index}`}
                           className="input h-[30px] w-full bg-white text-[12px]"
                           value={guest.breakfast}
-                          onChange={(e) => updateGuest(index, { breakfast: e.target.value })}
+                          onChange={(e) => updateGuest(guest.rowKey, { breakfast: e.target.value })}
                         >
                           {BREAKFASTS.map((b) => (
                             <option key={b} value={b}>
@@ -1010,8 +1297,20 @@ export default function CheckInForm({
                         </select>
                       </label>
                     </div>
+
+                    {/* 选择已有客史：同名客人的唯一出路（选中后带 guest_id_<i> 提交） */}
+                    <GuestHistoryPicker
+                      draft={guest}
+                      picked={pick?.candidate ?? null}
+                      onPick={(candidate, query) => pickGuest(guest.rowKey, candidate, query)}
+                      onClear={() => clearPick(guest.rowKey)}
+                    />
+                    {pick && guest.name.trim() && (
+                      <input type="hidden" name={`guest_id_${namedIndex}`} value={pick.candidate.id} />
+                    )}
                   </div>
-                ))}
+                  );
+                })}
               </div>
 
               <button

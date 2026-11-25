@@ -42,6 +42,12 @@ CREATE TABLE rooms (
   status TEXT NOT NULL DEFAULT 'VC',
   feature TEXT,
   sort INTEGER DEFAULT 0,
+  -- 维修 / 锁房的起止日期（与 scripts/migrate-all.mjs 第 25 段的 addColumn 一一对应）
+  -- status ∈ {OOO,LOCK} 且两列为空 → 整段不可售（老数据行为）；
+  -- 两列都有值 → 只有 [block_from, block_to) 这些房晚不可售；只有 block_from → 从该日起永久。
+  -- 日期口径：YYYY-MM-DD，开始日含、结束日不含（与入住/离店同一口径）
+  block_from TEXT,
+  block_to TEXT,
   UNIQUE(hotel_id, room_no)
 );
 

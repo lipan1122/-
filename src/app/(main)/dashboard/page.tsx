@@ -9,6 +9,7 @@ const one = get;
 import { requireUser } from "@/lib/session";
 import { fmtMoney, todayStr, BOOKING_STATUS } from "@/lib/utils";
 import { loadAlerts } from "./alerts";
+import { isDemoMode } from "@/lib/demo-mode";
 
 export const dynamic = "force-dynamic";
 
@@ -209,7 +210,7 @@ export default async function DashboardPage({
         原来只在「设置 → 演示数据」（要点进设置、再点左侧第 22 项菜单），埋得太深找不到。
         这里放到工作台最上面一行，一眼就能看到。
       */}
-      {user.role === "admin" && (
+      {isDemoMode() && user.role === "admin" && (
         <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-dashed border-amber-300 bg-amber-50 px-3 py-2">
           <div className="min-w-0">
             <span className="text-[12.5px] font-semibold text-amber-900">🧪 演示数据</span>
