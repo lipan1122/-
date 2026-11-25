@@ -175,15 +175,16 @@ fi
 #
 # ⚠️ 默认只读，**必须显式 --apply**（不写库的话这条命令只会打印报告）：
 #    node scripts/post-deploy.mjs --check   # 只报告（默认行为，部署脚本里不要用这个）
-#    node scripts/post-deploy.mjs --apply   # 备份一次 → 写库
+#    node scripts/post-deploy.mjs --apply --structure-only   # 只做结构迁移 + 只读体检（默认）
+#    node scripts/post-deploy.mjs --apply --data             # 含数据修复（会自动取消超卖订单，必须人工确认）
 # ⚠️ 退出码：0 = 十步全部成功；1 = 有步骤失败（脚本当场停下，不会继续往后跑）。
 #    部署不因它中断（服务要能起来），但非 0 必须立刻看上面报告排查。
 # ⚠️ 紧跟其后的 chown 不能省！sudo 跑脚本会让 SQLite 创建归属 root 的
 #    data/pms.db-wal / -shm，而服务以 $APP_USER 运行 —— 漏了这行，
 #    下一个请求就 attempt to write a readonly database（第九轮真踩过）。
 if [ -f scripts/post-deploy.mjs ]; then
-  log "数据收尾：结构 + 押金/房态/日期/超卖/客史 + 体检（scripts/post-deploy.mjs --apply）"
-  if node scripts/post-deploy.mjs --apply; then
+  log "数据收尾：结构迁移 + 只读体检（--structure-only；数据修复需人工确认后单独跑 --data）"
+  if node scripts/post-deploy.mjs --apply --structure-only; then
     log "数据收尾全部通过"
   else
     RC=$?

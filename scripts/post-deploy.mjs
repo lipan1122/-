@@ -98,6 +98,35 @@ const ARGV = process.argv.slice(2);
 /* 默认只读：只有显式 --apply 才写库；--dry-run 是 --check 的旧别名，同样只读 */
 const APPLY = ARGV.includes("--apply");
 const VERBOSE = ARGV.includes("--verbose");
+/*
+ * --structure-only：只做「结构 + 只读检查」，**跳过所有会写经营数据的步骤**
+ *
+ * 为什么必须要有这个开关（上线评审 P0-2）：
+ *
+ *   第 7 步「存量超卖修复」调用 scripts/fix-oversell-bookings.mjs，它会
+ *   `UPDATE bookings SET status = 'CANCELLED'` —— **把真实订单改成已取消**。
+ *   第 4/5/6/8 步也都会写经营数据（押金、房态、到离日期、客史）。
+ *
+ *   而 deploy-vps.sh / finish-vps.sh 原来**默认**调 `--apply`，也就是说：
+ *   每一次正式发布都会自动进入「改经营数据」的路径 —— 这不可以。
+ *
+ * 正式发布的默认行为应该是：结构迁移 + 只读体检。
+ * 数据修复必须由人看过清单、确认后再单独跑。
+ *
+ * 用法：
+ *   node scripts/post-deploy.mjs --apply --structure-only       结构迁移 + 体检
+ *   node scripts/post-deploy.mjs --apply --data                含数据修复（要人工确认）
+ *   node scripts/post-deploy.mjs --check                       只读（什么都不写）
+ */
+const STRUCTURE_ONLY = ARGV.includes("--structure-only");
+const WITH_DATA = ARGV.includes("--data");
+if (STRUCTURE_ONLY && WITH_DATA) {
+  console.error("❌ --structure-only 和 --data 互斥，只能选一个");
+  process.exit(1);
+}
+/** 会被 --structure-only 自动跳过的步骤（写经营数据的） */
+const DATA_STEP_IDS = ["deposit", "room-status", "roll-dates", "oversell", "guest-id"];
+
 const STEP_TIMEOUT_MS = Number(process.env.PMS_POST_DEPLOY_TIMEOUT_MS ?? 300000);
 
 /** --days N：透传给 fix-oversell-bookings.mjs（默认 30，与它自己的默认一致） */
@@ -299,6 +328,15 @@ function parseSkips() {
       );
     }
     out.add(hit[0]);
+  }
+  /*
+   * --structure-only：自动跳过所有写经营数据的步骤
+   *
+   * 顺序很重要：先收集用户显式 --skip 的，再叠加这个批次 ——
+   * 这样 `--structure-only --skip preflight`（只要结构、连体检都不跑）也成立。
+   */
+  if (STRUCTURE_ONLY) {
+    for (const id of DATA_STEP_IDS) out.add(id);
   }
   return out;
 }

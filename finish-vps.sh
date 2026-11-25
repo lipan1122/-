@@ -126,8 +126,8 @@ sqlite3 data/pms.db "SELECT '房间 ' || COUNT(*) || ' 间' FROM rooms; SELECT '
 # ⚠️ 紧跟其后的 chown 不能省：sudo 跑脚本会产生 root 的 data/pms.db-wal / -shm，
 #    服务以 $APP_USER 运行时下一个请求就 readonly database。
 if [ -f scripts/post-deploy.mjs ]; then
-  log "数据收尾：结构 + 押金/房态/日期/超卖/客史 + 体检（scripts/post-deploy.mjs --apply）"
-  if node scripts/post-deploy.mjs --apply; then
+  log "数据收尾：结构迁移 + 只读体检（--structure-only；数据修复需人工确认后单独跑 --data）"
+  if node scripts/post-deploy.mjs --apply --structure-only; then
     log "数据收尾全部通过"
   else
     RC=$?

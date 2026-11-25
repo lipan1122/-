@@ -98,10 +98,23 @@ add(
 add(
   "账单总额与流水合计不符",
   all(
-    `SELECT folio_no || ' 账单 ' || ROUND(total_amount,2) || ' vs 流水 ' ||
-            ROUND(COALESCE((SELECT SUM(amount) FROM folio_items fi WHERE fi.folio_id = f.id),0),2) AS x
+    /*
+     * ⚠️ 必须排除押金明细（item_type='DEPOSIT'）
+     *
+     * `folios.total_amount` 的口径是「客人应付的消费金额」，**不含押金**
+     * （见 lib/folio.ts 的 recalcFolioBalance / 以及 migrate-all 第 23 段）。
+     * 押金是代收代付的往来款，单独记在 folio_items 里用于退房时冲销。
+     *
+     * 原来的判据把押金明细也算进去 → 16 张 OPEN 账单恒报「不符」，
+     * 但实际 `total_amount - SUM(非押金明细) = 0.00`，数据是对的。
+     * 这类误报会让人习惯性忽略体检结果，比漏报更危险。
+     */
+    `SELECT folio_no || ' 账单 ' || ROUND(total_amount,2) || ' vs 明细 ' ||
+            ROUND(COALESCE((SELECT SUM(amount) FROM folio_items fi
+                             WHERE fi.folio_id = f.id AND fi.item_type <> 'DEPOSIT'),0),2) AS x
        FROM folios f WHERE hotel_id = ?
-        AND ABS(total_amount - COALESCE((SELECT SUM(amount) FROM folio_items fi WHERE fi.folio_id = f.id),0)) > 0.01`,
+        AND ABS(total_amount - COALESCE((SELECT SUM(amount) FROM folio_items fi
+                                          WHERE fi.folio_id = f.id AND fi.item_type <> 'DEPOSIT'),0)) > 0.01`,
     [HOTEL_ID]
   ).map((r) => r.x)
 );
