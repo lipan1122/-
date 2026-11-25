@@ -3,6 +3,7 @@ import Link from "next/link";
 import { redirect } from "next/navigation";
 import { ensureArAccountSchema, listArAgingDetail, listArLedgerDrift } from "@/lib/ar";
 import { all, get } from "@/lib/db";
+import { ensureWalletSchema } from "@/lib/member-wallet";
 import {
   dayCount,
   nightSeries,
@@ -7947,37 +7948,754 @@ function MiniTable({ head, rows }: { head: string[]; rows: string[][] }) {
   );
 }
 
-function ReportMemberList({ ctx }: ReportProps) {
-  const rows = all<{
-    id: number;
-    name: string;
-    mobile: string | null;
-    vip_level: number | null;
-    total_spend: number | null;
-    stay_count: number | null;
-  }>(
-    `SELECT id, name, mobile, vip_level, total_spend, stay_count
-     FROM guests WHERE hotel_id = ? AND COALESCE(vip_level, 0) > 0
-     ORDER BY COALESCE(total_spend, 0) DESC LIMIT 300`,
-    [ctx.hotelId]
+/* ================================================================== *
+ * 八·三、补做报表的数据访问层（会员 / 储值 / 发卡 / 保洁 / 渠道明细 / 公安）
+ *
+ * 这一组报表原来在 REPORT_VIEWS 里指向 ReportNotReady 占位，原因是它们的 SQL
+ * 引用了库里不存在的表 / 列（AI 生成后从未跑过）：
+ *   · payments.biz_type          —— payments 只有 kind（ROOM_PAYMENT/DEPOSIT/DEPOSIT_REFUND）
+ *   · member_topups              —— 储值流水在 member_wallet_ledger
+ *   · guests.total_spend         —— guests 没有该列，消费要从 stays → folios → folio_items 聚合
+ *   · guests.stay_count          —— 同上，入住次数是 stays 的行数
+ *   · bookings.order_no          —— 单号列叫 booking_no
+ *   · housekeeping.cleaner_name  —— 打扫员列叫 assignee，人员档案在 cleaners
+ *   · stays.id_no                —— 证件号在 guests.id_no（stays 只有 guest_id）
+ *
+ * 本节所有 SQL 都对着真库 PRAGMA table_info 校对过（2026-11 现状），不再凭记忆写列名。
+ * 会员消费 / 入住次数沿用 /members 页面与 members/actions.ts 的 MEMBER_METRIC_SQL：
+ *   「按 guest_id 关联，老数据 guest_id 为空时才按姓名回落」——
+ *   既不让同名客人蹭到指标，也不让历史空关联的住宿记录漏统计。
+ * ================================================================== */
+
+/** 报表内「导出 CSV」按钮（与渠道统计报表的导出按钮同一套样式） */
+const REPORT_EXPORT_CLS =
+  "inline-flex h-[24px] items-center rounded-[2px] border border-[#dcdcdc] bg-white px-2.5 text-[11.5px] text-[#5f6b76] hover:border-[#32c141] hover:text-[#32c141]";
+
+/** 时间戳显示到分钟（ISO → YYYY-MM-DD HH:mm，按服务器本地时区） */
+function fmtMinute(v: string | null | undefined): string {
+  if (!v) return "—";
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return String(v);
+  const p = (x: number) => String(x).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/**
+ * 手机号脱敏。
+ *
+ * 报表页只校验 report.view_finance，没有额外校验 member.view_sensitive，
+ * 所以明细里一律只给「前 3 + 后 4」；明文在会员管理（有敏感字段权限）里看。
+ */
+function maskMobile(mobile: string | null | undefined): string {
+  const s = String(mobile ?? "").trim();
+  if (!s) return "—";
+  if (s.length <= 6) return "****";
+  return `${s.slice(0, 3)}****${s.slice(-4)}`;
+}
+
+/** 数字兜底（配置项读出来可能是 undefined / 字符串 / NaN） */
+function numOr(v: unknown, fallback: number): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/** 证件号脱敏：保留前 4 后 4。页面与 CSV 都不摊完整证件号（公安清单尤其不能）。 */
+function maskIdNo(idNo: string | null | undefined): string {
+  const s = String(idNo ?? "").trim();
+  if (!s) return "—";
+  if (s.length <= 8) return `${s.slice(0, 2)}****${s.slice(-2)}`;
+  return `${s.slice(0, 4)}********${s.slice(-4)}`;
+}
+
+/**
+ * 会员累计指标（与 /members 页面、members/actions.ts 的 MEMBER_METRIC_SQL 同一口径）
+ *
+ * 老数据里 stays.guest_id 会为空（本期实测 384 条有 24 条为空），
+ * 只有 guest_id 为空的行才允许按姓名回落 —— 已经关联到人的住宿不会被同名客人重复计入。
+ */
+const MEMBER_METRIC_SQL = `
+       (SELECT COUNT(*) FROM stays s
+         WHERE s.hotel_id = g.hotel_id
+           AND (s.guest_id = g.id OR (s.guest_id IS NULL AND s.guest_name = g.name))) AS stay_count,
+       (SELECT COALESCE(SUM(fi.amount), 0)
+          FROM folio_items fi
+          JOIN folios f ON f.id = fi.folio_id AND f.hotel_id = fi.hotel_id
+          JOIN stays s ON s.id = f.stay_id AND s.hotel_id = f.hotel_id
+         WHERE s.hotel_id = g.hotel_id
+           AND (s.guest_id = g.id OR (s.guest_id IS NULL AND s.guest_name = g.name))
+           AND fi.item_type != 'DEPOSIT') AS total_spend,
+       (SELECT MAX(s.check_in_time) FROM stays s
+         WHERE s.hotel_id = g.hotel_id
+           AND (s.guest_id = g.id OR (s.guest_id IS NULL AND s.guest_name = g.name))) AS last_check_in`;
+
+type MemberCardRow = {
+  id: number;
+  name: string;
+  mobile: string | null;
+  gender: string | null;
+  vip_level: number;
+  id_no: string | null;
+  created_at: string | null;
+  stay_count: number;
+  total_spend: number;
+  last_check_in: string | null;
+  points_balance: number;
+  salesman: string | null;
+};
+
+/**
+ * 会员卡清单（vip_level > 0 即会员，与会员管理 / 会员概况同一定义）。
+ *
+ * `salesman` 取「该会员首次入住记录的销售员」（stays.salesman 是文本字段，
+ * 不是 salesman_id）—— 这是库里唯一能把发卡归到销售员的线索，
+ * 详见「销售员发卡报告」的口径说明。
+ */
+function memberCardRows(hotelId: number): MemberCardRow[] {
+  return all<MemberCardRow>(
+    `SELECT g.id, g.name, g.mobile, g.gender, COALESCE(g.vip_level, 0) AS vip_level,
+            g.id_no, g.created_at,
+            ${MEMBER_METRIC_SQL},
+            (SELECT COALESCE(SUM(sr.points), 0) FROM score_records sr
+              WHERE sr.hotel_id = g.hotel_id AND sr.guest_id = g.id) AS points_balance,
+            (SELECT s.salesman FROM stays s
+              WHERE s.hotel_id = g.hotel_id
+                AND (s.guest_id = g.id OR (s.guest_id IS NULL AND s.guest_name = g.name))
+                AND COALESCE(TRIM(s.salesman), '') <> ''
+              ORDER BY s.check_in_time
+              LIMIT 1) AS salesman
+       FROM guests g
+      WHERE g.hotel_id = ? AND COALESCE(g.vip_level, 0) > 0 AND COALESCE(g.deleted, 0) = 0
+      ORDER BY total_spend DESC, g.id`,
+    [hotelId]
+  ).map((r) => ({
+    ...r,
+    vip_level: num(r.vip_level),
+    stay_count: num(r.stay_count),
+    total_spend: round2(num(r.total_spend)),
+    points_balance: num(r.points_balance),
+  }));
+}
+
+/** 会员卡号：沿用会员报表原来的编码规则（M + 8 位补零的客史 id） */
+function memberCardNo(id: number): string {
+  return `M${String(id).padStart(8, "0")}`;
+}
+
+/** 区间内每个会员的消费（账务明细按 guest_id / 姓名回落归到客人，再按会员汇总） */
+function memberPeriodSpend(hotelId: number, from: string, to: string): Map<number, number> {
+  const out = new Map<number, number>();
+  for (const r of all<{ guest_id: number; amount: number }>(
+    `SELECT g.id AS guest_id, COALESCE(SUM(fi.amount), 0) AS amount
+       FROM guests g
+       JOIN stays s ON s.hotel_id = g.hotel_id
+                    AND (s.guest_id = g.id OR (s.guest_id IS NULL AND s.guest_name = g.name))
+       JOIN folios f ON f.stay_id = s.id AND f.hotel_id = s.hotel_id
+       JOIN folio_items fi ON fi.folio_id = f.id AND fi.hotel_id = f.hotel_id
+      WHERE g.hotel_id = ? AND COALESCE(g.vip_level, 0) > 0
+        AND fi.biz_date BETWEEN ? AND ?
+        AND fi.item_type IN ('ROOM', 'FOOD', 'OTHER')
+      GROUP BY g.id`,
+    [hotelId, from, to]
+  )) {
+    out.set(Number(r.guest_id), round2(num(r.amount)));
+  }
+  return out;
+}
+
+/** 区间内每个客人的间夜（metrics.ts 的住宿占用明细，按姓名挂到会员） */
+function memberNightsByName(hotelId: number, from: string, to: string): Map<string, number> {
+  return nightsBy(stayNightSlices(hotelId, from, to), (s) => String(s.guestName ?? "").trim());
+}
+
+/* -------------------- 会员升级规则 -------------------- */
+
+type MemberUpgradeLevel = {
+  level: number;
+  minSpend: number;
+  minStays: number;
+  discount: number;
+  pointsRate: number;
+};
+
+type MemberUpgradeRules = { basis: "spend" | "stays"; levels: MemberUpgradeLevel[] };
+
+/**
+ * 升级规则默认值（与 /members/actions.ts 的 DEFAULT_UPGRADE_RULES 逐字段一致）
+ *
+ * 为什么在这里再写一遍：actions.ts 是 "use server" 文件，只允许导出 async 函数，
+ * 常量导不出来。两处都改了才算改规则 —— 所以这里注释指向源文件，方便同步。
+ */
+const MEMBER_UPGRADE_DEFAULT: MemberUpgradeRules = {
+  basis: "spend",
+  levels: [
+    { level: 1, minSpend: 0, minStays: 0, discount: 1, pointsRate: 1 },
+    { level: 2, minSpend: 3000, minStays: 5, discount: 0.95, pointsRate: 1.5 },
+    { level: 3, minSpend: 10000, minStays: 15, discount: 0.9, pointsRate: 2 },
+  ],
+};
+
+/** 读本店生效的会员升级规则（settings.member_upgrade_rules；缺失 / 损坏回落默认值） */
+function memberUpgradeRules(hotelId: number): MemberUpgradeRules {
+  const row = get<{ value: string }>(
+    `SELECT value FROM settings WHERE hotel_id = ? AND key = ? ORDER BY id DESC LIMIT 1`,
+    [hotelId, "member_upgrade_rules"]
   );
+  if (!row?.value) return MEMBER_UPGRADE_DEFAULT;
+  try {
+    const data = JSON.parse(row.value) as { basis?: unknown; levels?: unknown };
+    const basis: "spend" | "stays" = data?.basis === "stays" ? "stays" : "spend";
+    const list = Array.isArray(data?.levels) ? (data.levels as unknown[]) : [];
+    const levels: MemberUpgradeLevel[] = [1, 2, 3].map((lv) => {
+      const found = list.find((x) => x && typeof x === "object" && Math.trunc(numOr((x as Record<string, unknown>).level, -1)) === lv) as
+        | Record<string, unknown>
+        | undefined;
+      const def = MEMBER_UPGRADE_DEFAULT.levels.find((x) => x.level === lv) ?? MEMBER_UPGRADE_DEFAULT.levels[0];
+      return {
+        level: lv,
+        minSpend: Math.max(0, round2(numOr(found?.minSpend, def.minSpend))),
+        minStays: Math.max(0, Math.trunc(numOr(found?.minStays, def.minStays))),
+        discount: Math.min(1, Math.max(0.1, numOr(found?.discount, def.discount))),
+        pointsRate: Math.min(10, Math.max(0, numOr(found?.pointsRate, def.pointsRate))),
+      };
+    });
+    return { basis, levels };
+  } catch {
+    return MEMBER_UPGRADE_DEFAULT;
+  }
+}
+
+/** 按生效口径算「应享等级」（0 = 未达任何门槛） */
+function memberTargetLevel(row: MemberCardRow, rules: MemberUpgradeRules): number {
+  let target = 0;
+  for (const lv of rules.levels) {
+    const reached = rules.basis === "stays" ? row.stay_count >= lv.minStays : row.total_spend >= lv.minSpend;
+    if (reached && lv.level > target) target = lv.level;
+  }
+  return target;
+}
+
+/* -------------------- 预订取消 / 失约 -------------------- */
+
+type CancelOrderRow = {
+  booking_no: string;
+  guest_name: string | null;
+  mobile: string | null;
+  channel_id: number | null;
+  check_in_date: string;
+  check_out_date: string;
+  nights: number;
+  room_count: number;
+  rate: number;
+  amount: number;
+  status: string;
+  remark: string | null;
+  created_at: string | null;
+};
+
+/**
+ * 取消 / 失约订单明细。
+ *
+ * 归期用「计划入住日 check_in_date」：库里的取消动作时间只有 updated_at，
+ * 而 updated_at 会被后续改单 / 批量操作覆盖（实测 831 行里 24 行是当天批量测试改的），
+ * 拿它当「取消日期」会把历史取消全挤到同一天。入住日是不会变的预订事实。
+ */
+function cancelOrderRows(hotelId: number, from: string, to: string): CancelOrderRow[] {
+  return all<CancelOrderRow>(
+    `SELECT COALESCE(b.booking_no, 'B' || b.id) AS booking_no,
+            b.guest_name, b.mobile, b.channel_id,
+            COALESCE(b.check_in_date, '') AS check_in_date,
+            COALESCE(b.check_out_date, '') AS check_out_date,
+            COALESCE(b.nights, 1) AS nights,
+            COALESCE(b.room_count, 1) AS room_count,
+            COALESCE(b.rate, 0) AS rate,
+            ROUND(COALESCE(b.rate, 0) * COALESCE(b.nights, 1) * COALESCE(b.room_count, 1), 2) AS amount,
+            COALESCE(b.status, '') AS status,
+            b.remark, b.created_at
+       FROM bookings b
+      WHERE b.hotel_id = ? AND b.status IN ('CANCELLED', 'NOSHOW')
+        AND b.check_in_date BETWEEN ? AND ?
+      ORDER BY b.check_in_date DESC, b.id DESC
+      LIMIT 500`,
+    [hotelId, from, to]
+  );
+}
+
+type CancelChannelRow = {
+  channel_id: number | null;
+  cancelled: number;
+  noshow: number;
+  nights: number;
+  amount: number;
+};
+
+/** 全部取消 / 失约按渠道分布（不受统计区间限制，用来回答「取消主要来自哪个渠道」） */
+function cancelChannelRows(hotelId: number): CancelChannelRow[] {
+  return all<CancelChannelRow>(
+    `SELECT b.channel_id,
+            COALESCE(SUM(CASE WHEN b.status = 'CANCELLED' THEN 1 ELSE 0 END), 0) AS cancelled,
+            COALESCE(SUM(CASE WHEN b.status = 'NOSHOW' THEN 1 ELSE 0 END), 0) AS noshow,
+            COALESCE(SUM(COALESCE(b.nights, 1) * COALESCE(b.room_count, 1)), 0) AS nights,
+            COALESCE(SUM(COALESCE(b.rate, 0) * COALESCE(b.nights, 1) * COALESCE(b.room_count, 1)), 0) AS amount
+       FROM bookings b
+      WHERE b.hotel_id = ? AND b.status IN ('CANCELLED', 'NOSHOW')
+      GROUP BY b.channel_id
+      ORDER BY cancelled + noshow DESC`,
+    [hotelId]
+  );
+}
+
+type CancelMonthRow = { month: string; cancelled: number; noshow: number };
+
+/** 近 12 个月的取消 / 失约按月趋势（同样按计划入住日归月） */
+function cancelMonthRows(hotelId: number): CancelMonthRow[] {
+  return all<CancelMonthRow>(
+    `SELECT substr(b.check_in_date, 1, 7) AS month,
+            COALESCE(SUM(CASE WHEN b.status = 'CANCELLED' THEN 1 ELSE 0 END), 0) AS cancelled,
+            COALESCE(SUM(CASE WHEN b.status = 'NOSHOW' THEN 1 ELSE 0 END), 0) AS noshow
+       FROM bookings b
+      WHERE b.hotel_id = ? AND b.status IN ('CANCELLED', 'NOSHOW')
+        AND COALESCE(b.check_in_date, '') <> ''
+      GROUP BY month
+      ORDER BY month DESC
+      LIMIT 12`,
+    [hotelId]
+  );
+}
+
+/** 区间内预订总数（取消率的分母） */
+function bookingPeriodCount(hotelId: number, from: string, to: string): number {
+  const row = get<{ n: number }>(
+    `SELECT COUNT(*) AS n FROM bookings WHERE hotel_id = ? AND check_in_date BETWEEN ? AND ?`,
+    [hotelId, from, to]
+  );
+  return num(row?.n);
+}
+
+/* -------------------- 打扫员业绩 -------------------- */
+
+type CleanerPerfRow = {
+  assignee: string;
+  tasks: number;
+  done: number;
+  pending: number;
+  cancelled: number;
+  period_done: number;
+  avg_minutes: number | null;
+  last_done: string | null;
+};
+
+/**
+ * 按打扫员汇总打扫任务（housekeeping.assignee 是姓名文本，不是外键；
+ * 人员档案在 cleaners 表，这里按姓名对齐，再补上 cleaners 里没接过任务的人）。
+ */
+function cleanerPerfRows(hotelId: number, from: string, to: string): CleanerPerfRow[] {
+  return all<CleanerPerfRow>(
+    `SELECT COALESCE(NULLIF(TRIM(h.assignee), ''), '未指派') AS assignee,
+            COUNT(*) AS tasks,
+            COALESCE(SUM(CASE WHEN h.status = 'DONE' THEN 1 ELSE 0 END), 0) AS done,
+            COALESCE(SUM(CASE WHEN h.status = 'PENDING' THEN 1 ELSE 0 END), 0) AS pending,
+            COALESCE(SUM(CASE WHEN h.status = 'CANCELLED' THEN 1 ELSE 0 END), 0) AS cancelled,
+            COALESCE(SUM(CASE WHEN h.status = 'DONE'
+                              AND date(h.done_at, '+8 hours') BETWEEN ? AND ? THEN 1 ELSE 0 END), 0) AS period_done,
+            AVG(CASE WHEN h.status = 'DONE' AND h.done_at IS NOT NULL AND h.created_at IS NOT NULL
+                     THEN (julianday(h.done_at) - julianday(h.created_at)) * 1440 END) AS avg_minutes,
+            MAX(h.done_at) AS last_done
+       FROM housekeeping h
+      WHERE h.hotel_id = ?
+      GROUP BY assignee
+      ORDER BY done DESC, tasks DESC`,
+    [from, to, hotelId]
+  ).map((r) => ({ ...r, avg_minutes: r.avg_minutes == null ? null : round2(num(r.avg_minutes)) }));
+}
+
+type CleanerRosterRow = { id: number; name: string; phone: string | null; area: string | null; status: string | null };
+
+function cleanerRoster(hotelId: number): CleanerRosterRow[] {
+  return all<CleanerRosterRow>(
+    `SELECT id, name, phone, area, status FROM cleaners WHERE hotel_id = ? ORDER BY id`,
+    [hotelId]
+  );
+}
+
+type HkTaskRow = {
+  id: number;
+  room_no: string | null;
+  task_type: string | null;
+  assignee: string;
+  status: string;
+  note: string | null;
+  created_at: string | null;
+  done_at: string | null;
+  review_status: string | null;
+};
+
+/** 打扫任务明细（最近 300 条，带房号） */
+function housekeepingTaskRows(hotelId: number): HkTaskRow[] {
+  return all<HkTaskRow>(
+    `SELECT h.id, r.room_no, h.task_type,
+            COALESCE(NULLIF(TRIM(h.assignee), ''), '未指派') AS assignee,
+            h.status, h.note, h.created_at, h.done_at, h.review_status
+       FROM housekeeping h
+       LEFT JOIN rooms r ON r.id = h.room_id AND r.hotel_id = h.hotel_id
+      WHERE h.hotel_id = ?
+      ORDER BY h.id DESC
+      LIMIT 300`,
+    [hotelId]
+  );
+}
+
+/* -------------------- 会员储值流水 -------------------- */
+
+type WalletLedgerRow = {
+  id: number;
+  member_id: number;
+  member_name: string | null;
+  member_vip: number;
+  biz_type: string;
+  amount: number;
+  balance_after: number | null;
+  ref_type: string | null;
+  ref_id: number | null;
+  operator: string | null;
+  remark: string | null;
+  created_at: string | null;
+  day: string;
+};
+
+/**
+ * 储值流水（唯一记账表 member_wallet_ledger）。
+ *
+ * 余额恒等式：member_wallet.balance === SUM(member_wallet_ledger.amount)。
+ * 这里一律读流水、不读余额缓存 —— 缓存表 member_wallet 在真库是 0 行（历史迁移产物），
+ * 读它会得出「余额 0 但其实有充值」的错数。
+ * 归期用 date(created_at,'+8 hours')：流水是前台当下记账，按营业所在地的本地日归日。
+ */
+function walletLedgerRows(hotelId: number, from: string, to: string): WalletLedgerRow[] {
+  ensureWalletSchema();
+  return all<WalletLedgerRow>(
+    `SELECT t.id, t.member_id, g.name AS member_name, COALESCE(g.vip_level, 0) AS member_vip,
+            t.biz_type, t.amount, t.balance_after, t.ref_type, t.ref_id,
+            t.operator, t.remark, t.created_at,
+            date(t.created_at, '+8 hours') AS day
+       FROM member_wallet_ledger t
+       LEFT JOIN guests g ON g.id = t.member_id AND g.hotel_id = t.hotel_id
+      WHERE t.hotel_id = ? AND date(t.created_at, '+8 hours') BETWEEN ? AND ?
+      ORDER BY t.id DESC
+      LIMIT 500`,
+    [hotelId, from, to]
+  ).map((r) => ({ ...r, amount: round2(num(r.amount)), member_vip: num(r.member_vip) }));
+}
+
+/** 全表储值余额（不受区间限制；= SUM(ledger.amount)） */
+function walletBalanceTotal(hotelId: number): number {
+  ensureWalletSchema();
+  const row = get<{ balance: number }>(
+    `SELECT COALESCE(SUM(amount), 0) AS balance FROM member_wallet_ledger WHERE hotel_id = ?`,
+    [hotelId]
+  );
+  return round2(num(row?.balance));
+}
+
+/** 全表流水笔数（用来区分「区间内没有」和「整张表都没有」） */
+function walletLedgerCount(hotelId: number): number {
+  ensureWalletSchema();
+  const row = get<{ n: number }>(`SELECT COUNT(*) AS n FROM member_wallet_ledger WHERE hotel_id = ?`, [hotelId]);
+  return num(row?.n);
+}
+
+/**
+ * 从储值备注里取支付方式。
+ *
+ * 流水表没有 method 列，充值时前台选的支付方式被 members/wallet/actions.ts
+ * 写进 remark（`充值方式：现金；备注`）。这里按同一格式解析；
+ * 解析不到（人工调整 / 历史数据）归到「未填」，不猜。
+ */
+function rechargeMethodOf(remark: string | null | undefined): string {
+  const m = String(remark ?? "").match(/充值方式[：:]\s*([^；;\n]+)/);
+  const method = (m?.[1] ?? "").trim();
+  return method || "未填";
+}
+
+const WALLET_TYPE_LABEL: Record<string, string> = {
+  RECHARGE: "充值",
+  CONSUME: "消费",
+  REFUND: "退款",
+  ADJUST: "调整",
+};
+
+/* -------------------- 渠道统计明细 -------------------- */
+
+type ChannelOrderDetailRow = {
+  booking_no: string;
+  channel_order_no: string | null;
+  channel_id: number | null;
+  guest_name: string | null;
+  mobile: string | null;
+  room_type_id: number | null;
+  check_in_date: string;
+  check_out_date: string;
+  nights: number;
+  room_count: number;
+  rate: number;
+  amount: number;
+  status: string;
+  created_at: string | null;
+};
+
+/**
+ * 渠道订单明细（逐笔）。
+ *
+ * 金额不取 bookings.total_price —— 真库 831 行该列全为 NULL（只有渠道订单同步时才会写），
+ * 用 rate × nights × room_count 还原订单金额，与「销售员业绩 / 协议客户」两张表的算法一致。
+ */
+function channelOrderDetailRows(hotelId: number, from: string, to: string): ChannelOrderDetailRow[] {
+  return all<ChannelOrderDetailRow>(
+    `SELECT COALESCE(b.booking_no, 'B' || b.id) AS booking_no,
+            b.channel_order_no, b.channel_id, b.guest_name, b.mobile, b.room_type_id,
+            COALESCE(b.check_in_date, '') AS check_in_date,
+            COALESCE(b.check_out_date, '') AS check_out_date,
+            COALESCE(b.nights, 1) AS nights,
+            COALESCE(b.room_count, 1) AS room_count,
+            COALESCE(b.rate, 0) AS rate,
+            ROUND(COALESCE(b.rate, 0) * COALESCE(b.nights, 1) * COALESCE(b.room_count, 1), 2) AS amount,
+            COALESCE(b.status, '') AS status,
+            b.created_at
+       FROM bookings b
+      WHERE b.hotel_id = ? AND b.check_in_date BETWEEN ? AND ?
+      ORDER BY b.check_in_date DESC, b.id DESC
+      LIMIT 500`,
+    [hotelId, from, to]
+  );
+}
+
+/** 房型 id → 名称 */
+function roomTypeNameMap(hotelId: number): Map<number, string> {
+  const out = new Map<number, string>();
+  for (const rt of all<{ id: number; name: string | null }>(
+    `SELECT id, name FROM room_types WHERE hotel_id = ?`,
+    [hotelId]
+  )) {
+    out.set(Number(rt.id), String(rt.name ?? "").trim() || `房型#${rt.id}`);
+  }
+  return out;
+}
+
+/** 预订状态 → 中文 */
+const BOOKING_STATUS_LABEL: Record<string, string> = {
+  PENDING: "待确认",
+  CONFIRMED: "已确认",
+  CHECKED_IN: "已入住",
+  CHECKED_OUT: "已退房",
+  CANCELLED: "已取消",
+  NOSHOW: "失约",
+};
+
+/* -------------------- 公安上传准备清单 -------------------- */
+
+type PoliceStayRow = {
+  stay_id: number;
+  stay_no: string | null;
+  room_no: string | null;
+  guest_name: string | null;
+  gender: string | null;
+  id_type: string | null;
+  id_no: string | null;
+  mobile: string | null;
+  check_in_time: string | null;
+  expect_check_out: string | null;
+  actual_check_out: string | null;
+  status: string;
+};
+
+/**
+ * 待上传公安的住客登记信息。
+ *
+ * 数据来源（缺一列都出不来，所以先说清楚）：
+ *   · 证件类型 / 证件号 / 性别 —— guests（stays 表没有 id_no 列，只有 guest_id）
+ *   · 房号 / 入住时间 / 在住状态 —— stays + rooms
+ *   · 手机号 —— stays.mobile 优先，空时回落到 guests.mobile
+ * 范围 = 「当前在住」∪「入住时间落在统计区间」：
+ * 在住客人不管区间选的是哪一天都必须出现在待上传清单里（他还没走，公安那边必须补齐），
+ * 区间只用来把「这段时间办过入住的人」一并带出来复核。
+ * 在住排前面，再按房号。
+ */
+function policeStayRows(hotelId: number, from: string, to: string): PoliceStayRow[] {
+  return all<PoliceStayRow>(
+    `SELECT s.id AS stay_id, s.stay_no, r.room_no, s.guest_name,
+            g.gender, g.id_type, g.id_no,
+            COALESCE(NULLIF(TRIM(s.mobile), ''), g.mobile) AS mobile,
+            s.check_in_time, s.expect_check_out, s.actual_check_out,
+            COALESCE(s.status, '') AS status
+       FROM stays s
+       JOIN rooms r ON r.id = s.room_id AND r.hotel_id = s.hotel_id
+       LEFT JOIN guests g ON g.id = s.guest_id AND g.hotel_id = s.hotel_id
+      WHERE s.hotel_id = ?
+        AND (s.status = 'INHOUSE' OR substr(s.check_in_time, 1, 10) BETWEEN ? AND ?)
+      ORDER BY CASE WHEN s.status = 'INHOUSE' THEN 0 ELSE 1 END, r.room_no`,
+    [hotelId, from, to]
+  );
+}
+
+
+type WalletMemberBalanceRow = {
+  member_id: number;
+  member_name: string;
+  balance: number;
+  recharge: number;
+  consume: number;
+  refund: number;
+  cnt: number;
+  last_at: string | null;
+};
+
+/** 每个会员的储值余额与累计收付（全量，不受区间限制；余额 = SUM(流水)） */
+function walletMemberBalanceRows(hotelId: number): WalletMemberBalanceRow[] {
+  ensureWalletSchema();
+  return all<WalletMemberBalanceRow>(
+    `SELECT t.member_id,
+            COALESCE(g.name, '会员#' || t.member_id) AS member_name,
+            ROUND(COALESCE(SUM(t.amount), 0), 2) AS balance,
+            ROUND(COALESCE(SUM(CASE WHEN t.biz_type = 'RECHARGE' THEN t.amount ELSE 0 END), 0), 2) AS recharge,
+            ROUND(COALESCE(SUM(CASE WHEN t.biz_type = 'CONSUME' THEN -t.amount ELSE 0 END), 0), 2) AS consume,
+            ROUND(COALESCE(SUM(CASE WHEN t.biz_type = 'REFUND' THEN -t.amount ELSE 0 END), 0), 2) AS refund,
+            COUNT(*) AS cnt,
+            MAX(t.created_at) AS last_at
+       FROM member_wallet_ledger t
+       LEFT JOIN guests g ON g.id = t.member_id AND g.hotel_id = t.hotel_id
+      WHERE t.hotel_id = ?
+      GROUP BY t.member_id
+      ORDER BY balance DESC`,
+    [hotelId]
+  ).map((r) => ({
+    ...r,
+    balance: round2(num(r.balance)),
+    recharge: round2(num(r.recharge)),
+    consume: round2(num(r.consume)),
+    refund: round2(num(r.refund)),
+    cnt: num(r.cnt),
+  }));
+}
+
+function ReportMemberList({ ctx }: ReportProps) {
+  const { hotelId } = ctx;
+  const rows = memberCardRows(hotelId);
+  const nightsByName = memberNightsByName(hotelId, ctx.from, ctx.to);
+  const totalSpend = sumMoney(rows.map((r) => r.total_spend));
+  const totalStays = rows.reduce((s, r) => s + r.stay_count, 0);
+  const withSpend = rows.filter((r) => r.total_spend > 0.005).length;
+  const avgSpend = rows.length > 0 ? round2(totalSpend / rows.length) : 0;
+
+  const exportHref = csvHref(
+    ["会员卡号", "姓名", "性别", "手机", "等级", "累计消费", "入住次数", "本期间夜", "最近入住", "积分余额"],
+    rows.map((r) => [
+      memberCardNo(r.id),
+      r.name,
+      r.gender ?? "—",
+      maskMobile(r.mobile),
+      VIP_LABEL[r.vip_level] ?? `VIP${r.vip_level}`,
+      r.total_spend.toFixed(2),
+      String(r.stay_count),
+      String(nightsByName.get(String(r.name).trim()) ?? 0),
+      r.last_check_in ? fmtMinute(r.last_check_in) : "—",
+      String(r.points_balance),
+    ])
+  );
+
   return (
-    <div className="card overflow-hidden">
-      <div className="border-b border-[#f0f0f0] px-3 py-2 text-[13px] font-semibold text-[#222]">
-        会员报表 · 共 {rows.length} 位
+    <>
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-5">
+        <StatCard label="会员总数" value={fmtInt(rows.length)} hint="客史 vip_level > 0 即会员，与会员管理页同一定义" />
+        <StatCard
+          label="累计消费"
+          value={fmtMoney(totalSpend)}
+          hint="该会员名下全部住宿的账务明细（房费 + 餐饮 + 其他，不含押金）累计"
+        />
+        <StatCard label="人均消费" value={fmtMoney(avgSpend)} hint="累计消费 ÷ 会员总数" />
+        <StatCard
+          label="累计入住次数"
+          value={fmtInt(totalStays)}
+          hint="stays 里归到该会员的入住单数：按 guest_id 关联，老数据 guest_id 为空时按姓名回落"
+        />
+        <StatCard label="有消费会员" value={fmtInt(withSpend)} hint="累计消费 > 0 的会员数" />
       </div>
-      <MiniTable
-        head={["会员卡号", "姓名", "手机", "等级", "累计消费", "入住次数"]}
-        rows={rows.map((r) => [
-          `M${String(r.id).padStart(8, "0")}`,
-          r.name,
-          r.mobile ?? "—",
-          `VIP${r.vip_level ?? 0}`,
-          fmtMoney(r.total_spend),
-          String(r.stay_count ?? 0),
-        ])}
-      />
-    </div>
+
+      <SectionCard
+        title="会员卡清单"
+        right={
+          <span className="flex flex-wrap items-center gap-2">
+            <span>共 {rows.length} 位 · 累计消费 {fmtMoney(totalSpend)}</span>
+            <a className={REPORT_EXPORT_CLS} download={`会员报表_${ctx.from}_${ctx.to}.csv`} href={exportHref}>
+              导出 CSV
+            </a>
+          </span>
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">会员卡号</th>
+                <th className="th">姓名</th>
+                <th className="th">性别</th>
+                <th className="th">手机</th>
+                <th className="th">等级</th>
+                <th className="th text-right">累计消费</th>
+                <th className="th text-right">入住次数</th>
+                <th className="th text-right">本期间夜</th>
+                <th className="th">最近入住</th>
+                <th className="th text-right">积分余额</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 && <EmptyRow colSpan={10} />}
+              {rows.map((r) => (
+                <tr key={r.id} className="hover:bg-gray-50">
+                  <td className="td tabular-nums text-gray-500">{memberCardNo(r.id)}</td>
+                  <td className="td font-medium text-gray-800">{r.name}</td>
+                  <td className="td text-gray-500">{dash(r.gender)}</td>
+                  <td className="td tabular-nums text-gray-500">{maskMobile(r.mobile)}</td>
+                  <td className="td text-gray-600">{VIP_LABEL[r.vip_level] ?? `VIP${r.vip_level}`}</td>
+                  <td className={SUM_TD}>{fmtMoney(r.total_spend)}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(r.stay_count)}</td>
+                  <td className="td text-right tabular-nums text-gray-500">
+                    {fmtInt(nightsByName.get(String(r.name).trim()) ?? 0)}
+                  </td>
+                  <td className="td tabular-nums text-gray-500">
+                    {r.last_check_in ? fmtMinute(r.last_check_in) : "—"}
+                  </td>
+                  <td className="td text-right tabular-nums text-gray-600">{fmtInt(r.points_balance)}</td>
+                </tr>
+              ))}
+              <TotalRow>
+                <td className="td font-medium text-gray-800">合计</td>
+                <td className="td" />
+                <td className="td" />
+                <td className="td" />
+                <td className="td" />
+                <td className={SUM_TD}>{fmtMoney(totalSpend)}</td>
+                <td className={SUM_TD}>{fmtInt(totalStays)}</td>
+                <td className={SUM_TD}>
+                  {fmtInt(rows.reduce((s, r) => s + (nightsByName.get(String(r.name).trim()) ?? 0), 0))}
+                </td>
+                <td className="td" />
+                <td className={SUM_TD}>{fmtInt(rows.reduce((s, r) => s + r.points_balance, 0))}</td>
+              </TotalRow>
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <NoteCard>
+        口径说明：会员 = 客史 guests.vip_level &gt; 0（与「会员管理」「会员概况」同一认定）。
+        累计消费取该会员名下全部住宿的账务明细（stays → folios → folio_items，
+        科目 ROOM / FOOD / OTHER，<b>不含押金</b>）；入住次数是入住单数不是间夜，间夜另列且取
+        metrics.ts 的住宿占用口径（在住算到今天、已退房用实际离店日、排除钟点房）。
+        关联方式：优先 stays.guest_id，老数据 guest_id 为空时才按姓名回落 ——
+        避免同名客人互相蹭指标，也不漏历史空关联的住宿。手机号在报表内脱敏（前 3 后 4），
+        明文请在会员管理页查看（需要 member.view_sensitive 权限）。
+        本表是<b>全量会员清单</b>，不受统计区间限制；「本期间夜」列才跟区间。
+      </NoteCard>
+    </>
   );
 }
 
@@ -8049,54 +8767,462 @@ function ReportRealtime({ ctx }: ReportProps) {
 }
 
 function ReportCancelOrder({ ctx }: ReportProps) {
-  const rows = all<{ order_no: string | null; guest_name: string | null; channel_name: string | null; check_in_date: string; status: string }>(
-    `SELECT COALESCE(b.order_no, 'B' || b.id) AS order_no, b.guest_name, c.name AS channel_name,
-            b.check_in_date, b.status
-     FROM bookings b LEFT JOIN channels c ON c.id = b.channel_id
-     WHERE b.hotel_id = ? AND b.status IN ('CANCELLED','NO_SHOW')
-     ORDER BY b.check_in_date DESC LIMIT 300`,
-    [ctx.hotelId]
+  const { hotelId, from, to } = ctx;
+  const names = channelNameMap(hotelId);
+  const rows = cancelOrderRows(hotelId, from, to);
+  const channelRows = cancelChannelRows(hotelId);
+  const monthRows = cancelMonthRows(hotelId);
+
+  const periodBookings = bookingPeriodCount(hotelId, from, to);
+  const periodCancel = rows.filter((r) => r.status === "CANCELLED").length;
+  const periodNoshow = rows.filter((r) => r.status === "NOSHOW").length;
+  const periodAmount = sumMoney(rows.map((r) => r.amount));
+
+  const allCancelled = channelRows.reduce((s, r) => s + num(r.cancelled), 0);
+  const allNoshow = channelRows.reduce((s, r) => s + num(r.noshow), 0);
+  const allLost = allCancelled + allNoshow;
+  const allBookings = num(
+    get<{ n: number }>(`SELECT COUNT(*) AS n FROM bookings WHERE hotel_id = ?`, [hotelId])?.n
   );
+  const allNights = channelRows.reduce((s, r) => s + num(r.nights), 0);
+  const allAmount = sumMoney(channelRows.map((r) => r.amount));
+
+  const exportHref = csvHref(
+    ["预订号", "渠道", "客人", "手机", "入住日期", "离店日期", "间夜", "房数", "房费", "状态", "备注"],
+    rows.map((r) => [
+      r.booking_no,
+      channelLabel(r.channel_id == null ? null : Number(r.channel_id), names),
+      r.guest_name ?? "",
+      maskMobile(r.mobile),
+      r.check_in_date,
+      r.check_out_date,
+      String(r.nights),
+      String(r.room_count),
+      r.amount.toFixed(2),
+      r.status === "CANCELLED" ? "已取消" : "失约未到",
+      r.remark ?? "",
+    ])
+  );
+  const channelExport = csvHref(
+    ["渠道", "取消量", "失约量", "合计", "间夜", "涉及房费"],
+    channelRows.map((r) => [
+      channelLabel(r.channel_id == null ? null : Number(r.channel_id), names),
+      String(num(r.cancelled)),
+      String(num(r.noshow)),
+      String(num(r.cancelled) + num(r.noshow)),
+      String(num(r.nights)),
+      num(r.amount).toFixed(2),
+    ])
+  );
+
   return (
-    <div className="card overflow-hidden">
-      <div className="border-b border-[#f0f0f0] px-3 py-2 text-[13px] font-semibold text-[#222]">
-        预订取消/失约报表 · 共 {rows.length} 条
+    <>
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-5">
+        <StatCard
+          label="本期取消"
+          value={fmtInt(periodCancel)}
+          hint={`计划入住日落在 ${from} ~ ${to} 的取消订单数`}
+        />
+        <StatCard
+          label="本期失约"
+          value={fmtInt(periodNoshow)}
+          hint="计划入住日落在区间的 NO-SHOW（未到店）订单数"
+        />
+        <StatCard
+          label="本期取消+失约占比"
+          value={periodBookings > 0 ? fmtPct((periodCancel + periodNoshow) / periodBookings) : "—"}
+          hint={`区间预订 ${fmtInt(periodBookings)} 单 · 涉及房费 ${fmtMoney(periodAmount)}`}
+        />
+        <StatCard label="累计取消+失约" value={fmtInt(allLost)} hint={`全部门店预订里的取消 ${fmtInt(allCancelled)} + 失约 ${fmtInt(allNoshow)}`} />
+        <StatCard
+          label="累计取消率"
+          value={allBookings > 0 ? fmtPct(allLost / allBookings) : "—"}
+          hint={`分母 ${fmtInt(allBookings)} 单全部预订 · 涉及间夜 ${fmtInt(allNights)} · 房费 ${fmtMoney(allAmount)}`}
+        />
       </div>
-      <MiniTable
-        head={["订单号", "客人", "渠道", "入住日期", "状态"]}
-        rows={rows.map((r) => [
-          r.order_no ?? "—",
-          r.guest_name ?? "—",
-          r.channel_name ?? "散客",
-          r.check_in_date,
-          r.status === "CANCELLED" ? "已取消" : "失约",
-        ])}
-      />
-    </div>
+
+      <SectionCard
+        title="本期取消 / 失约明细"
+        right={
+          <span className="flex flex-wrap items-center gap-2">
+            <span>
+              {from} ~ {to} · {rows.length} 单
+            </span>
+            <a className={REPORT_EXPORT_CLS} download={`预订取消失约_${from}_${to}.csv`} href={exportHref}>
+              导出 CSV
+            </a>
+          </span>
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">预订号</th>
+                <th className="th">渠道</th>
+                <th className="th">客人</th>
+                <th className="th">手机</th>
+                <th className="th">入住日期</th>
+                <th className="th">离店日期</th>
+                <th className="th text-right">间夜</th>
+                <th className="th text-right">房数</th>
+                <th className="th text-right">涉及房费</th>
+                <th className="th">状态</th>
+                <th className="th">备注</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 && <EmptyRow colSpan={11} text="本期区间内没有取消 / 失约订单（真实为 0，不是查询失败；可切到「本周 / 本月」查看）" />}
+              {rows.map((r) => (
+                <tr key={r.booking_no} className="hover:bg-gray-50">
+                  <td className="td tabular-nums text-gray-600">{r.booking_no}</td>
+                  <td className="td text-gray-600">
+                    {channelLabel(r.channel_id == null ? null : Number(r.channel_id), names)}
+                  </td>
+                  <td className="td text-gray-700">{dash(r.guest_name)}</td>
+                  <td className="td tabular-nums text-gray-500">{maskMobile(r.mobile)}</td>
+                  <td className="td tabular-nums text-gray-600">{r.check_in_date}</td>
+                  <td className="td tabular-nums text-gray-500">{dash(r.check_out_date)}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(r.nights)}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(r.room_count)}</td>
+                  <td className="td text-right tabular-nums text-gray-700">{fmtMoney(r.amount)}</td>
+                  <td className="td">
+                    <span
+                      className={`rounded border px-1.5 py-0.5 text-[11px] ${
+                        r.status === "CANCELLED"
+                          ? "border-gray-200 bg-gray-50 text-gray-600"
+                          : "border-amber-200 bg-amber-50 text-amber-700"
+                      }`}
+                    >
+                      {r.status === "CANCELLED" ? "已取消" : "失约未到"}
+                    </span>
+                  </td>
+                  <td className="td max-w-[220px] truncate text-gray-400">{dash(r.remark)}</td>
+                </tr>
+              ))}
+              <TotalRow>
+                <td className="td font-medium text-gray-800">合计</td>
+                <td className="td" />
+                <td className="td" />
+                <td className="td" />
+                <td className="td" />
+                <td className="td" />
+                <td className={SUM_TD}>{fmtInt(rows.reduce((s, r) => s + r.nights, 0))}</td>
+                <td className={SUM_TD}>{fmtInt(rows.reduce((s, r) => s + r.room_count, 0))}</td>
+                <td className={SUM_TD}>{fmtMoney(periodAmount)}</td>
+                <td className="td" />
+                <td className="td" />
+              </TotalRow>
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <SectionCard
+        title="累计取消 / 失约 · 按渠道"
+        right={
+          <span className="flex flex-wrap items-center gap-2">
+            <span>不受统计区间限制 · 合计 {fmtInt(allLost)} 单</span>
+            <a className={REPORT_EXPORT_CLS} download="预订取消失约_按渠道.csv" href={channelExport}>
+              导出 CSV
+            </a>
+          </span>
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">渠道</th>
+                <th className="th text-right">取消</th>
+                <th className="th text-right">失约</th>
+                <th className="th text-right">合计</th>
+                <th className="th text-right">涉及间夜</th>
+                <th className="th text-right">涉及房费</th>
+                <th className="th w-44">占取消总量</th>
+              </tr>
+            </thead>
+            <tbody>
+              {channelRows.length === 0 && <EmptyRow colSpan={7} />}
+              {channelRows.map((r) => {
+                const cid = r.channel_id == null ? null : Number(r.channel_id);
+                const total = num(r.cancelled) + num(r.noshow);
+                return (
+                  <tr key={channelKey(cid)} className="hover:bg-gray-50">
+                    <td className="td text-gray-700">{channelLabel(cid, names)}</td>
+                    <td className="td text-right tabular-nums">{fmtInt(num(r.cancelled))}</td>
+                    <td className="td text-right tabular-nums">{fmtInt(num(r.noshow))}</td>
+                    <td className={SUM_TD}>{fmtInt(total)}</td>
+                    <td className="td text-right tabular-nums text-gray-600">{fmtInt(num(r.nights))}</td>
+                    <td className="td text-right tabular-nums text-gray-600">{fmtMoney(num(r.amount))}</td>
+                    <td className="td">
+                      <ShareBar value={total} total={allLost} tone="bg-[#e2483a]" />
+                    </td>
+                  </tr>
+                );
+              })}
+              <TotalRow>
+                <td className="td font-medium text-gray-800">合计</td>
+                <td className={SUM_TD}>{fmtInt(allCancelled)}</td>
+                <td className={SUM_TD}>{fmtInt(allNoshow)}</td>
+                <td className={SUM_TD}>{fmtInt(allLost)}</td>
+                <td className={SUM_TD}>{fmtInt(allNights)}</td>
+                <td className={SUM_TD}>{fmtMoney(allAmount)}</td>
+                <td className="td" />
+              </TotalRow>
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <SectionCard title="近 12 个月取消 / 失约趋势" right="按计划入住日归月 · 最多 12 个月">
+        <table className="w-full">
+          <thead>
+            <tr>
+              <th className="th">月份</th>
+              <th className="th text-right">取消</th>
+              <th className="th text-right">失约</th>
+              <th className="th text-right">合计</th>
+              <th className="th w-56">分布</th>
+            </tr>
+          </thead>
+          <tbody>
+            {monthRows.length === 0 && <EmptyRow colSpan={5} />}
+            {monthRows.map((r) => {
+              const total = num(r.cancelled) + num(r.noshow);
+              return (
+                <tr key={r.month} className="hover:bg-gray-50">
+                  <td className="td tabular-nums text-gray-600">{r.month}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(num(r.cancelled))}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(num(r.noshow))}</td>
+                  <td className={SUM_TD}>{fmtInt(total)}</td>
+                  <td className="td">
+                    <ShareBar value={total} total={allLost} tone="bg-[#e2483a]" />
+                  </td>
+                </tr>
+              );
+            })}
+            <TotalRow>
+              <td className="td font-medium text-gray-800">合计</td>
+              <td className={SUM_TD}>{fmtInt(allCancelled)}</td>
+              <td className={SUM_TD}>{fmtInt(allNoshow)}</td>
+              <td className={SUM_TD}>{fmtInt(allLost)}</td>
+              <td className="td" />
+            </TotalRow>
+          </tbody>
+        </table>
+      </SectionCard>
+
+      <NoteCard>
+        口径说明：订单号取 <code>bookings.booking_no</code>（库里<b>没有</b> order_no 列，这是原来占位的根因）；
+        渠道取 channel_id（未匹配渠道显示「散客（未匹配渠道）」，与 id=6 名为「散客」的渠道是两条不同渠道）。
+        归期用<b>计划入住日 check_in_date</b>：取消动作时间在库中只有 updated_at，而它会被后续改单 /
+        批量操作覆盖（实测同一天批量测试把 24 单的 updated_at 改成同一时刻），拿它当「取消日期」会把
+        历史取消全挤到一天。金额是 <code>rate × nights × room_count</code> 的订单金额
+        （bookings.total_price 在真库 831 行全为 NULL，不能直接用），属于「本该收到的房费」，不是实收。
+        「本期」卡片与第一张表跟统计区间；渠道分布与月趋势是<b>全量</b>，用来回答「取消主要来自哪里」，
+        两者分母不同，别互相加减。取消原因目前只有客人退房申请（cancel_requests）才有，
+        预订取消本身没有原因字段，所以本表没有「原因分布」列。
+      </NoteCard>
+    </>
   );
 }
 
 function ReportCleanerPerf({ ctx }: ReportProps) {
-  const rows = all<{ cleaner_name: string | null; done: number; total: number }>(
-    `SELECT COALESCE(cleaner_name, '未分配') AS cleaner_name,
-            SUM(CASE WHEN status = 'DONE' THEN 1 ELSE 0 END) AS done,
-            COUNT(*) AS total
-     FROM housekeeping WHERE hotel_id = ? GROUP BY cleaner_name ORDER BY done DESC`,
-    [ctx.hotelId]
+  const { hotelId, from, to } = ctx;
+  const perf = cleanerPerfRows(hotelId, from, to);
+  const roster = cleanerRoster(hotelId);
+  const tasks = housekeepingTaskRows(hotelId);
+
+  /* cleaners 里在岗但没有任务记录的人也要出现在表里（否则「新来的阿姨」在报表里查不到） */
+  const rows: CleanerPerfRow[] = [...perf];
+  for (const c of roster) {
+    if (!rows.some((r) => r.assignee === c.name)) {
+      rows.push({
+        assignee: c.name,
+        tasks: 0,
+        done: 0,
+        pending: 0,
+        cancelled: 0,
+        period_done: 0,
+        avg_minutes: null,
+        last_done: null,
+      });
+    }
+  }
+  const rosterMap = new Map(roster.map((c) => [c.name, c]));
+
+  const totalTasks = rows.reduce((s, r) => s + num(r.tasks), 0);
+  const totalDone = rows.reduce((s, r) => s + num(r.done), 0);
+  const totalPending = rows.reduce((s, r) => s + num(r.pending), 0);
+  const totalPeriodDone = rows.reduce((s, r) => s + num(r.period_done), 0);
+  const doneRate = totalTasks > 0 ? totalDone / totalTasks : 0;
+  const activeCleaners = roster.filter((c) => String(c.status ?? "") === "ACTIVE").length;
+
+  const HkStatusLabel: Record<string, string> = { DONE: "已完成", PENDING: "待打扫", CANCELLED: "已取消" };
+  const HkStatusCls: Record<string, string> = {
+    DONE: "border-emerald-200 bg-emerald-50 text-emerald-700",
+    PENDING: "border-amber-200 bg-amber-50 text-amber-700",
+    CANCELLED: "border-gray-200 bg-gray-50 text-gray-500",
+  };
+
+  const exportHref = csvHref(
+    ["打扫员", "区域", "联系电话", "任务数", "已完成", "待打扫", "已取消", "完成率", "本期完成", "平均完成耗时(分钟)", "最近完成"],
+    rows.map((r) => [
+      r.assignee,
+      rosterMap.get(r.assignee)?.area ?? "",
+      maskMobile(rosterMap.get(r.assignee)?.phone ?? ""),
+      String(num(r.tasks)),
+      String(num(r.done)),
+      String(num(r.pending)),
+      String(num(r.cancelled)),
+      num(r.tasks) > 0 ? `${((num(r.done) / num(r.tasks)) * 100).toFixed(1)}%` : "0%",
+      String(num(r.period_done)),
+      r.avg_minutes == null ? "" : num(r.avg_minutes).toFixed(1),
+      r.last_done ? fmtMinute(r.last_done) : "",
+    ])
   );
+
   return (
-    <div className="card overflow-hidden">
-      <div className="border-b border-[#f0f0f0] px-3 py-2 text-[13px] font-semibold text-[#222]">打扫员业绩报表</div>
-      <MiniTable
-        head={["打扫员", "已完成", "总任务", "完成率"]}
-        rows={rows.map((r) => [
-          r.cleaner_name ?? "未分配",
-          String(r.done),
-          String(r.total),
-          Number(r.total) > 0 ? `${((Number(r.done) / Number(r.total)) * 100).toFixed(1)}%` : "0%",
-        ])}
-      />
-    </div>
+    <>
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-5">
+        <StatCard label="累计打扫任务" value={fmtInt(totalTasks)} hint="housekeeping 表的全部任务数（含已取消）" />
+        <StatCard label="累计完成" value={fmtInt(totalDone)} hint="status = DONE 的任务数" />
+        <StatCard label="完成率" value={fmtPct(doneRate)} hint="已完成 ÷ 全部任务（分母含待打扫 / 已取消）" />
+        <StatCard
+          label="本期完成"
+          value={fmtInt(totalPeriodDone)}
+          hint={`完成时间（done_at）落在 ${from} ~ ${to} 的任务数`}
+        />
+        <StatCard label="在岗打扫员" value={fmtInt(activeCleaners)} hint={`cleaners 表 status = ACTIVE · 共 ${roster.length} 人在册`} />
+      </div>
+
+      <SectionCard
+        title="按打扫员汇总"
+        right={
+          <span className="flex flex-wrap items-center gap-2">
+            <span>
+              台账全部任务 · 待打扫 {fmtInt(totalPending)} 间 · 本期完成 {fmtInt(totalPeriodDone)} 间
+            </span>
+            <a className={REPORT_EXPORT_CLS} download={`打扫员业绩_${from}_${to}.csv`} href={exportHref}>
+              导出 CSV
+            </a>
+          </span>
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">打扫员</th>
+                <th className="th">负责区域</th>
+                <th className="th">联系电话</th>
+                <th className="th text-right">任务数</th>
+                <th className="th text-right">已完成</th>
+                <th className="th text-right">待打扫</th>
+                <th className="th text-right">已取消</th>
+                <th className="th text-right">完成率</th>
+                <th className="th text-right">本期完成</th>
+                <th className="th text-right">平均耗时</th>
+                <th className="th">最近完成</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 && <EmptyRow colSpan={11} />}
+              {rows.map((r) => (
+                <tr key={r.assignee} className="hover:bg-gray-50">
+                  <td className="td font-medium text-gray-800">{r.assignee}</td>
+                  <td className="td text-gray-500">{rosterMap.get(r.assignee)?.area ?? "—"}</td>
+                  <td className="td tabular-nums text-gray-500">{maskMobile(rosterMap.get(r.assignee)?.phone ?? "")}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(num(r.tasks))}</td>
+                  <td className="td text-right tabular-nums text-[#32a852]">{fmtInt(num(r.done))}</td>
+                  <td className="td text-right tabular-nums text-gray-600">{fmtInt(num(r.pending))}</td>
+                  <td className="td text-right tabular-nums text-gray-400">{fmtInt(num(r.cancelled))}</td>
+                  <td className={SUM_TD}>
+                    {num(r.tasks) > 0 ? fmtPct(num(r.done) / num(r.tasks)) : "—"}
+                  </td>
+                  <td className="td text-right tabular-nums text-gray-700">{fmtInt(num(r.period_done))}</td>
+                  <td className="td text-right tabular-nums text-gray-500">
+                    {r.avg_minutes == null ? "—" : `${num(r.avg_minutes).toFixed(1)} 分`}
+                  </td>
+                  <td className="td tabular-nums text-gray-500">{r.last_done ? fmtMinute(r.last_done) : "—"}</td>
+                </tr>
+              ))}
+              <TotalRow>
+                <td className="td font-medium text-gray-800">合计</td>
+                <td className="td" />
+                <td className="td" />
+                <td className={SUM_TD}>{fmtInt(totalTasks)}</td>
+                <td className={SUM_TD}>{fmtInt(totalDone)}</td>
+                <td className={SUM_TD}>{fmtInt(totalPending)}</td>
+                <td className={SUM_TD}>{fmtInt(rows.reduce((s, r) => s + num(r.cancelled), 0))}</td>
+                <td className={SUM_TD}>{fmtPct(doneRate)}</td>
+                <td className={SUM_TD}>{fmtInt(totalPeriodDone)}</td>
+                <td className="td" />
+                <td className="td" />
+              </TotalRow>
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <SectionCard title="打扫任务明细（最近 300 条）" right={`共 ${tasks.length} 条 · 房号来自 rooms`}>
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">房号</th>
+                <th className="th">任务类型</th>
+                <th className="th">打扫员</th>
+                <th className="th">状态</th>
+                <th className="th">创建时间</th>
+                <th className="th">完成时间</th>
+                <th className="th text-right">耗时</th>
+                <th className="th">备注</th>
+              </tr>
+            </thead>
+            <tbody>
+              {tasks.length === 0 && <EmptyRow colSpan={8} />}
+              {tasks.map((t) => {
+                const minutes =
+                  t.done_at && t.created_at
+                    ? round2((new Date(t.done_at).getTime() - new Date(t.created_at).getTime()) / 60000)
+                    : null;
+                return (
+                  <tr key={t.id} className="hover:bg-gray-50">
+                    <td className="td tabular-nums text-gray-700">{dash(t.room_no)}</td>
+                    <td className="td text-gray-500">{dash(t.task_type)}</td>
+                    <td className="td text-gray-700">{t.assignee}</td>
+                    <td className="td">
+                      <span className={`rounded border px-1.5 py-0.5 text-[11px] ${HkStatusCls[t.status] ?? "border-gray-200 bg-gray-50 text-gray-600"}`}>
+                        {HkStatusLabel[t.status] ?? t.status}
+                      </span>
+                    </td>
+                    <td className="td tabular-nums text-gray-500">{fmtMinute(t.created_at)}</td>
+                    <td className="td tabular-nums text-gray-500">{t.done_at ? fmtMinute(t.done_at) : "—"}</td>
+                    <td className="td text-right tabular-nums text-gray-500">
+                      {minutes == null || !Number.isFinite(minutes) ? "—" : `${minutes.toFixed(1)} 分`}
+                    </td>
+                    <td className="td max-w-[240px] truncate text-gray-400">{dash(t.note)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <NoteCard>
+        口径说明：任务来自 <code>housekeeping</code>，打扫员列是 <b>assignee</b>
+        （库里没有 cleaner_name 列，这是原来占位的根因）；「打扫员」是姓名文本而不是外键，
+        区域 / 电话按姓名对齐 <code>cleaners</code> 档案，在岗但还没接过任务的人补 0 行显示。
+        完成率 = 已完成 ÷ 全部任务，分母含待打扫与已取消 —— 只看「完成 ÷（完成+待办）」会虚高。
+        「本期完成」按 <code>done_at</code> 的本地日期（+8 小时）落在统计区间统计；
+        上表其余列与第二张明细表是<b>全量台账</b>，不受区间限制。
+        平均耗时 = done_at − created_at（分钟），演示库里大量任务是批量补记的，耗时接近 0 属真实数据，
+        不代表真实打扫工时；接入手持机逐单打卡后才有参考价值。
+      </NoteCard>
+    </>
   );
 }
 
@@ -8128,37 +9254,398 @@ function ReportEpidemic({ ctx }: ReportProps) {
 
 
 function ReportMemberTopup({ ctx }: ReportProps) {
-  const rows = all<{ guest_name: string | null; amount: number | null; balance: number | null; method: string | null; created_at: string | null }>(
-    `SELECT g.name AS guest_name, p.amount, p.balance, p.method, p.created_at
-     FROM member_topups p LEFT JOIN guests g ON g.id = p.guest_id
-     WHERE p.hotel_id = ? ORDER BY p.id DESC LIMIT 300`,
-    [ctx.hotelId]
+  const { hotelId, from, to } = ctx;
+  const rows = walletLedgerRows(hotelId, from, to);
+  const balances = walletMemberBalanceRows(hotelId);
+  const ledgerCountAll = walletLedgerCount(hotelId);
+  const balanceAll = walletBalanceTotal(hotelId);
+
+  const rechargeSum = sumMoney(rows.filter((r) => r.biz_type === "RECHARGE").map((r) => r.amount));
+  const consumeSum = sumMoney(rows.filter((r) => r.biz_type === "CONSUME").map((r) => Math.abs(r.amount)));
+  const refundSum = sumMoney(rows.filter((r) => r.biz_type === "REFUND").map((r) => Math.abs(r.amount)));
+  const adjustSum = sumMoney(rows.filter((r) => r.biz_type === "ADJUST").map((r) => r.amount));
+
+  const exportHref = csvHref(
+    ["时间", "会员", "卡号", "类型", "发生额", "记账后余额", "关联单据", "操作人", "备注"],
+    rows.map((r) => [
+      fmtMinute(r.created_at),
+      r.member_name ?? `会员#${r.member_id}`,
+      memberCardNo(r.member_id),
+      WALLET_TYPE_LABEL[r.biz_type] ?? r.biz_type,
+      r.amount.toFixed(2),
+      r.balance_after == null ? "" : num(r.balance_after).toFixed(2),
+      r.ref_type ? `${r.ref_type}${r.ref_id == null ? "" : `#${r.ref_id}`}` : "",
+      r.operator ?? "",
+      r.remark ?? "",
+    ])
   );
-  void rows;
+  const balanceExport = csvHref(
+    ["会员", "卡号", "储值余额", "累计充值", "累计消费", "累计退款", "流水笔数", "最近变动"],
+    balances.map((b) => [
+      b.member_name,
+      memberCardNo(b.member_id),
+      b.balance.toFixed(2),
+      b.recharge.toFixed(2),
+      b.consume.toFixed(2),
+      b.refund.toFixed(2),
+      String(b.cnt),
+      b.last_at ? fmtMinute(b.last_at) : "",
+    ])
+  );
+
   return (
-    <div className="card overflow-hidden">
-      <div className="border-b border-[#f0f0f0] px-3 py-2 text-[13px] font-semibold text-[#222]">会员储值明细报表</div>
-      <MiniTable head={["会员", "金额", "余额", "方式", "时间"]} rows={[]} />
-    </div>
+    <>
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-5">
+        <StatCard
+          label="本期流水笔数"
+          value={fmtInt(rows.length)}
+          hint={`记账时间（+8 小时本地日）落在 ${from} ~ ${to} 的储值流水 · 全表共 ${fmtInt(ledgerCountAll)} 笔`}
+        />
+        <StatCard label="本期充值" value={fmtMoney(rechargeSum)} hint="biz_type = RECHARGE（正数入账）" />
+        <StatCard label="本期消费" value={fmtMoney(consumeSum)} hint="biz_type = CONSUME（负数出账，这里取绝对值）" />
+        <StatCard
+          label="本期退款 / 调整"
+          value={`${fmtMoney(refundSum)} / ${fmtMoney(adjustSum)}`}
+          hint="REFUND = 把余额退给客人（出账）；ADJUST = 人工对账调整（双向）"
+        />
+        <StatCard label="储值余额合计" value={fmtMoney(balanceAll)} hint="SUM(member_wallet_ledger.amount) 全量余额，不受区间限制" />
+      </div>
+
+      <SectionCard
+        title="储值流水明细"
+        right={
+          <span className="flex flex-wrap items-center gap-2">
+            <span>
+              {from} ~ {to} · {rows.length} 笔
+            </span>
+            <a className={REPORT_EXPORT_CLS} download={`会员储值明细_${from}_${to}.csv`} href={exportHref}>
+              导出 CSV
+            </a>
+          </span>
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">时间</th>
+                <th className="th">会员</th>
+                <th className="th">卡号</th>
+                <th className="th">类型</th>
+                <th className="th text-right">发生额</th>
+                <th className="th text-right">记账后余额</th>
+                <th className="th">关联单据</th>
+                <th className="th">操作人</th>
+                <th className="th">备注</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 && (
+                <EmptyRow
+                  colSpan={9}
+                  text={`本期无储值流水（全表 member_wallet_ledger 共 ${ledgerCountAll} 笔）—— 是真实没有业务，不是查询失败；在「会员管理 → 储值账户」充值/消费后立刻出现在这里`}
+                />
+              )}
+              {rows.map((r) => (
+                <tr key={r.id} className="hover:bg-gray-50">
+                  <td className="td tabular-nums text-gray-500">{fmtMinute(r.created_at)}</td>
+                  <td className="td text-gray-700">{r.member_name ?? `会员#${r.member_id}`}</td>
+                  <td className="td tabular-nums text-gray-400">{memberCardNo(r.member_id)}</td>
+                  <td className="td">
+                    <span
+                      className={`rounded border px-1.5 py-0.5 text-[11px] ${
+                        r.biz_type === "RECHARGE"
+                          ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                          : r.biz_type === "CONSUME"
+                            ? "border-rose-200 bg-rose-50 text-rose-700"
+                            : "border-amber-200 bg-amber-50 text-amber-700"
+                      }`}
+                    >
+                      {WALLET_TYPE_LABEL[r.biz_type] ?? r.biz_type}
+                    </span>
+                  </td>
+                  <td className={`td text-right tabular-nums ${r.amount < 0 ? "text-[#e2483a]" : "text-[#32a852]"}`}>
+                    {fmtMoney(r.amount)}
+                  </td>
+                  <td className="td text-right tabular-nums text-gray-600">
+                    {r.balance_after == null ? "—" : fmtMoney(num(r.balance_after))}
+                  </td>
+                  <td className="td text-gray-500">{r.ref_type ? `${r.ref_type}${r.ref_id == null ? "" : `#${r.ref_id}`}` : "—"}</td>
+                  <td className="td text-gray-500">{dash(r.operator)}</td>
+                  <td className="td max-w-[260px] truncate text-gray-400">{dash(r.remark)}</td>
+                </tr>
+              ))}
+              {rows.length > 0 && (
+                <TotalRow>
+                  <td className="td font-medium text-gray-800">本期合计</td>
+                  <td className="td" />
+                  <td className="td" />
+                  <td className="td" />
+                  <td className={SUM_TD}>{fmtMoney(sumMoney(rows.map((r) => r.amount)))}</td>
+                  <td className="td" />
+                  <td className="td" />
+                  <td className="td" />
+                  <td className="td" />
+                </TotalRow>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <SectionCard
+        title="会员储值余额"
+        right={
+          <span className="flex flex-wrap items-center gap-2">
+            <span>全量 · {balances.length} 个有余额会员账户 · 余额合计 {fmtMoney(balanceAll)}</span>
+            <a className={REPORT_EXPORT_CLS} download="会员储值余额.csv" href={balanceExport}>
+              导出 CSV
+            </a>
+          </span>
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">会员</th>
+                <th className="th">卡号</th>
+                <th className="th text-right">储值余额</th>
+                <th className="th text-right">累计充值</th>
+                <th className="th text-right">累计消费</th>
+                <th className="th text-right">累计退款</th>
+                <th className="th text-right">流水笔数</th>
+                <th className="th">最近变动</th>
+              </tr>
+            </thead>
+            <tbody>
+              {balances.length === 0 && <EmptyRow colSpan={8} text="还没有任何会员开通过储值账户（余额恒等式：余额 = SUM(流水)，流水为 0 则余额为 0）" />}
+              {balances.map((b) => (
+                <tr key={b.member_id} className="hover:bg-gray-50">
+                  <td className="td font-medium text-gray-800">{b.member_name}</td>
+                  <td className="td tabular-nums text-gray-400">{memberCardNo(b.member_id)}</td>
+                  <td className={SUM_TD}>{fmtMoney(b.balance)}</td>
+                  <td className="td text-right tabular-nums text-[#32a852]">{fmtMoney(b.recharge)}</td>
+                  <td className="td text-right tabular-nums text-gray-600">{fmtMoney(b.consume)}</td>
+                  <td className="td text-right tabular-nums text-amber-700">{fmtMoney(b.refund)}</td>
+                  <td className="td text-right tabular-nums text-gray-500">{fmtInt(b.cnt)}</td>
+                  <td className="td tabular-nums text-gray-500">{b.last_at ? fmtMinute(b.last_at) : "—"}</td>
+                </tr>
+              ))}
+              {balances.length > 0 && (
+                <TotalRow>
+                  <td className="td font-medium text-gray-800">合计</td>
+                  <td className="td" />
+                  <td className={SUM_TD}>{fmtMoney(balanceAll)}</td>
+                  <td className={SUM_TD}>{fmtMoney(sumMoney(balances.map((b) => b.recharge)))}</td>
+                  <td className={SUM_TD}>{fmtMoney(sumMoney(balances.map((b) => b.consume)))}</td>
+                  <td className={SUM_TD}>{fmtMoney(sumMoney(balances.map((b) => b.refund)))}</td>
+                  <td className={SUM_TD}>{fmtInt(balances.reduce((s, b) => s + b.cnt, 0))}</td>
+                  <td className="td" />
+                </TotalRow>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <NoteCard>
+        口径说明：储值流水唯一来源是 <code>member_wallet_ledger</code>
+        （库里<b>没有</b> member_topups 表，这是原来占位的根因），biz_type 只有四种：
+        RECHARGE 充值（+）、CONSUME 消费（−）、REFUND 退款出账（−）、ADJUST 人工调整（±）。
+        余额恒等式 <code>balance = SUM(amount)</code>：本表的「储值余额」一律由流水求和，
+        不读 <code>member_wallet.balance</code> 缓存表（真库该缓存表是 0 行，读它会得出
+        「余额 0 但其实有充值」的错数）。归期按记账时间的本地日（created_at + 8 小时）。
+        当前真库 <b>全表 0 笔流水</b>，所以本期与余额都是真实的 0 —— 不是 SQL 查不出，
+        而是本店还没有发生过储值业务（充值入口在「会员管理 → 储值账户」）。
+      </NoteCard>
+    </>
   );
 }
 
 function ReportSalesmanCard({ ctx }: ReportProps) {
-  const rows = all<{ salesman: string | null; cards: number; amount: number | null }>(
-    `SELECT COALESCE(u.real_name, u.username, '未分配') AS salesman,
-            COUNT(g.id) AS cards,
-            COALESCE(SUM(g.total_spend), 0) AS amount
-     FROM guests g LEFT JOIN users u ON u.id = g.salesman_id
-     WHERE g.hotel_id = ? AND COALESCE(g.vip_level, 0) > 0
-     GROUP BY u.id ORDER BY cards DESC`,
-    [ctx.hotelId]
+  const { hotelId } = ctx;
+  const rows = memberCardRows(hotelId);
+  const salesmen = all<{ id: number; name: string; status: string | null; commission_rate: number | null }>(
+    `SELECT id, name, status, commission_rate FROM salesmen WHERE hotel_id = ? ORDER BY id`,
+    [hotelId]
   );
-  void rows;
+
+  type Sum = { salesman: string; cards: number; amount: number; stays: number };
+  const by = new Map<string, Sum>();
+  for (const r of rows) {
+    const key = String(r.salesman ?? "").trim() || "未归属";
+    const cur = by.get(key) ?? { salesman: key, cards: 0, amount: 0, stays: 0 };
+    cur.cards += 1;
+    cur.amount = round2(cur.amount + r.total_spend);
+    cur.stays += r.stay_count;
+    by.set(key, cur);
+  }
+  /* 发卡为 0 的在职销售员也要出现（否则「谁这个月没发卡」看不出来） */
+  for (const s of salesmen) {
+    if (!by.has(s.name)) by.set(s.name, { salesman: s.name, cards: 0, amount: 0, stays: 0 });
+  }
+  const sums = [...by.values()].sort(
+    (a, b) => b.cards - a.cards || b.amount - a.amount || a.salesman.localeCompare(b.salesman, "zh")
+  );
+  const salesmanMap = new Map(salesmen.map((s) => [s.name, s]));
+
+  const totalCards = rows.length;
+  const totalAmount = sumMoney(rows.map((r) => r.total_spend));
+  const attributed = rows.filter((r) => String(r.salesman ?? "").trim() !== "").length;
+  const avgAmount = totalCards > 0 ? round2(totalAmount / totalCards) : 0;
+
+  const exportHref = csvHref(
+    ["销售员", "在职状态", "发卡数", "卡内累计消费", "人均消费", "占比"],
+    sums.map((s) => [
+      s.salesman,
+      s.salesman === "未归属" ? "—" : (salesmanMap.get(s.salesman)?.status ?? ""),
+      String(s.cards),
+      s.amount.toFixed(2),
+      s.cards > 0 ? (s.amount / s.cards).toFixed(2) : "0.00",
+      totalCards > 0 ? `${((s.cards / totalCards) * 100).toFixed(2)}%` : "-",
+    ])
+  );
+  const detailExport = csvHref(
+    ["会员卡号", "会员", "手机", "等级", "开卡时间", "累计消费", "归属销售员"],
+    rows.map((r) => [
+      memberCardNo(r.id),
+      r.name,
+      maskMobile(r.mobile),
+      VIP_LABEL[r.vip_level] ?? `VIP${r.vip_level}`,
+      r.created_at ? fmtMinute(r.created_at) : "",
+      r.total_spend.toFixed(2),
+      String(r.salesman ?? "").trim() || "未归属",
+    ])
+  );
+
   return (
-    <div className="card overflow-hidden">
-      <div className="border-b border-[#f0f0f0] px-3 py-2 text-[13px] font-semibold text-[#222]">销售员发卡报告</div>
-      <MiniTable head={["销售员", "发卡数", "卡内累计消费"]} rows={[]} />
-    </div>
+    <>
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-5">
+        <StatCard label="发卡总数" value={fmtInt(totalCards)} hint="客史 vip_level > 0 的会员卡数量（与会员报表同一批人）" />
+        <StatCard label="卡内累计消费" value={fmtMoney(totalAmount)} hint="会员名下全部住宿账务明细累计（不含押金）" />
+        <StatCard label="人均卡消费" value={fmtMoney(avgAmount)} hint="卡内累计消费 ÷ 发卡总数" />
+        <StatCard
+          label="已归属销售员"
+          value={fmtInt(attributed)}
+          hint="按「该会员首次入住记录的销售员」归因，详见下方口径说明"
+        />
+        <StatCard label="未归属" value={fmtInt(totalCards - attributed)} hint="入住记录没有填销售员的会员卡" />
+      </div>
+
+      <SectionCard
+        title="按销售员汇总"
+        right={
+          <span className="flex flex-wrap items-center gap-2">
+            <span>在册销售员 {salesmen.length} 人 · 已归因 {attributed} 张</span>
+            <a className={REPORT_EXPORT_CLS} download="销售员发卡_按销售员.csv" href={exportHref}>
+              导出 CSV
+            </a>
+          </span>
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">销售员</th>
+                <th className="th">在职状态</th>
+                <th className="th text-right">发卡数</th>
+                <th className="th text-right">卡内累计消费</th>
+                <th className="th text-right">人均消费</th>
+                <th className="th w-44">占发卡量</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sums.length === 0 && <EmptyRow colSpan={6} />}
+              {sums.map((s) => (
+                <tr key={s.salesman} className="hover:bg-gray-50">
+                  <td className="td font-medium text-gray-800">{s.salesman}</td>
+                  <td className="td text-gray-500">
+                    {s.salesman === "未归属"
+                      ? "—"
+                      : (salesmanMap.get(s.salesman)?.status ?? "—") === "ACTIVE"
+                        ? "在职"
+                        : "停用"}
+                  </td>
+                  <td className="td text-right tabular-nums">{fmtInt(s.cards)}</td>
+                  <td className={SUM_TD}>{fmtMoney(s.amount)}</td>
+                  <td className="td text-right tabular-nums text-gray-600">
+                    {s.cards > 0 ? fmtMoney(round2(s.amount / s.cards)) : "—"}
+                  </td>
+                  <td className="td">
+                    <ShareBar value={s.cards} total={totalCards} />
+                  </td>
+                </tr>
+              ))}
+              <TotalRow>
+                <td className="td font-medium text-gray-800">合计</td>
+                <td className="td" />
+                <td className={SUM_TD}>{fmtInt(totalCards)}</td>
+                <td className={SUM_TD}>{fmtMoney(totalAmount)}</td>
+                <td className="td" />
+                <td className="td" />
+              </TotalRow>
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <SectionCard
+        title="发卡明细"
+        right={
+          <span className="flex flex-wrap items-center gap-2">
+            <span>共 {rows.length} 张 · 按卡内累计消费倒序</span>
+            <a className={REPORT_EXPORT_CLS} download="销售员发卡_明细.csv" href={detailExport}>
+              导出 CSV
+            </a>
+          </span>
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">会员卡号</th>
+                <th className="th">会员</th>
+                <th className="th">手机</th>
+                <th className="th">等级</th>
+                <th className="th">开卡时间</th>
+                <th className="th text-right">入住次数</th>
+                <th className="th text-right">卡内累计消费</th>
+                <th className="th">归属销售员</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 && <EmptyRow colSpan={8} />}
+              {rows.map((r) => (
+                <tr key={r.id} className="hover:bg-gray-50">
+                  <td className="td tabular-nums text-gray-500">{memberCardNo(r.id)}</td>
+                  <td className="td font-medium text-gray-800">{r.name}</td>
+                  <td className="td tabular-nums text-gray-500">{maskMobile(r.mobile)}</td>
+                  <td className="td text-gray-600">{VIP_LABEL[r.vip_level] ?? `VIP${r.vip_level}`}</td>
+                  <td className="td tabular-nums text-gray-500">{r.created_at ? fmtMinute(r.created_at) : "—"}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(r.stay_count)}</td>
+                  <td className={SUM_TD}>{fmtMoney(r.total_spend)}</td>
+                  <td className="td text-gray-600">{String(r.salesman ?? "").trim() || "未归属"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <NoteCard>
+        口径说明：本表把「发卡」定义为<b>客史里 vip_level &gt; 0 的会员卡</b>，卡号沿用 M + 8 位客史 id。
+        销售员归因是这张表最容易误解的地方：<code>guests</code> 表<b>没有</b> salesman 列，
+        销售员只记在入住单上（<code>stays.salesman</code> / <code>bookings.salesman</code>，都是姓名文本）。
+        所以归因规则是「取该会员<b>首次入住记录</b>的销售员」；当前真库这两列在
+        831 条预订 / 384 条入住里<b>全部为空</b>，因此所有卡都落在「未归属」——
+        这是数据缺失的真实结果，不是 SQL 写错。前台在办理入住 / 下单时填了「销售员」字段后，
+        该会员的卡会自动归到对应销售员名下。金额是卡内累计消费（账务明细 ROOM+FOOD+OTHER，不含押金），
+        不是卡内余额；储值余额见「会员储值明细报表」。
+      </NoteCard>
+    </>
   );
 }
 
@@ -8173,46 +9660,411 @@ function ReportSalesmanCardDetail({ ctx }: ReportProps) {
 }
 
 function ReportMemberConsumeRank({ ctx }: ReportProps) {
-  const rows = all<{ name: string; mobile: string | null; total_spend: number | null; stay_count: number | null }>(
-    `SELECT name, mobile, total_spend, stay_count FROM guests
-     WHERE hotel_id = ? AND COALESCE(vip_level, 0) > 0
-     ORDER BY COALESCE(total_spend, 0) DESC LIMIT 100`,
-    [ctx.hotelId]
+  const { hotelId, from, to } = ctx;
+  const base = memberCardRows(hotelId);
+  const periodSpend = memberPeriodSpend(hotelId, from, to);
+  const nightsByName = memberNightsByName(hotelId, from, to);
+
+  const ranked = base
+    .map((r) => ({
+      ...r,
+      period_spend: periodSpend.get(r.id) ?? 0,
+      period_nights: nightsByName.get(String(r.name).trim()) ?? 0,
+    }))
+    .filter((r) => r.period_spend > 0.005)
+    .sort((a, b) => b.period_spend - a.period_spend || b.total_spend - a.total_spend);
+
+  const periodTotal = sumMoney(ranked.map((r) => r.period_spend));
+  const allTotal = sumMoney(base.map((r) => r.total_spend));
+  const topOne = ranked.length > 0 ? ranked[0].period_spend : 0;
+  const avg = ranked.length > 0 ? round2(periodTotal / ranked.length) : 0;
+  const top10Share = periodTotal > 0 ? ranked.slice(0, 10).reduce((s, r) => s + r.period_spend, 0) / periodTotal : 0;
+
+  const periodExport = csvHref(
+    ["排名", "会员", "卡号", "等级", "入住次数", "本期间夜", "本期消费", "占本期", "累计消费"],
+    ranked.map((r, i) => [
+      String(i + 1),
+      r.name,
+      memberCardNo(r.id),
+      VIP_LABEL[r.vip_level] ?? `VIP${r.vip_level}`,
+      String(r.stay_count),
+      String(r.period_nights),
+      r.period_spend.toFixed(2),
+      periodTotal > 0 ? `${((r.period_spend / periodTotal) * 100).toFixed(2)}%` : "-",
+      r.total_spend.toFixed(2),
+    ])
   );
+  const allRank = base.slice(0, 50);
+  const allExport = csvHref(
+    ["排名", "会员", "卡号", "等级", "入住次数", "累计消费", "占会员累计消费"],
+    allRank.map((r, i) => [
+      String(i + 1),
+      r.name,
+      memberCardNo(r.id),
+      VIP_LABEL[r.vip_level] ?? `VIP${r.vip_level}`,
+      String(r.stay_count),
+      r.total_spend.toFixed(2),
+      allTotal > 0 ? `${((r.total_spend / allTotal) * 100).toFixed(2)}%` : "-",
+    ])
+  );
+
   return (
-    <div className="card overflow-hidden">
-      <div className="border-b border-[#f0f0f0] px-3 py-2 text-[13px] font-semibold text-[#222]">
-        会员消费排名表 · 前 {rows.length} 位
+    <>
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-5">
+        <StatCard
+          label="本期会员消费"
+          value={fmtMoney(periodTotal)}
+          hint={`账务明细（房费 + 餐饮 + 其他，不含押金）按营业日落在 ${from} ~ ${to}`}
+        />
+        <StatCard label="本期有消费会员" value={fmtInt(ranked.length)} hint="本期消费 > 0 的会员数（其余会员本期没住店）" />
+        <StatCard label="榜首消费" value={fmtMoney(topOne)} hint="本期消费最高的会员" />
+        <StatCard
+          label="本期人均"
+          value={fmtMoney(avg)}
+          hint={`会员累计消费 ${fmtMoney(allTotal)} · 前 10 名占本期 ${fmtPct(top10Share)}`}
+        />
+        <StatCard label="会员累计消费" value={fmtMoney(allTotal)} hint="全部会员的全历史累计（与会员报表同口径）" />
       </div>
-      <MiniTable
-        head={["排名", "会员", "手机", "累计消费", "入住次数"]}
-        rows={rows.map((r, i) => [
-          String(i + 1),
-          r.name,
-          r.mobile ?? "—",
-          fmtMoney(r.total_spend),
-          String(r.stay_count ?? 0),
-        ])}
-      />
-    </div>
+
+      <SectionCard
+        title="本期会员消费排名"
+        right={
+          <span className="flex flex-wrap items-center gap-2">
+            <span>
+              {from} ~ {to} · {ranked.length} 位
+            </span>
+            <a className={REPORT_EXPORT_CLS} download={`会员消费排名_${from}_${to}.csv`} href={periodExport}>
+              导出 CSV
+            </a>
+          </span>
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th text-right">排名</th>
+                <th className="th">会员</th>
+                <th className="th">卡号</th>
+                <th className="th">等级</th>
+                <th className="th text-right">入住次数</th>
+                <th className="th text-right">本期间夜</th>
+                <th className="th text-right">本期消费</th>
+                <th className="th w-44">占本期</th>
+                <th className="th text-right">累计消费</th>
+              </tr>
+            </thead>
+            <tbody>
+              {ranked.length === 0 && (
+                <EmptyRow
+                  colSpan={9}
+                  text="本期区间内没有会员消费（真实为 0，不是查询失败；会员累计消费榜单见下表）"
+                />
+              )}
+              {ranked.map((r, i) => (
+                <tr key={r.id} className="hover:bg-gray-50">
+                  <td className="td text-right tabular-nums text-gray-400">{i + 1}</td>
+                  <td className="td font-medium text-gray-800">{r.name}</td>
+                  <td className="td tabular-nums text-gray-400">{memberCardNo(r.id)}</td>
+                  <td className="td text-gray-600">{VIP_LABEL[r.vip_level] ?? `VIP${r.vip_level}`}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(r.stay_count)}</td>
+                  <td className="td text-right tabular-nums text-gray-500">{fmtInt(r.period_nights)}</td>
+                  <td className={SUM_TD}>{fmtMoney(r.period_spend)}</td>
+                  <td className="td">
+                    <ShareBar value={r.period_spend} total={periodTotal} tone="bg-[#58bc62]" />
+                  </td>
+                  <td className="td text-right tabular-nums text-gray-500">{fmtMoney(r.total_spend)}</td>
+                </tr>
+              ))}
+              <TotalRow>
+                <td className="td font-medium text-gray-800">合计</td>
+                <td className="td" />
+                <td className="td" />
+                <td className="td" />
+                <td className={SUM_TD}>{fmtInt(ranked.reduce((s, r) => s + r.stay_count, 0))}</td>
+                <td className={SUM_TD}>{fmtInt(ranked.reduce((s, r) => s + r.period_nights, 0))}</td>
+                <td className={SUM_TD}>{fmtMoney(periodTotal)}</td>
+                <td className="td" />
+                <td className={SUM_TD}>{fmtMoney(sumMoney(ranked.map((r) => r.total_spend)))}</td>
+              </TotalRow>
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <SectionCard
+        title="会员累计消费榜（前 50 位）"
+        right={
+          <span className="flex flex-wrap items-center gap-2">
+            <span>全历史累计 · 合计 {fmtMoney(allTotal)}</span>
+            <a className={REPORT_EXPORT_CLS} download="会员累计消费榜.csv" href={allExport}>
+              导出 CSV
+            </a>
+          </span>
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th text-right">排名</th>
+                <th className="th">会员</th>
+                <th className="th">等级</th>
+                <th className="th text-right">入住次数</th>
+                <th className="th text-right">累计消费</th>
+                <th className="th text-right">本期消费</th>
+                <th className="th w-44">占会员累计消费</th>
+              </tr>
+            </thead>
+            <tbody>
+              {allRank.length === 0 && <EmptyRow colSpan={7} />}
+              {allRank.map((r, i) => {
+                const spend = periodSpend.get(r.id) ?? 0;
+                return (
+                  <tr key={r.id} className="hover:bg-gray-50">
+                    <td className="td text-right tabular-nums text-gray-400">{i + 1}</td>
+                    <td className="td font-medium text-gray-800">{r.name}</td>
+                    <td className="td text-gray-600">{VIP_LABEL[r.vip_level] ?? `VIP${r.vip_level}`}</td>
+                    <td className="td text-right tabular-nums">{fmtInt(r.stay_count)}</td>
+                    <td className={SUM_TD}>{fmtMoney(r.total_spend)}</td>
+                    <td className="td text-right tabular-nums text-gray-500">{spend > 0.005 ? fmtMoney(spend) : "—"}</td>
+                    <td className="td">
+                      <ShareBar value={r.total_spend} total={allTotal} tone="bg-[#58bc62]" />
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <NoteCard>
+        口径说明：消费金额来自账务明细（stays → folios → folio_items，科目 ROOM / FOOD / OTHER，
+        <b>不含押金</b>，与「会员报表」「会员概况」同一口径）。库里 guests 表<b>没有</b> total_spend 列，
+        原来占位就是因为 SQL 直接读它 —— 现在改成现算。会员关联优先 stays.guest_id，
+        老数据 guest_id 为空时才按姓名回落，避免同名客人互相蹭消费。
+        本期榜按 <code>folio_items.biz_date</code>（营业日 / 夜审归期）取区间；
+        会员累计榜是全历史累计、不受区间限制，两张表分母不同不能互相加减。
+        本期间夜取 metrics.ts 的住宿占用口径（排除钟点房），并且是按姓名的近似归属。
+      </NoteCard>
+    </>
   );
 }
 
 function ReportMembersUpgrade({ ctx }: ReportProps) {
-  const rows = all<{ name: string; vip_level: number | null; total_spend: number | null; stay_count: number | null }>(
-    `SELECT name, vip_level, total_spend, stay_count FROM guests
-     WHERE hotel_id = ? AND COALESCE(vip_level, 0) > 0
-     ORDER BY vip_level DESC, COALESCE(total_spend, 0) DESC LIMIT 200`,
-    [ctx.hotelId]
+  const { hotelId } = ctx;
+  const rules = memberUpgradeRules(hotelId);
+  const base = memberCardRows(hotelId);
+
+  const evaluated = base.map((r) => {
+    const target = memberTargetLevel(r, rules);
+    const nextRule = rules.levels.find((lv) => lv.level > r.vip_level) ?? null;
+    const gap = nextRule
+      ? Math.max(
+          0,
+          rules.basis === "stays" ? nextRule.minStays - r.stay_count : round2(nextRule.minSpend - r.total_spend)
+        )
+      : 0;
+    return { ...r, target, next: nextRule, gap };
+  });
+  const pending = evaluated
+    .filter((r) => r.target > r.vip_level)
+    .sort((a, b) => b.target - a.target || b.total_spend - a.total_spend);
+  const upTo3 = pending.filter((r) => r.target >= 3).length;
+  const reached = evaluated.filter((r) => r.target <= r.vip_level).length;
+  const basisLabel = rules.basis === "stays" ? "入住次数" : "累计消费金额";
+
+  /* 每个等级档：当前在册人数 / 按规则已达门槛人数 */
+  const ruleRows = rules.levels.map((lv) => {
+    const current = evaluated.filter((r) => r.vip_level === lv.level).length;
+    const qualified = evaluated.filter((r) => r.target >= lv.level).length;
+    return { ...lv, current, qualified };
+  });
+
+  const levelRows = [1, 2, 3, 4].map((lv) => {
+    const list = evaluated.filter((r) => r.vip_level === lv);
+    return {
+      level: lv,
+      count: list.length,
+      amount: sumMoney(list.map((r) => r.total_spend)),
+      stays: list.reduce((s, r) => s + r.stay_count, 0),
+    };
+  });
+  const totalAmount = sumMoney(evaluated.map((r) => r.total_spend));
+
+  const exportHref = csvHref(
+    ["会员", "卡号", "当前等级", "应享等级", "累计消费", "入住次数", "还差金额", "还差次数"],
+    pending.map((r) => [
+      r.name,
+      memberCardNo(r.id),
+      VIP_LABEL[r.vip_level] ?? `VIP${r.vip_level}`,
+      VIP_LABEL[r.target] ?? `VIP${r.target}`,
+      r.total_spend.toFixed(2),
+      String(r.stay_count),
+      r.next && rules.basis === "spend" ? r.gap.toFixed(2) : "",
+      r.next && rules.basis === "stays" ? String(r.gap) : "",
+    ])
   );
+
   return (
-    <div className="card overflow-hidden">
-      <div className="border-b border-[#f0f0f0] px-3 py-2 text-[13px] font-semibold text-[#222]">会员升级报表</div>
-      <MiniTable
-        head={["会员", "当前等级", "累计消费", "入住次数"]}
-        rows={rows.map((r) => [r.name, `VIP${r.vip_level ?? 0}`, fmtMoney(r.total_spend), String(r.stay_count ?? 0)])}
-      />
-    </div>
+    <>
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-5">
+        <StatCard label="会员总数" value={fmtInt(evaluated.length)} hint="客史 vip_level > 0" />
+        <StatCard
+          label="待升级"
+          value={fmtInt(pending.length)}
+          hint={`按生效规则「${basisLabel}」判定：应享等级 > 当前等级 · 其中可到 VIP3 的 ${upTo3} 人`}
+        />
+        <StatCard label="等级已达标" value={fmtInt(reached)} hint="应享等级 ≤ 当前等级（含等级给得比消费高的）" />
+        <StatCard label="会员累计消费" value={fmtMoney(totalAmount)} hint="全部会员账务明细累计（不含押金）" />
+        <StatCard
+          label="升级依据"
+          value={rules.basis === "stays" ? "入住次数" : "累计消费"}
+          hint="规则来源 settings.member_upgrade_rules，与会员管理「会员升级」页同一份规则；未保存时用默认规则"
+        />
+      </div>
+
+      <SectionCard title="升级规则与达标情况" right={`依据：${basisLabel} · 规则版本：settings.member_upgrade_rules`}>
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">等级</th>
+                <th className="th text-right">消费门槛</th>
+                <th className="th text-right">入住次数门槛</th>
+                <th className="th text-right">折扣</th>
+                <th className="th text-right">积分倍率</th>
+                <th className="th text-right">当前会员数</th>
+                <th className="th text-right">按规则达标人数</th>
+                <th className="th">缺口</th>
+              </tr>
+            </thead>
+            <tbody>
+              {ruleRows.map((lv) => (
+                <tr key={lv.level} className="hover:bg-gray-50">
+                  <td className="td font-medium text-gray-800">{VIP_LABEL[lv.level] ?? `VIP${lv.level}`}</td>
+                  <td className="td text-right tabular-nums text-gray-700">{fmtMoney(lv.minSpend)}</td>
+                  <td className="td text-right tabular-nums text-gray-600">{fmtInt(lv.minStays)}</td>
+                  <td className="td text-right tabular-nums text-gray-600">{lv.discount.toFixed(2)}</td>
+                  <td className="td text-right tabular-nums text-gray-600">{lv.pointsRate.toFixed(2)}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(lv.current)}</td>
+                  <td className={SUM_TD}>{fmtInt(lv.qualified)}</td>
+                  <td className="td text-gray-400">
+                    {lv.qualified > lv.current
+                      ? `还差 ${fmtInt(lv.qualified - lv.current)} 人补登记升级`
+                      : lv.qualified < lv.current
+                        ? `${fmtInt(lv.current - lv.qualified)} 人等级高于当前消费`
+                        : "—"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <SectionCard
+        title="待升级会员清单"
+        right={
+          <span className="flex flex-wrap items-center gap-2">
+            <span>
+              {pending.length} 人 · 按依据口径现算（不是等级变更流水）
+            </span>
+            <a className={REPORT_EXPORT_CLS} download="会员升级_待升级清单.csv" href={exportHref}>
+              导出 CSV
+            </a>
+          </span>
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">会员</th>
+                <th className="th">卡号</th>
+                <th className="th">当前等级</th>
+                <th className="th">应享等级</th>
+                <th className="th text-right">累计消费</th>
+                <th className="th text-right">入住次数</th>
+                <th className="th text-right">距下一级还差</th>
+                <th className="th">最近入住</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pending.length === 0 && <EmptyRow colSpan={8} text="所有会员的等级都已达到（或高于）按规则应有的等级" />}
+              {pending.map((r) => (
+                <tr key={r.id} className="hover:bg-gray-50">
+                  <td className="td font-medium text-gray-800">{r.name}</td>
+                  <td className="td tabular-nums text-gray-400">{memberCardNo(r.id)}</td>
+                  <td className="td text-gray-600">{VIP_LABEL[r.vip_level] ?? `VIP${r.vip_level}`}</td>
+                  <td className="td font-medium text-[#e2483a]">{VIP_LABEL[r.target] ?? `VIP${r.target}`}</td>
+                  <td className={SUM_TD}>{fmtMoney(r.total_spend)}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(r.stay_count)}</td>
+                  <td className="td text-right tabular-nums text-gray-600">
+                    {r.next == null
+                      ? "已到顶"
+                      : rules.basis === "stays"
+                        ? `${fmtInt(r.gap)} 次`
+                        : fmtMoney(r.gap)}
+                  </td>
+                  <td className="td tabular-nums text-gray-500">{r.last_check_in ? fmtMinute(r.last_check_in) : "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <SectionCard title="会员等级分布" right={`合计 ${fmtInt(evaluated.length)} 人 · 累计消费 ${fmtMoney(totalAmount)}`}>
+        <table className="w-full">
+          <thead>
+            <tr>
+              <th className="th">等级</th>
+              <th className="th text-right">人数</th>
+              <th className="th text-right">累计消费</th>
+              <th className="th text-right">人均消费</th>
+              <th className="th text-right">入住次数</th>
+              <th className="th w-44">人数占比</th>
+            </tr>
+          </thead>
+          <tbody>
+            {levelRows.map((lv) => (
+              <tr key={lv.level} className="hover:bg-gray-50">
+                <td className="td text-gray-700">{VIP_LABEL[lv.level] ?? `VIP${lv.level}`}</td>
+                <td className="td text-right tabular-nums">{fmtInt(lv.count)}</td>
+                <td className={SUM_TD}>{fmtMoney(lv.amount)}</td>
+                <td className="td text-right tabular-nums text-gray-600">
+                  {lv.count > 0 ? fmtMoney(round2(lv.amount / lv.count)) : "—"}
+                </td>
+                <td className="td text-right tabular-nums text-gray-500">{fmtInt(lv.stays)}</td>
+                <td className="td">
+                  <ShareBar value={lv.count} total={evaluated.length} />
+                </td>
+              </tr>
+            ))}
+            <TotalRow>
+              <td className="td font-medium text-gray-800">合计</td>
+              <td className={SUM_TD}>{fmtInt(evaluated.length)}</td>
+              <td className={SUM_TD}>{fmtMoney(totalAmount)}</td>
+              <td className="td" />
+              <td className={SUM_TD}>{fmtInt(evaluated.reduce((s, r) => s + r.stay_count, 0))}</td>
+              <td className="td" />
+            </TotalRow>
+          </tbody>
+        </table>
+      </SectionCard>
+
+      <NoteCard>
+        口径说明：<b>必须说清楚这张表不是「已发生的升级流水」</b>。库里没有会员等级变更历史表
+        （op_logs 只在手动改等级时才会写，真库里没有一条），所以「升级报表」只能按规则现算：
+        拿每个会员的累计消费 / 入住次数，对照 <code>settings.member_upgrade_rules</code>（与会员管理
+        「会员升级」页同一份规则；未保存过则用默认：VIP2 消费 3000 或 5 次、VIP3 消费 10000 或 15 次），
+        得出「应享等级」，再和客史里的 vip_level 比 —— 应享高于当前就是待升级。
+        累计消费取账务明细（ROOM + FOOD + OTHER，不含押金），关联优先 stays.guest_id、老数据按姓名回落。
+        这张表<b>不改数据</b>：确认要升级请到会员管理点「升级」，本页只负责把差额摆出来。
+      </NoteCard>
+    </>
   );
 }
 
@@ -8829,31 +10681,221 @@ function ReportChannel({ ctx }: ReportProps) {
 }
 
 function ReportChannelDetail({ ctx }: ReportProps) {
-  const rows = all<{ order_no: string | null; guest_name: string | null; channel_name: string | null; check_in_date: string; check_out_date: string; status: string }>(
-    `SELECT COALESCE(b.order_no, 'B' || b.id) AS order_no, b.guest_name, c.name AS channel_name,
-            b.check_in_date, b.check_out_date, b.status
-     FROM bookings b LEFT JOIN channels c ON c.id = b.channel_id
-     WHERE b.hotel_id = ? AND b.check_in_date BETWEEN ? AND ?
-     ORDER BY b.id DESC LIMIT 300`,
-    [ctx.hotelId, ctx.from, ctx.to]
+  const { hotelId, from, to } = ctx;
+  const names = channelNameMap(hotelId);
+  const rtNames = roomTypeNameMap(hotelId);
+  const rows = channelOrderDetailRows(hotelId, from, to);
+
+  type ChSum = { channelId: number | null; orders: number; cancelled: number; noshow: number; nights: number; amount: number };
+  const byChannel = new Map<string, ChSum>();
+  for (const r of rows) {
+    const cid = r.channel_id == null ? null : Number(r.channel_id);
+    const key = channelKey(cid);
+    const cur = byChannel.get(key) ?? { channelId: cid, orders: 0, cancelled: 0, noshow: 0, nights: 0, amount: 0 };
+    cur.orders += 1;
+    if (r.status === "CANCELLED") cur.cancelled += 1;
+    if (r.status === "NOSHOW") cur.noshow += 1;
+    cur.nights += num(r.nights) * num(r.room_count);
+    cur.amount = round2(cur.amount + num(r.amount));
+    byChannel.set(key, cur);
+  }
+  const channelSums = [...byChannel.values()].sort((a, b) => b.amount - a.amount || b.orders - a.orders);
+
+  const totalOrders = rows.length;
+  const totalNights = rows.reduce((s, r) => s + num(r.nights) * num(r.room_count), 0);
+  const totalAmount = sumMoney(rows.map((r) => r.amount));
+  const totalCancelled = rows.filter((r) => r.status === "CANCELLED").length;
+  const totalNoshow = rows.filter((r) => r.status === "NOSHOW").length;
+  const adr = totalNights > 0 ? round2(totalAmount / totalNights) : 0;
+
+  const exportHref = csvHref(
+    ["预订号", "渠道单号", "渠道", "客人", "手机", "房型", "入住日期", "离店日期", "间夜", "房数", "单价", "订单金额", "状态", "下单时间"],
+    rows.map((r) => [
+      r.booking_no,
+      r.channel_order_no ?? "",
+      channelLabel(r.channel_id == null ? null : Number(r.channel_id), names),
+      r.guest_name ?? "",
+      maskMobile(r.mobile),
+      rtNames.get(Number(r.room_type_id)) ?? "",
+      r.check_in_date,
+      r.check_out_date,
+      String(num(r.nights)),
+      String(num(r.room_count)),
+      num(r.rate).toFixed(2),
+      num(r.amount).toFixed(2),
+      BOOKING_STATUS_LABEL[r.status] ?? r.status,
+      r.created_at ? fmtMinute(r.created_at) : "",
+    ])
   );
+  const sumExport = csvHref(
+    ["渠道", "订单量", "取消", "失约", "间夜", "订单金额", "占比"],
+    channelSums.map((c) => [
+      channelLabel(c.channelId, names),
+      String(c.orders),
+      String(c.cancelled),
+      String(c.noshow),
+      String(c.nights),
+      c.amount.toFixed(2),
+      totalAmount > 0 ? `${((c.amount / totalAmount) * 100).toFixed(2)}%` : "-",
+    ])
+  );
+
   return (
-    <div className="card overflow-hidden">
-      <div className="border-b border-[#f0f0f0] px-3 py-2 text-[13px] font-semibold text-[#222]">
-        渠道统计明细表 · {rows.length} 条
+    <>
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-5">
+        <StatCard label="订单量" value={fmtInt(totalOrders)} hint={`计划入住日落在 ${from} ~ ${to} 的预订订单数`} />
+        <StatCard label="间夜" value={fmtInt(totalNights)} hint="订单口径：nights × room_count（不是实际入住间夜，实际间夜见渠道统计报表）" />
+        <StatCard label="订单金额" value={fmtMoney(totalAmount)} hint="rate × nights × room_count 还原的应收房费" />
+        <StatCard label="取消 / 失约" value={`${fmtInt(totalCancelled)} / ${fmtInt(totalNoshow)}`} hint="状态 CANCELLED / NOSHOW" />
+        <StatCard label="平均房价" value={fmtMoney(adr)} hint="订单金额 ÷ 间夜" />
       </div>
-      <MiniTable
-        head={["订单号", "客人", "渠道", "入住", "离店", "状态"]}
-        rows={rows.map((r) => [
-          r.order_no ?? "—",
-          r.guest_name ?? "—",
-          r.channel_name ?? "散客",
-          r.check_in_date,
-          r.check_out_date,
-          r.status,
-        ])}
-      />
-    </div>
+
+      <SectionCard
+        title="按渠道小计"
+        right={
+          <span className="flex flex-wrap items-center gap-2">
+            <span>
+              {channelSums.length} 条渠道 · 合计 {fmtMoney(totalAmount)}
+            </span>
+            <a className={REPORT_EXPORT_CLS} download={`渠道明细_按渠道_${from}_${to}.csv`} href={sumExport}>
+              导出 CSV
+            </a>
+          </span>
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">渠道</th>
+                <th className="th text-right">订单量</th>
+                <th className="th text-right">取消</th>
+                <th className="th text-right">失约</th>
+                <th className="th text-right">间夜</th>
+                <th className="th text-right">订单金额</th>
+                <th className="th text-right">平均房价</th>
+                <th className="th w-40">占订单金额</th>
+              </tr>
+            </thead>
+            <tbody>
+              {channelSums.length === 0 && <EmptyRow colSpan={8} />}
+              {channelSums.map((c) => (
+                <tr key={channelKey(c.channelId)} className="hover:bg-gray-50">
+                  <td className="td text-gray-700">{channelLabel(c.channelId, names)}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(c.orders)}</td>
+                  <td className="td text-right tabular-nums text-gray-500">{fmtInt(c.cancelled)}</td>
+                  <td className="td text-right tabular-nums text-amber-700">{fmtInt(c.noshow)}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(c.nights)}</td>
+                  <td className={SUM_TD}>{fmtMoney(c.amount)}</td>
+                  <td className="td text-right tabular-nums text-gray-600">
+                    {c.nights > 0 ? fmtMoney(round2(c.amount / c.nights)) : "—"}
+                  </td>
+                  <td className="td">
+                    <ShareBar value={c.amount} total={totalAmount} />
+                  </td>
+                </tr>
+              ))}
+              <TotalRow>
+                <td className="td font-medium text-gray-800">合计</td>
+                <td className={SUM_TD}>{fmtInt(totalOrders)}</td>
+                <td className={SUM_TD}>{fmtInt(totalCancelled)}</td>
+                <td className={SUM_TD}>{fmtInt(totalNoshow)}</td>
+                <td className={SUM_TD}>{fmtInt(totalNights)}</td>
+                <td className={SUM_TD}>{fmtMoney(totalAmount)}</td>
+                <td className={SUM_TD}>{fmtMoney(adr)}</td>
+                <td className="td" />
+              </TotalRow>
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <SectionCard
+        title="渠道订单逐笔明细"
+        right={
+          <span className="flex flex-wrap items-center gap-2">
+            <span>
+              {from} ~ {to} · {rows.length} 单（最多 500 单）
+            </span>
+            <a className={REPORT_EXPORT_CLS} download={`渠道明细_逐笔_${from}_${to}.csv`} href={exportHref}>
+              导出 CSV
+            </a>
+          </span>
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">预订号</th>
+                <th className="th">渠道单号</th>
+                <th className="th">渠道</th>
+                <th className="th">客人</th>
+                <th className="th">手机</th>
+                <th className="th">房型</th>
+                <th className="th">入住</th>
+                <th className="th">离店</th>
+                <th className="th text-right">间夜</th>
+                <th className="th text-right">房数</th>
+                <th className="th text-right">单价</th>
+                <th className="th text-right">订单金额</th>
+                <th className="th">状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 && (
+                <EmptyRow colSpan={13} text="本期区间内没有渠道订单（真实为 0，可切到「本周 / 本月」查看）" />
+              )}
+              {rows.map((r) => (
+                <tr key={r.booking_no} className="hover:bg-gray-50">
+                  <td className="td tabular-nums text-gray-600">{r.booking_no}</td>
+                  <td className="td tabular-nums text-gray-400">{dash(r.channel_order_no)}</td>
+                  <td className="td text-gray-600">
+                    {channelLabel(r.channel_id == null ? null : Number(r.channel_id), names)}
+                  </td>
+                  <td className="td text-gray-700">{dash(r.guest_name)}</td>
+                  <td className="td tabular-nums text-gray-500">{maskMobile(r.mobile)}</td>
+                  <td className="td text-gray-500">{rtNames.get(Number(r.room_type_id)) ?? "—"}</td>
+                  <td className="td tabular-nums text-gray-600">{r.check_in_date}</td>
+                  <td className="td tabular-nums text-gray-500">{dash(r.check_out_date)}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(num(r.nights) * num(r.room_count))}</td>
+                  <td className="td text-right tabular-nums text-gray-500">{fmtInt(num(r.room_count))}</td>
+                  <td className="td text-right tabular-nums text-gray-600">{fmtMoney(num(r.rate))}</td>
+                  <td className={SUM_TD}>{fmtMoney(num(r.amount))}</td>
+                  <td className="td text-gray-600">{BOOKING_STATUS_LABEL[r.status] ?? r.status}</td>
+                </tr>
+              ))}
+              <TotalRow>
+                <td className="td font-medium text-gray-800">合计</td>
+                <td className="td" />
+                <td className="td" />
+                <td className="td" />
+                <td className="td" />
+                <td className="td" />
+                <td className="td" />
+                <td className="td" />
+                <td className={SUM_TD}>{fmtInt(totalNights)}</td>
+                <td className={SUM_TD}>{fmtInt(rows.reduce((s, r) => s + num(r.room_count), 0))}</td>
+                <td className="td" />
+                <td className={SUM_TD}>{fmtMoney(totalAmount)}</td>
+                <td className="td" />
+              </TotalRow>
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <NoteCard>
+        口径说明：单号取 <code>bookings.booking_no</code>（库里<b>没有</b> order_no 列，这是原来占位的根因），
+        渠道侧单号在 <code>channel_order_no</code>，两者都列出来方便和 OTA 后台对账。
+        金额是 <code>rate × nights × room_count</code> 的<b>订单金额</b>：真库
+        <code>bookings.total_price</code> 831 行全为 NULL（只有渠道同步写入时才有值），不能直接当金额。
+        订单金额 ≠ 实收：实际入账的房费要去「渠道统计报表」看 folio_items 的 ROOM 明细，
+        这里看的是「按订单应收多少」；间夜也是订单口径（nights × room_count），
+        实际住宿间夜同样在渠道统计里（住宿占用口径，排除钟点房）。
+        归期按计划入住日 check_in_date；未匹配渠道显示「散客（未匹配渠道）」，与 id=6 名为「散客」的渠道不是同一条。
+      </NoteCard>
+    </>
   );
 }
 
@@ -8893,43 +10935,378 @@ function ReportSms({ ctx }: ReportProps) {
 }
 
 function ReportPolice({ ctx }: ReportProps) {
-  const rows = all<{ room_no: string; guest_name: string | null; mobile: string | null; id_no: string | null; check_in_time: string | null }>(
-    `SELECT r.room_no, s.guest_name, s.mobile, s.id_no, s.check_in_time
-     FROM stays s JOIN rooms r ON r.id = s.room_id
-     WHERE s.hotel_id = ? AND s.status = 'INHOUSE' ORDER BY r.room_no`,
-    [ctx.hotelId]
+  const { hotelId, from, to } = ctx;
+  const rows = policeStayRows(hotelId, from, to);
+
+  const inhouse = rows.filter((r) => r.status === "INHOUSE").length;
+  const periodCheckins = rows.filter((r) => {
+    const d = String(r.check_in_time ?? "").slice(0, 10);
+    return d >= from && d <= to;
+  }).length;
+  const noId = rows.filter((r) => !String(r.id_no ?? "").trim()).length;
+  const noMobile = rows.filter((r) => !String(r.mobile ?? "").trim()).length;
+  const complete = rows.filter(
+    (r) => String(r.id_type ?? "").trim() && String(r.id_no ?? "").trim() && String(r.mobile ?? "").trim()
+  ).length;
+  const completeRate = rows.length > 0 ? complete / rows.length : 0;
+
+  const completeness = (r: PoliceStayRow): string => {
+    const missing: string[] = [];
+    if (!String(r.id_type ?? "").trim()) missing.push("证件类型");
+    if (!String(r.id_no ?? "").trim()) missing.push("证件号");
+    if (!String(r.mobile ?? "").trim()) missing.push("手机");
+    return missing.length === 0 ? "完整" : `缺${missing.join("/")}`;
+  };
+
+  const exportHref = csvHref(
+    ["房号", "姓名", "性别", "证件类型", "证件号", "手机", "入住时间", "预离时间", "实际离店", "在住状态", "登记完整性"],
+    rows.map((r) => [
+      r.room_no ?? "",
+      r.guest_name ?? "",
+      r.gender ?? "",
+      r.id_type ?? "",
+      maskIdNo(r.id_no),
+      maskMobile(r.mobile),
+      fmtMinute(r.check_in_time),
+      r.expect_check_out ? fmtMinute(r.expect_check_out) : "",
+      r.actual_check_out ? fmtMinute(r.actual_check_out) : "",
+      r.status === "INHOUSE" ? "在住" : r.status === "CHECKED_OUT" ? "已退房" : r.status,
+      completeness(r),
+    ])
   );
+
   return (
-    <div className="card overflow-hidden">
-      <div className="border-b border-[#f0f0f0] px-3 py-2 text-[13px] font-semibold text-[#222]">
-        公安报表 · 在住 {rows.length} 人（待上传清单）
+    <>
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-5">
+        <StatCard
+          label="应上传人数"
+          value={fmtInt(rows.length)}
+          hint="当前在住 ∪ 入住时间落在统计区间的登记记录（在住客人不管区间选哪天都要上传）"
+        />
+        <StatCard label="在住待上传" value={fmtInt(inhouse)} hint="当前仍在住、尚未离店的登记记录" />
+        <StatCard label="本期新增入住" value={fmtInt(periodCheckins)} hint={`入住时间落在 ${from} ~ ${to} 的登记记录`} />
+        <StatCard label="缺证件号" value={fmtInt(noId)} hint={`guests.id_no 为空 —— 公安上传必填项 · 另有 ${fmtInt(noMobile)} 条缺手机号`} />
+        <StatCard label="信息完整率" value={fmtPct(completeRate)} hint="证件类型 + 证件号 + 手机 三项齐全的比例" />
       </div>
-      <MiniTable
-        head={["房号", "姓名", "手机", "证件号", "入住时间"]}
-        rows={rows.map((r) => [
-          r.room_no,
-          r.guest_name ?? "—",
-          r.mobile ?? "—",
-          r.id_no ? `${r.id_no.slice(0, 4)}****${r.id_no.slice(-4)}` : "—",
-          (r.check_in_time ?? "").slice(0, 16).replace("T", " "),
-        ])}
-      />
-    </div>
+
+      <SectionCard
+        title="待上传住客清单（在住 + 本期登记）"
+        right={
+          <span className="flex flex-wrap items-center gap-2">
+            <span>
+              {from} ~ {to} · {rows.length} 条（在住 {inhouse}）· 证件号与手机均已脱敏
+            </span>
+            <a className={REPORT_EXPORT_CLS} download={`公安上传准备清单_${from}_${to}.csv`} href={exportHref}>
+              导出 CSV
+            </a>
+          </span>
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">房号</th>
+                <th className="th">姓名</th>
+                <th className="th">性别</th>
+                <th className="th">证件类型</th>
+                <th className="th">证件号</th>
+                <th className="th">手机</th>
+                <th className="th">入住时间</th>
+                <th className="th">预离时间</th>
+                <th className="th">在住状态</th>
+                <th className="th">登记完整性</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 && (
+                <EmptyRow colSpan={10} text="当前没有在住客人，本期区间也没有入住登记记录（真实为 0）" />
+              )}
+              {rows.map((r) => {
+                const text = completeness(r);
+                return (
+                  <tr key={r.stay_id} className="hover:bg-gray-50">
+                    <td className="td tabular-nums text-gray-700">{dash(r.room_no)}</td>
+                    <td className="td font-medium text-gray-800">{dash(r.guest_name)}</td>
+                    <td className="td text-gray-500">{dash(r.gender)}</td>
+                    <td className="td text-gray-500">{dash(r.id_type)}</td>
+                    <td className="td tabular-nums text-gray-600">{maskIdNo(r.id_no)}</td>
+                    <td className="td tabular-nums text-gray-500">{maskMobile(r.mobile)}</td>
+                    <td className="td tabular-nums text-gray-500">{fmtMinute(r.check_in_time)}</td>
+                    <td className="td tabular-nums text-gray-500">
+                      {r.expect_check_out ? fmtMinute(r.expect_check_out) : "—"}
+                    </td>
+                    <td className="td">
+                      <span
+                        className={`rounded border px-1.5 py-0.5 text-[11px] ${
+                          r.status === "INHOUSE"
+                            ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                            : "border-gray-200 bg-gray-50 text-gray-500"
+                        }`}
+                      >
+                        {r.status === "INHOUSE" ? "在住" : r.status === "CHECKED_OUT" ? "已退房" : r.status}
+                      </span>
+                    </td>
+                    <td className={`td ${text === "完整" ? "text-[#32a852]" : "text-[#e2483a]"}`}>{text}</td>
+                  </tr>
+                );
+              })}
+              <TotalRow>
+                <td className="td font-medium text-gray-800">合计</td>
+                <td className={SUM_TD}>{fmtInt(rows.length)}</td>
+                <td className="td" />
+                <td className="td" />
+                <td className="td" />
+                <td className="td" />
+                <td className="td" />
+                <td className="td" />
+                <td className={SUM_TD}>{fmtInt(inhouse)} 在住</td>
+                <td className="td">{fmtPct(completeRate)} 完整</td>
+              </TotalRow>
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <NoteCard>
+        口径说明：这张表是<b>「公安上传准备清单」，不是「已上传成功」</b>。本项目没有对接公安部旅馆业
+        住宿登记上传接口，也没有身份证读卡器与上传回执 —— 真正完成上传必须接入当地公安的接口
+        （设备 + 商户号 + 报文规范 + 回执确认），缺任何一样都不能对外宣称「已上报」。
+        字段来源：证件类型 / 证件号 / 性别取 <code>guests</code>（<code>stays</code> 表<b>没有</b> id_no 列，
+        这是原来占位的根因），房号 / 入住时间 / 在住状态取 <code>stays + rooms</code>，
+        手机号优先 stays.mobile，为空回落到 guests.mobile。清单范围 = <b>当前在住 ∪ 入住时间落在统计区间</b>：
+        在住客人不管区间选哪一天都必须出现（人还没走，公安那边要补齐），区间只决定额外带出哪段
+        时间内办过入住的人；这与「入住登记 24 小时内上传」的监管口径一致。证件号与手机在页面和
+        CSV 导出里都做了脱敏，完整值请在客人档案（需要查看敏感字段的权限）核对；
+        「信息完整率」是前台自查的补录指标。
+      </NoteCard>
+    </>
   );
 }
 
 function ReportRechargeSum({ ctx }: ReportProps) {
-  const rows = all<{ method: string | null; n: number; amount: number | null }>(
-    `SELECT COALESCE(method, '未填') AS method, COUNT(*) AS n, COALESCE(SUM(amount), 0) AS amount
-     FROM payments WHERE hotel_id = ? AND biz_type = 'RECHARGE' GROUP BY method`,
-    [ctx.hotelId]
-  ).filter(() => true);
-  void rows;
+  const { hotelId, from, to } = ctx;
+  const ledger = walletLedgerRows(hotelId, from, to);
+  const charges = ledger.filter((r) => r.biz_type === "RECHARGE");
+  const refunds = ledger.filter((r) => r.biz_type === "REFUND");
+  const ledgerCountAll = walletLedgerCount(hotelId);
+  const balanceAll = walletBalanceTotal(hotelId);
+
+  const chargeAmount = sumMoney(charges.map((r) => r.amount));
+  const refundAmount = sumMoney(refunds.map((r) => Math.abs(r.amount)));
+  const netAmount = round2(chargeAmount - refundAmount);
+
+  type MethodSum = { method: string; cnt: number; amount: number };
+  const byMethod = new Map<string, MethodSum>();
+  for (const r of charges) {
+    const method = rechargeMethodOf(r.remark);
+    const cur = byMethod.get(method) ?? { method, cnt: 0, amount: 0 };
+    cur.cnt += 1;
+    cur.amount = round2(cur.amount + num(r.amount));
+    byMethod.set(method, cur);
+  }
+  const methodRows = [...byMethod.values()].sort((a, b) => b.amount - a.amount);
+
+  type MemberSum = { memberId: number; memberName: string; cnt: number; amount: number; last: string | null };
+  const byMember = new Map<number, MemberSum>();
+  for (const r of charges) {
+    const cur =
+      byMember.get(r.member_id) ??
+      ({ memberId: r.member_id, memberName: r.member_name ?? `会员#${r.member_id}`, cnt: 0, amount: 0, last: null } as MemberSum);
+    cur.cnt += 1;
+    cur.amount = round2(cur.amount + num(r.amount));
+    if (!cur.last || String(r.created_at ?? "") > cur.last) cur.last = r.created_at;
+    byMember.set(r.member_id, cur);
+  }
+  const memberRows = [...byMember.values()].sort((a, b) => b.amount - a.amount);
+
+  const exportHref = csvHref(
+    ["时间", "会员", "卡号", "支付方式", "充值金额", "记账后余额", "操作人", "备注"],
+    charges.map((r) => [
+      fmtMinute(r.created_at),
+      r.member_name ?? `会员#${r.member_id}`,
+      memberCardNo(r.member_id),
+      rechargeMethodOf(r.remark),
+      num(r.amount).toFixed(2),
+      r.balance_after == null ? "" : num(r.balance_after).toFixed(2),
+      r.operator ?? "",
+      r.remark ?? "",
+    ])
+  );
+  const methodExport = csvHref(
+    ["支付方式", "充值笔数", "充值金额", "占比"],
+    methodRows.map((m) => [
+      m.method,
+      String(m.cnt),
+      m.amount.toFixed(2),
+      chargeAmount > 0 ? `${((m.amount / chargeAmount) * 100).toFixed(2)}%` : "-",
+    ])
+  );
+
   return (
-    <div className="card overflow-hidden">
-      <div className="border-b border-[#f0f0f0] px-3 py-2 text-[13px] font-semibold text-[#222]">会员卡充值汇总表</div>
-      <MiniTable head={["支付方式", "笔数", "金额"]} rows={[]} />
-    </div>
+    <>
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-5">
+        <StatCard
+          label="本期充值笔数"
+          value={fmtInt(charges.length)}
+          hint={`biz_type = RECHARGE · 记账本地日（+8 小时）落在 ${from} ~ ${to} · 全表流水 ${fmtInt(ledgerCountAll)} 笔`}
+        />
+        <StatCard label="本期充值金额" value={fmtMoney(chargeAmount)} hint="会员储值账户充值的入账合计（不含充值赠送）" />
+        <StatCard label="本期退款" value={fmtMoney(refundAmount)} hint="biz_type = REFUND（把余额退给客人，出账）" />
+        <StatCard label="本期净入账" value={fmtMoney(netAmount)} hint="充值 − 退款（消费不动这条口径，消费在储值明细里看）" />
+        <StatCard label="储值余额合计" value={fmtMoney(balanceAll)} hint="SUM(流水) 全量余额，不受区间限制" />
+      </div>
+
+      <SectionCard
+        title="按支付方式汇总"
+        right={
+          <span className="flex flex-wrap items-center gap-2">
+            <span>
+              {from} ~ {to} · 合计 {fmtMoney(chargeAmount)}
+            </span>
+            <a className={REPORT_EXPORT_CLS} download={`充值汇总_按支付方式_${from}_${to}.csv`} href={methodExport}>
+              导出 CSV
+            </a>
+          </span>
+        }
+      >
+        <table className="w-full">
+          <thead>
+            <tr>
+              <th className="th">支付方式</th>
+              <th className="th text-right">充值笔数</th>
+              <th className="th text-right">充值金额</th>
+              <th className="th w-44">占比</th>
+            </tr>
+          </thead>
+          <tbody>
+            {methodRows.length === 0 && (
+              <EmptyRow colSpan={4} text={`本期无充值记录（全表 member_wallet_ledger 共 ${ledgerCountAll} 笔）—— 真实为 0`} />
+            )}
+            {methodRows.map((m) => (
+              <tr key={m.method} className="hover:bg-gray-50">
+                <td className="td text-gray-700">{m.method}</td>
+                <td className="td text-right tabular-nums">{fmtInt(m.cnt)}</td>
+                <td className={SUM_TD}>{fmtMoney(m.amount)}</td>
+                <td className="td">
+                  <ShareBar value={m.amount} total={chargeAmount} />
+                </td>
+              </tr>
+            ))}
+            {methodRows.length > 0 && (
+              <TotalRow>
+                <td className="td font-medium text-gray-800">合计</td>
+                <td className={SUM_TD}>{fmtInt(charges.length)}</td>
+                <td className={SUM_TD}>{fmtMoney(chargeAmount)}</td>
+                <td className="td" />
+              </TotalRow>
+            )}
+          </tbody>
+        </table>
+      </SectionCard>
+
+      <SectionCard title="按会员汇总" right={`${memberRows.length} 位会员有充值 · 人均 ${memberRows.length > 0 ? fmtMoney(round2(chargeAmount / memberRows.length)) : "—"}`}>
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">会员</th>
+                <th className="th">卡号</th>
+                <th className="th text-right">充值笔数</th>
+                <th className="th text-right">充值金额</th>
+                <th className="th text-right">占本期充值</th>
+                <th className="th">最近充值</th>
+              </tr>
+            </thead>
+            <tbody>
+              {memberRows.length === 0 && <EmptyRow colSpan={6} />}
+              {memberRows.map((m) => (
+                <tr key={m.memberId} className="hover:bg-gray-50">
+                  <td className="td font-medium text-gray-800">{m.memberName}</td>
+                  <td className="td tabular-nums text-gray-400">{memberCardNo(m.memberId)}</td>
+                  <td className="td text-right tabular-nums">{fmtInt(m.cnt)}</td>
+                  <td className={SUM_TD}>{fmtMoney(m.amount)}</td>
+                  <td className="td text-right tabular-nums text-gray-600">
+                    {chargeAmount > 0 ? fmtPct(m.amount / chargeAmount) : "—"}
+                  </td>
+                  <td className="td tabular-nums text-gray-500">{m.last ? fmtMinute(m.last) : "—"}</td>
+                </tr>
+              ))}
+              {memberRows.length > 0 && (
+                <TotalRow>
+                  <td className="td font-medium text-gray-800">合计</td>
+                  <td className="td" />
+                  <td className={SUM_TD}>{fmtInt(charges.length)}</td>
+                  <td className={SUM_TD}>{fmtMoney(chargeAmount)}</td>
+                  <td className="td" />
+                  <td className="td" />
+                </TotalRow>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <SectionCard
+        title="充值流水明细"
+        right={
+          <span className="flex flex-wrap items-center gap-2">
+            <span>{charges.length} 笔</span>
+            <a className={REPORT_EXPORT_CLS} download={`充值汇总_明细_${from}_${to}.csv`} href={exportHref}>
+              导出 CSV
+            </a>
+          </span>
+        }
+      >
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr>
+                <th className="th">时间</th>
+                <th className="th">会员</th>
+                <th className="th">卡号</th>
+                <th className="th">支付方式</th>
+                <th className="th text-right">充值金额</th>
+                <th className="th text-right">记账后余额</th>
+                <th className="th">操作人</th>
+                <th className="th">备注</th>
+              </tr>
+            </thead>
+            <tbody>
+              {charges.length === 0 && (
+                <EmptyRow colSpan={8} text="本期没有充值流水（真实为 0，不是查不出）" />
+              )}
+              {charges.map((r) => (
+                <tr key={r.id} className="hover:bg-gray-50">
+                  <td className="td tabular-nums text-gray-500">{fmtMinute(r.created_at)}</td>
+                  <td className="td text-gray-700">{r.member_name ?? `会员#${r.member_id}`}</td>
+                  <td className="td tabular-nums text-gray-400">{memberCardNo(r.member_id)}</td>
+                  <td className="td text-gray-600">{rechargeMethodOf(r.remark)}</td>
+                  <td className={SUM_TD}>{fmtMoney(num(r.amount))}</td>
+                  <td className="td text-right tabular-nums text-gray-600">
+                    {r.balance_after == null ? "—" : fmtMoney(num(r.balance_after))}
+                  </td>
+                  <td className="td text-gray-500">{dash(r.operator)}</td>
+                  <td className="td max-w-[280px] truncate text-gray-400">{dash(r.remark)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <NoteCard>
+        口径说明：原来占位的原因写的是「SQL 引用了不存在的 biz_type 列」—— 对，
+        <code>payments</code> 只有 <code>kind</code>（ROOM_PAYMENT / DEPOSIT / DEPOSIT_REFUND），
+        <b>没有</b> biz_type，也根本没有「充值」这一种收款：会员储值流水在
+        <code>member_wallet_ledger</code>（biz_type = RECHARGE / CONSUME / REFUND / ADJUST），
+        本表只读它。支付方式不是独立列：充值时前台选的支付方式被
+        <code>members/wallet/actions.ts</code> 写进 remark（格式「充值方式：现金；备注」），
+        本表按同一格式解析，解析不到的归「未填」不猜。金额只算实际入账（不含充值方案的赠送额），
+        退款单列并冲减「净入账」，消费不进入这张表（在「会员储值明细报表」里看）。
+        当前真库 <b>全表 0 笔流水</b>，因此本期各项与余额都是真实的 0。
+      </NoteCard>
+    </>
   );
 }
 
@@ -9408,45 +11785,6 @@ function ReportRoomBizDaily({ ctx }: ReportProps) {
 }
 
 /* ================================================================== *
- * 八·二、未实现报表的占位视图
- * ================================================================== */
-
-/**
- * 未实现报表的占位视图
- *
- * 这些报表在 REPORTS 里注册了、组件框架也写了，但 SQL 引用了不存在的表/列
- * （AI 生成后从未运行过）。上线前审计发现它们一旦被映射就会 500。
- *
- * 处理原则：宁可明确说「没做」，也不能：
- *   · 500 白屏（用户不知道发生了什么）
- *   · 静默显示别的报表（拿错数做决策，比报错危险得多）
- * 需要真做的时候，按实际表结构改 SQL 再换回真组件。
- */
-function ReportNotReady({ ctx, title, why }: ReportProps & { title: string; why?: string }) {
-  return (
-    <div className="card p-6">
-      <div className="flex items-start gap-3">
-        <div className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-amber-100 text-[13px] text-amber-700">
-          !
-        </div>
-        <div className="min-w-0">
-          <div className="text-[13px] font-semibold text-gray-900">{title}</div>
-          <div className="mt-1 text-[12px] leading-relaxed text-gray-600">
-            这张报表尚未实现，当前显示的是占位说明。
-          </div>
-          {why && (
-            <div className="mt-2 rounded bg-gray-50 px-2.5 py-1.5 font-mono text-[11px] text-gray-500">{why}</div>
-          )}
-          <div className="mt-2 text-[11.5px] text-gray-400">
-            统计范围：{ctx.from} ~ {ctx.to}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ================================================================== *
  * 九、报表分发
  * ================================================================== */
 
@@ -9513,78 +11851,35 @@ const REPORT_VIEWS: Record<string, ReportComponent> = {
   "credit-checkin": ReportCreditCheckin,
   "sms-report": ReportSms,
   /*
-   * "police-report"（公安报表）尚未实现：SQL 引用了 stays.id_no（证件号在 guests 表）
-   * 原来映射到真组件会 500，改指向占位说明。
+   * 第十一轮：下面 10 张报表原来指向 ReportNotReady 占位（SQL 引用了不存在的表/列），
+   * 现在全部按真库结构改写成能跑的查询，数据访问层见「八·三」。
+   * 关键修正（都对着 PRAGMA table_info 复核过）：
+   *   · 公安清单  —— 证件号在 guests.id_no（stays 没有 id_no）；
+   *   · 充值/储值 —— 读 member_wallet_ledger（payments 没有 biz_type，库里也没有 member_topups 表）；
+   *   · 会员消费  —— guests 没有 total_spend / stay_count，从 stays → folios → folio_items 现算；
+   *   · 渠道/取消 —— 单号列是 booking_no（没有 order_no）；
+   *   · 打扫员    —— 列名是 housekeeping.assignee（没有 cleaner_name）。
+   * 仍占位的：无。真正需要外部依赖的是「公安上传」这个动作本身（接口 + 读卡器 + 回执），
+   * 报表只做「上传准备清单」，并在口径说明里写明未对接 —— 不谎称已上报。
    */
-  "police-report": (props: ReportProps) => (
-    <ReportNotReady
-      {...props}
-      title="公安上传准备清单"
-      why="当前为占位。真实的公安上传需要读卡器 + 公安部接口 + 回执确认，本项目未对接，所以不谎称「已实现」。待上传数据本身可以从 guests 表取（证件号在 guests.id_no，不在 stays）。"
-    />
-  ),
-  /*
-   * "recharge-sum"（充值汇总报表）尚未实现：SQL 引用了不存在的 biz_type 列
-   * 原来映射到真组件会 500，改指向占位说明。
-   */
-  "recharge-sum": (props: ReportProps) => <ReportNotReady {...props} title="充值汇总报表" why="SQL 引用了不存在的 biz_type 列" />,
+  "police-report": ReportPolice,
+  "recharge-sum": ReportRechargeSum,
   "recharge-salesman": ReportRechargeSalesman,
   "room-biz-daily": ReportRoomBizDaily,
-  /*
-   * "member-topup"（会员储值明细）尚未实现：SQL 引用了不存在的 member_topups 表（储值流水在 member_wallet_ledger）
-   * 原来映射到真组件会 500，改指向占位说明。
-   */
-  "member-topup": (props: ReportProps) => <ReportNotReady {...props} title="会员储值明细" why="SQL 引用了不存在的 member_topups 表（储值流水在 member_wallet_ledger）" />,
-  /*
-   * "salesman-card"（销售员发卡报表）尚未实现：SQL 引用了 guests.total_spend（不存在，需从 stays 聚合）
-   * 原来映射到真组件会 500，改指向占位说明。
-   */
-  "salesman-card": (props: ReportProps) => <ReportNotReady {...props} title="销售员发卡报表" why="SQL 引用了 guests.total_spend（不存在，需从 stays 聚合）" />,
+  "member-topup": ReportMemberTopup,
+  "salesman-card": ReportSalesmanCard,
   "salesman-card-detail": ReportSalesmanCardDetail,
-  /*
-   * "member-consume-rank"（会员消费排名）尚未实现：SQL 引用了不存在的 total_spend 列
-   * 原来映射到真组件会 500，改指向占位说明。
-   */
-  "member-consume-rank": (props: ReportProps) => <ReportNotReady {...props} title="会员消费排名" why="SQL 引用了不存在的 total_spend 列" />,
-  /*
-   * "members-upgrade"（会员升级报表）尚未实现：SQL 引用了不存在的 total_spend 列
-   * 原来映射到真组件会 500，改指向占位说明。
-   */
-  "members-upgrade": (props: ReportProps) => <ReportNotReady {...props} title="会员升级报表" why="SQL 引用了不存在的 total_spend 列" />,
+  "member-consume-rank": ReportMemberConsumeRank,
+  "members-upgrade": ReportMembersUpgrade,
   "goods-stock": ReportGoodsStock,
-  /*
-   * "channel-report"（渠道统计报表）第九轮已实现（清单 二.5）：
-   * 原来占位的原因是 SQL 引用了不存在的 bookings.total_amount（实际列是 total_price），
-   * 现在按 channel_id 聚合订单 / 取消 / 未到店 / 已入住 / 已退房 / 间夜 / 房费 / 收入占比，
-   * 并支持营业日·自然日筛选与按渠道·房型·日期导出。
-   */
   "channel-report": ReportChannel,
-  /*
-   * "channel-report-detail"（渠道统计明细）尚未实现：SQL 引用了 bookings.order_no（实际字段是 booking_no）
-   * 原来映射到真组件会 500，改指向占位说明。
-   */
-  "channel-report-detail": (props: ReportProps) => <ReportNotReady {...props} title="渠道统计明细" why="SQL 引用了 bookings.order_no（实际字段是 booking_no）" />,
-  /*
-   * "member-list-report"（会员报表）尚未实现：SQL 引用了不存在的 total_spend 列
-   * （会员累计消费需从 stays/folios 聚合，或读 guests 的预计算列）
-   * 原来映射到真组件会 500，改指向占位说明。
-   */
-  "member-list-report": (props: ReportProps) => (
-    <ReportNotReady {...props} title="会员报表" why="SQL 引用了不存在的 total_spend 列（需从 stays/folios 聚合）" />
-  ),
+  "channel-report-detail": ReportChannelDetail,
+  "member-list-report": ReportMemberList,
   "score-detail-report": ReportScoreDetail,
   "invoice-report": ReportInvoice,
   "realtime-report": ReportRealtime,
-  /*
-   * "cancel-order-report"（预订取消/失约报表）尚未实现：SQL 引用了 bookings.order_no（实际字段是 booking_no）
-   * 原来映射到真组件会 500，改指向占位说明。
-   */
-  "cancel-order-report": (props: ReportProps) => <ReportNotReady {...props} title="预订取消/失约报表" why="SQL 引用了 bookings.order_no（实际字段是 booking_no）" />,
-  /*
-   * "cleaner-perf"（打扫员业绩报表）尚未实现：SQL 引用了不存在的 cleaner_name 列
-   * 原来映射到真组件会 500，改指向占位说明。
-   */
-  "cleaner-perf": (props: ReportProps) => <ReportNotReady {...props} title="打扫员业绩报表" why="SQL 引用了不存在的 cleaner_name 列" />,
+  "cancel-order-report": ReportCancelOrder,
+  "cleaner-perf": ReportCleanerPerf,
   "epidemic-report": ReportEpidemic,
 };
 

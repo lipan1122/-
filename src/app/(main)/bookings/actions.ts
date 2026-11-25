@@ -23,6 +23,25 @@ import { nextBookingNo } from "@/lib/channels/booking-no";
  * 反而制造渠道与本地不一致。
  */
 import { markStockDirty } from "@/lib/channels/stock-trigger";
+/*
+ * 房型库存「按晚」口径 —— PC 建单与小程序下单的**唯一实现**（src/lib/room-stock-nightly.ts）
+ *
+ * 这里原来自己写着 physicalCapOfType / eachNight / occupiedByNight / stockError 四个本地函数，
+ * 小程序 api/mini/_shared.ts 的 loadAvailability 又照着抄了一份旧口径，结果两边漂移：
+ * 小程序那份只扣 OOO 不扣 LOCK（锁房被卖）、按区间重叠计数（跨日订单被误拒）。
+ * 抽成 lib 之后口径只有一份，任何改动两边同时生效；本文件只保留「按房型汇总要订几间」
+ * 这一层页面语义（见下方 createBookingInTx 里的 needByType）。
+ */
+import { stockShortage, type StockDb } from "@/lib/room-stock-nightly";
+
+/**
+ * 交给库存 lib 的查询句柄（同一个连接、同一个事务快照）
+ *
+ * 为什么不在 lib 里直接 import @/lib/db：lib 要被 PC action、小程序 route、
+ * 测试脚本共用，句柄由调用方注入才能保证「算库存」和「写订单」看到的是同一份数据
+ * （PC 端是在 `BEGIN IMMEDIATE` 事务内复查的，换成另一个连接就失去意义了）。
+ */
+const STOCK_DB: StockDb = { all, get };
 
 /** 读取字符串字段并去除首尾空格，非字符串一律视为空串 */
 function str(value: FormDataEntryValue | null): string {
@@ -265,86 +284,6 @@ export async function createBookingAction(formData: FormData) {
     }
     validLines.push({ ...line, roomId });
   }
-  /*
-   * 房型库存校验（P0，chk-perf 实测）
-   *
-   * 原来只有「指定了具体房间」才查 `findRoomConflicts`；**只订房型、不指定房间时
-   * 完全不校验库存** —— 实测：可售 1 间，连点 5 次各订 1 间，5 个全部成功，
-   * 有效 `room_count` 合计 5 间，直接超卖（和并发无关，串行点击也会）。
-   *
-   * 这里在事务内按「房型 × 区间」汇总**已有有效占用**，与物理房量比：
-   *
-   *   已有占用 =
-   *     ① 已排房的明细（booking_rooms.room_id 非空）→ 一行算 1 间
-   *     ② 未排房的主单（bookings.room_id 为空）→ 按 room_count 算
-   *     ③ 在住单（stays，同房型、区间重叠）→ 一间算 1 间
-   *
-   *   本次增加的间数 = 本行 room_count
-   *   可用 = 该房型物理房量 − 已有占用
-   *
-   * `room_count` 校验在**同一个事务内**做（下面 tx 里），并发下由
-   * `BEGIN IMMEDIATE` 的行级写锁 + 复查兜住。
-   */
-  const roomTypeCapacity = new Map<number, number>();
-  for (const t of all<{ id: number; c: number }>(
-    `SELECT rt.id, (SELECT COUNT(*) FROM rooms r WHERE r.hotel_id = rt.hotel_id AND r.room_type_id = rt.id) AS c
-       FROM room_types rt WHERE rt.hotel_id = ?`,
-    [hotelId]
-  )) {
-    roomTypeCapacity.set(Number(t.id), Number(t.c));
-  }
-
-  /** 某房型在某区间的已有有效占用（间数） */
-  const occupiedOfType = (roomTypeId: number, ci: string, co: string): number => {
-    /*
-     * ① 有明细的订单 → **按明细行数算**（一行一间，不管这间排没排房）
-     *
-     * ⚠️ 不能只数「排了房的明细」：3 间订单排了 1 间时，
-     *    `booking_rooms` 是「1 行有 room_id + 2 行 room_id 为空」，
-     *    只数有 room_id 的会算成 1 间，另外 2 间凭空消失 → 校验形同虚设。
-     *
-     *    也不能再叠加主单 `room_count`：主单和明细是同一份占用的两种表达，
-     *    两边都算会翻倍。
-     */
-    const byDetails = Number(
-      get<{ c: number }>(
-        `SELECT COUNT(*) AS c FROM booking_rooms br
-           JOIN bookings b ON b.id = br.booking_id AND b.hotel_id = br.hotel_id
-          WHERE br.hotel_id = ? AND br.room_type_id = ?
-            AND br.status IN ('PENDING','CONFIRMED')
-            AND b.status IN ('PENDING','CONFIRMED')
-            AND br.check_in_date < ? AND br.check_out_date > ?`,
-        [hotelId, roomTypeId, co, ci]
-      )?.c ?? 0
-    );
-    /*
-     * ② 没有明细的订单（迁移前的老数据）→ 按主单 room_count 算
-     *    有明细的订单**不参与**这一支，避免和 ① 重复计数。
-     */
-    const byMaster = Number(
-      get<{ s: number }>(
-        `SELECT COALESCE(SUM(COALESCE(b.room_count,1)),0) AS s
-           FROM bookings b
-          WHERE b.hotel_id = ? AND b.room_type_id = ?
-            AND b.status IN ('PENDING','CONFIRMED')
-            AND b.check_in_date < ? AND b.check_out_date > ?
-            AND NOT EXISTS (SELECT 1 FROM booking_rooms x WHERE x.booking_id = b.id)`,
-        [hotelId, roomTypeId, co, ci]
-      )?.s ?? 0
-    );
-    /* ③ 在住单（同房型、区间重叠）—— 在住的房也不能再卖 */
-    const inhouse = Number(
-      get<{ c: number }>(
-        `SELECT COUNT(*) AS c FROM stays s JOIN rooms r ON r.id = s.room_id AND r.hotel_id = s.hotel_id
-          WHERE s.hotel_id = ? AND r.room_type_id = ?
-            AND s.status = 'INHOUSE'
-            AND substr(s.check_in_time,1,10) < ? AND s.expect_check_out > ?`,
-        [hotelId, roomTypeId, co, ci]
-      )?.c ?? 0
-    );
-    return byDetails + byMaster + inhouse;
-  };
-
   /* P2-1：房型校验全部失败时也要说清楚哪一项不对，而不是静默回退 */
   if (validLines.length === 0) {
     backNew("所选房型无效，请重新选择房型（可能已被停用）");
@@ -432,14 +371,20 @@ export async function createBookingAction(formData: FormData) {
     }
 
     /*
-     * 事务内复查房型库存（P0 超卖）
+     * 事务内复查房型库存（按晚 · P0-1）
      *
-     * 上面的 `occupiedOfType` 是在事务**外**算的（用于快速失败、给用户友好提示），
-     * 但并发下两个请求可能都看到「还剩 1 间」然后都写成功 —— 唯一索引只能挡住
-     * 「同一间房同一区间」，挡不住「只订房型」这种没有具体房间的重复售卖。
+     * 口径全部在 src/lib/room-stock-nightly.ts（与小程序下单同一份实现）：
+     *   物理可售 = 房间数 − OOO − LOCK
+     *   该晚占用 = 在住单 + PENDING/CONFIRMED 明细（一行一间）+ 无明细旧主单 room_count
+     *   判定     = 入住区间内**最低**的剩余 ≥ 本单要的间数
      *
-     * 所以进事务后再算一遍：`BEGIN IMMEDIATE` 已经拿到写锁，这一遍的结果是权威的。
-     * 任一行超量就整单拒绝（与其它校验一样：要么全成功、要么全回滚）。
+     * 库存这一遍必须在 `BEGIN IMMEDIATE` 拿到写锁之后算：并发下两个请求可能
+     * 都看到「还剩 1 间」然后都写成功 —— 唯一索引只能挡住「同一间房同一区间」，
+     * 挡不住「只订房型」这种没有具体房间的重复售卖。
+     * 这一遍看到的是权威快照；任一行超量就整单拒绝（要么全成功、要么全回滚）。
+     *
+     * 本文件只剩业务层语义：一个表单里同房型可能有多行，库存要按合并后的间数判，
+     * 所以先聚合成 needByType 再逐房型问 lib（文案由 lib 统一给，指出最低的那一晚）。
      */
     {
       const needByType = new Map<number, number>();
@@ -447,16 +392,11 @@ export async function createBookingAction(formData: FormData) {
         needByType.set(line.roomTypeId, (needByType.get(line.roomTypeId) ?? 0) + Math.max(1, line.roomCount));
       }
       for (const [typeId, need] of needByType) {
-        const cap = roomTypeCapacity.get(typeId) ?? 0;
-        if (cap <= 0) continue; // 房型没有物理房（异常数据），交给下面的房型校验
-        const occ = occupiedOfType(typeId, checkInDate, checkOutDate);
-        if (occ + need > cap) {
-          const t = get<{ name: string }>(`SELECT name FROM room_types WHERE id = ? AND hotel_id = ?`, [typeId, hotelId]);
-          throw new Error(
-            `「${t?.name ?? "该房型"}」在 ${checkInDate} ~ ${checkOutDate} 只剩 ${Math.max(0, cap - occ)} 间，` +
-              `本次要订 ${need} 间，库存不足（整单未创建）`
-          );
-        }
+        const name =
+          get<{ name: string }>(`SELECT name FROM room_types WHERE id = ? AND hotel_id = ?`, [typeId, hotelId])?.name ??
+          "该房型";
+        const stockMsg = stockShortage(STOCK_DB, hotelId, typeId, name, checkInDate, checkOutDate, need);
+        if (stockMsg) throw new Error(stockMsg);
       }
     }
 

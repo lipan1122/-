@@ -14,7 +14,17 @@ import { all, get, run } from "@/lib/db";
 import { getActiveMiniConfig, getMiniProgramConfig } from "@/lib/mini-config";
 import { requireMiniToken, type MiniUser } from "@/lib/mini-auth";
 import { rateLimit } from "@/lib/mini-rate-limit";
+/* 房量口径：与 PC 建单（bookings/actions.ts）共用同一份实现，见文件下方 loadAvailability */
+import { roomTypeStock, type StockDb } from "@/lib/room-stock-nightly";
 import { nowIso } from "@/lib/utils";
+
+/**
+ * 交给库存 lib 的查询句柄（同一个连接，事务内看到的就是最新已提交数据）
+ *
+ * lib 不自己 import @/lib/db：PC action / 小程序 route / 测试脚本共用同一份逻辑，
+ * 句柄由调用方注入，才能保证「算房量」和「写订单」在同一份快照上。
+ */
+const STOCK_DB: StockDb = { all, get };
 
 /** 统一响应体：小程序端只按 ok 判断成败，error 直接展示给用户 */
 export type MiniApiBody<T = unknown> = {
@@ -189,27 +199,34 @@ type RateRow = { room_type_id: number; date: string; price: number | null };
 /**
  * 计算某日期区间内每个房型的可订房量。
  *
- * 口径（与 PC 端「房型可售预测」/ room-availability.ts 的占用判定一致）：
- *   可订 = 物理房间数 − 该区间在住 − 该区间已排预订 − 维修房
+ * ══════════════════════════════════════════════════════════════════════════
+ * 房量口径（整改 P0-1 之后统一到 src/lib/room-stock-nightly.ts）
+ * ══════════════════════════════════════════════════════════════════════════
+ *   物理可售(房型) = 房间数 − 维修(OOO) − 锁房(LOCK)
+ *   某一晚占用     = 在住单 + PENDING/CONFIRMED 明细（一行一间）
+ *                  + 无明细旧主单（按 room_count）
+ *   对外可订       = 区间内**最低**的那一晚剩余
  *
- * 三个占用来源都要查，且不能互相重复计数：
- *   1. stays（在住）：按入住日期 ~ 预计离店日与目标区间求交
- *   2. booking_rooms（预订明细，权威来源）：已转入住的明细 stay_id 非空，
- *      那部分由第 1 条计数，这里必须排除，否则同一间房会被算两次
- *   3. bookings 主单：只为「没有明细的历史单」兜底（迁移会补明细，
- *      但外网老库可能还没跑过迁移），有明细时以明细为准
+ * 原来这里自己写了一份「区间重叠计数」的旧口径，与 PC 建单修好后的逐晚口径不一致，
+ * 带着两个已实测的 bug：
+ *   ① 只扣 OOO 不扣 LOCK → 房型唯一一间房被锁，小程序照样卖出去（超卖）；
+ *   ② 按整个入住区间有没有重叠 +1、不按晚拆 → 两间同型房 A 占 11-25、B 占 11-26，
+ *      再订 11-25~11-27 一间（两晚各剩 1 间）被算成「已占 2 间」而误拒。
+ * 现在口径交给 lib 的 `roomTypeStock`：它内部的 `physicalCapOfType` / `occupiedByNight`
+ * 与 PC 端 `stockShortage` 是同一份代码，所以「列表显示可订 N 间」与
+ * 「PC 建单能不能订 N 间」永远是同一个答案，不存在两个入口漂移的空间。
  *
- * 维修房（rooms.status = 'OOO'）没有日期维度，只能按「整段不可售」扣减；
- * 这是保守做法 —— 宁可少卖一间，也不会出现「卖了维修房让前台无法排房」。
- * 锁房（LOCK）与房型可售预测页保持同一口径，不在此扣减。
+ * 房价（rate_calendar）与库存无关，仍在下面自己算：
+ *   区间总价 = Σ 每晚（有日历价用日历价，缺的日子回落门市价），均价 = 总价 / 晚数。
+ * 两段故意分开：改库存口径不该影响报价，改报价也不该影响库存。
  *
- * 区间判定用半开区间：入住日 < 目标离店日 且 离店日 > 目标入住日，
- * 相等不算冲突（12:00 退房、14:00 入住，同一天可以接续）。
+ * 区间判定用半开区间：入住日 ≤ 该晚 < 离店日 —— 12:00 退房、14:00 入住，同一天可以接续，
+ * A 占 11-25 一晚不会占掉 11-26。
  */
 export function loadAvailability(hotelId: number, checkIn: string, checkOut: string): AvailabilityResult {
   const nights = dayDiff(checkIn, checkOut);
 
-  /* 1. 房型 + 物理房量 + 维修房 */
+  /* 1. 房型基础信息（只取展示 / 报价要用的列；房量交给 lib，不再自己数房间） */
   const roomTypes = all<{
     id: number;
     code: string | null;
@@ -217,59 +234,25 @@ export function loadAvailability(hotelId: number, checkIn: string, checkOut: str
     bed_type: string | null;
     max_occupancy: number | null;
     base_price: number | null;
-    total_rooms: number;
-    ooo_rooms: number;
   }>(
-    `SELECT rt.id, rt.code, rt.name, rt.bed_type, rt.max_occupancy, COALESCE(rt.base_price, 0) AS base_price,
-            (SELECT COUNT(*) FROM rooms r
-              WHERE r.hotel_id = rt.hotel_id AND r.room_type_id = rt.id) AS total_rooms,
-            (SELECT COUNT(*) FROM rooms r
-              WHERE r.hotel_id = rt.hotel_id AND r.room_type_id = rt.id AND r.status = 'OOO') AS ooo_rooms
+    `SELECT rt.id, rt.code, rt.name, rt.bed_type, rt.max_occupancy, COALESCE(rt.base_price, 0) AS base_price
        FROM room_types rt
       WHERE rt.hotel_id = ?
       ORDER BY COALESCE(rt.sort, 100), rt.id`,
     [hotelId]
   );
 
-  /* 2. 在住占用（按房间所属房型统计） */
-  const stayRows = all<{ room_type_id: number; n: number }>(
-    `SELECT r.room_type_id AS room_type_id, COUNT(*) AS n
-       FROM stays s
-       JOIN rooms r ON r.id = s.room_id AND r.hotel_id = s.hotel_id
-      WHERE s.hotel_id = ? AND s.status = 'INHOUSE'
-        AND COALESCE(substr(s.check_in_time, 1, 10), '') < ?
-        AND COALESCE(s.expect_check_out, '') > ?
-      GROUP BY r.room_type_id`,
-    [hotelId, checkOut, checkIn]
-  );
+  /*
+   * 2. 房量（逐晚口径，与 PC 建单同一份实现）
+   *
+   * roomTypeStock 一次算全房型：
+   *   cap       物理可售（房间数 − OOO − LOCK）
+   *   minRemain 区间内最低剩余（入住区间里最紧的那一晚）
+   *   occupied  每一晚的占用明细（本函数只用 minRemain；排查时可从这里拿逐晚数据）
+   */
+  const stock = roomTypeStock(STOCK_DB, hotelId, checkIn, checkOut);
 
-  /* 3. 预订明细占用（权威来源；已转入住的不重复计） */
-  const detailRows = all<{ room_type_id: number; n: number }>(
-    `SELECT br.room_type_id AS room_type_id, COUNT(*) AS n
-       FROM booking_rooms br
-       JOIN bookings b ON b.id = br.booking_id AND b.hotel_id = br.hotel_id
-      WHERE br.hotel_id = ?
-        AND br.stay_id IS NULL
-        AND br.status IN ('PENDING', 'CONFIRMED', 'CHECKED_IN')
-        AND b.status IN ('PENDING', 'CONFIRMED', 'CHECKED_IN')
-        AND br.check_in_date < ? AND br.check_out_date > ?
-      GROUP BY br.room_type_id`,
-    [hotelId, checkOut, checkIn]
-  );
-
-  /* 4. 历史主单兜底（只算没有明细的单，避免与第 3 条重复） */
-  const legacyRows = all<{ room_type_id: number; n: number }>(
-    `SELECT b.room_type_id AS room_type_id, COALESCE(SUM(COALESCE(b.room_count, 1)), 0) AS n
-       FROM bookings b
-      WHERE b.hotel_id = ?
-        AND b.status IN ('PENDING', 'CONFIRMED', 'CHECKED_IN')
-        AND b.check_in_date < ? AND b.check_out_date > ?
-        AND NOT EXISTS (SELECT 1 FROM booking_rooms br2 WHERE br2.booking_id = b.id)
-      GROUP BY b.room_type_id`,
-    [hotelId, checkOut, checkIn]
-  );
-
-  /* 5. 区间房价（房价日历按天配置，缺的日子回落门市价） */
+  /* 3. 区间房价（房价日历按天配置，缺的日子回落门市价） */
   const rateRows =
     nights > 0
       ? all<RateRow>(
@@ -284,13 +267,6 @@ export function loadAvailability(hotelId: number, checkIn: string, checkOut: str
     if (Number.isFinite(price) && price >= 0) rateMap.set(`${r.room_type_id}|${r.date}`, price);
   }
 
-  const occupiedMap = new Map<number, number>();
-  for (const row of [...stayRows, ...detailRows, ...legacyRows]) {
-    const typeId = Number(row.room_type_id ?? 0);
-    if (!typeId) continue;
-    occupiedMap.set(typeId, (occupiedMap.get(typeId) ?? 0) + Number(row.n ?? 0));
-  }
-
   const days = eachDay(checkIn, checkOut);
   const list: RoomTypeAvailability[] = roomTypes.map((rt) => {
     const basePrice = round2(Number(rt.base_price ?? 0));
@@ -299,13 +275,15 @@ export function loadAvailability(hotelId: number, checkIn: string, checkOut: str
     const totalPrice = round2(sum);
     const avgPrice = days.length > 0 ? round2(totalPrice / days.length) : basePrice;
 
-    const totalRooms = Number(rt.total_rooms ?? 0);
-    const maintenanceRooms = Number(rt.ooo_rooms ?? 0);
-    const occupiedRooms = occupiedMap.get(rt.id) ?? 0;
-    const remainingRooms = Math.max(0, totalRooms - occupiedRooms - maintenanceRooms);
+    /*
+     * 可订间数 = 区间内最低的那一晚剩余（roomTypeStock 已按逐晚算好，与 PC 建单同源）。
+     *
+     * 整改 P1-24：cap / 占用 / 维修房数**只在这里参与计算、不进入返回值** ——
+     * 匿名接口不能泄露全店物理房量与经营数据，客人只需要知道「还能订几间」。
+     * minRemain 可能为负（历史超卖数据），对外统一 clamp 到 0。
+     */
+    const remainingRooms = Math.max(0, Number(stock.get(rt.id)?.minRemain ?? 0));
 
-    /* 整改 P1-24：totalRooms / occupiedRooms / maintenanceRooms 只在这里参与计算，
-       不进入返回值（无登录接口不得外泄全店房量与经营数据）。 */
     return {
       roomTypeId: rt.id,
       code: rt.code ?? null,

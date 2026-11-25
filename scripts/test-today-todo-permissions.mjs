@@ -669,10 +669,34 @@ const occupiedBeforeBatch = occupiedDetails(TODAY);
     )?.c ?? 0
   );
   check("★ 批量取消后逾期单在 booking_rooms 里再无有效占房明细", overdueOccupiedAfter === 0, `实际 ${overdueOccupiedAfter}`);
+  /*
+   * ⚠️ 这条不要断言「绝对等于 1」—— 那依赖「今天除了测试造的单，真库里没有别的预订」
+   *
+   * 真库今天有 4 条真实的占房明细，所以 `occupiedDetails(TODAY)` 恒为 4，
+   * 断言 `=== 1` 会一直红；而且这个数字会随演示数据/真实运营变化，
+   * 让测试结果取决于「库里有几张今天的预订」，那是环境依赖，不是代码回归。
+   *
+   * 改成**相对基线**：批量取消前后，今天的占房明细数应该「不变」
+   * （被取消的两张逾期单本来就不覆盖今天，所以取消它们不该影响今天的计数）。
+   * 这才真正检验「批量取消只释放它自己那两张单、没有误伤今天的占房」。
+   */
   check(
-    "★ 今日占房明细只剩今天到店那张有效单（逾期单占用已清零）",
-    occupiedDetails(TODAY) === 1,
-    `${occupiedBeforeBatch} → ${occupiedDetails(TODAY)}`
+    "★ 今日占房明细数不因批量取消逾期单而改变（没有误伤今天的占房）",
+    occupiedDetails(TODAY) === occupiedBeforeBatch,
+    `取消前 ${occupiedBeforeBatch} → 取消后 ${occupiedDetails(TODAY)}`
+  );
+  check(
+    "★ 今天到店那张单自己的明细仍然有效（未被批量取消误伤）",
+    Number(
+      one(
+        `SELECT COUNT(*) AS c FROM booking_rooms br
+          WHERE br.hotel_id = 1 AND br.booking_id = ?
+            AND br.status IN ('PENDING','CONFIRMED')
+            AND br.check_in_date <= ? AND br.check_out_date > ?`,
+        [bkT, TODAY, TODAY]
+      )?.c ?? 0
+    ) >= 1,
+    "该单在今天的占房明细数为 0（被误伤）"
   );
   check("批量取消后今天到店的那张单不受影响（仍是 CONFIRMED）", statusOf(bkT)?.status === "CONFIRMED");
 

@@ -61,11 +61,30 @@ const auditSrc = readFileSync(AUDIT_FILE, "utf8");
 const dashSrc = readFileSync(DASH_FILE, "utf8");
 const roomsSrc = readFileSync(ROOMS_FILE, "utf8");
 
-/** 报表组件正文（「八点五」这节标题 → 下一个节标题「八·二」） */
+/**
+ * 这张报表的全部源码（从「八点五」节标题 → 下一个顶层大节「九、报表分发」）
+ *
+ * ⚠️ 历史上踩过两次锚点坑，都记在这里：
+ *
+ *   1. 原来用「八点五、综合营业日报-房间」→「八·二、未实现报表的占位视图」两段注释做锚点。
+ *      「未实现报表的占位视图」那一节后来被删掉了（10 张占位报表全部实现完毕，
+ *      ReportNotReady 组件也一并删除）→ end 找不到返回 -1 → section 长度 0 →
+ *      21 条静态断言全部误报失败。
+ *
+ *   2. 改成「函数体边界」后又漏了一半：`fix-perf-ui` 为了做「宽区间截断 + 明细折叠」，
+ *      把数据获取从组件里**抽成了三个独立函数**：
+ *        refundRoomDayRows / roomDayFinanceRows / sellableRoomMap
+ *      它们都在组件之前。只切组件函数体会让「退款口径」「OOO/LOCK 扣除」这些 SQL 断言失效。
+ *
+ *   现在按「大节范围」切：起点是这张报表的节注释，终点是下一个顶层大节「九、报表分发」。
+ *   这个范围同时覆盖数据函数 + 组件 + 注释，不受内部函数怎么拆的影响。
+ */
 const section = (() => {
   const start = pageSrc.indexOf("八点五、综合营业日报-房间");
-  const end = pageSrc.indexOf("八·二、未实现报表的占位视图");
-  if (start < 0 || end < 0 || end <= start) return "";
+  if (start < 0) return "";
+  /* 终点：下一个顶层大节。用「九、」而不是「八·二」——后者已经被删了 */
+  const endCandidates = ["九、报表分发", "9、报表分发"].map((m) => pageSrc.indexOf(m, start)).filter((i) => i > start);
+  const end = endCandidates.length > 0 ? Math.min(...endCandidates) : pageSrc.length;
   return pageSrc.slice(start, end);
 })();
 const code = section

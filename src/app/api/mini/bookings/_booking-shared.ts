@@ -13,8 +13,12 @@
  *      否则会出现「详情页显示有房、改单算出来没房」或反过来的两套口径。
  */
 
-import { get } from "@/lib/db";
+import { get, all } from "@/lib/db";
+import { occupiedByNight, physicalCapOfType, type StockDb } from "@/lib/room-stock-nightly";
 import { round2 } from "../_shared";
+
+/** 共享库存 lib 要的只读句柄（lib 不直接 import db，句柄由调用方注入以保证同一连接） */
+const MINI_STOCK_DB: StockDb = { all, get };
 
 /** 订单状态中文名（与 bookings/route.ts 的 STATUS_LABEL 同一份文案） */
 export const MINI_BOOKING_STATUS_LABEL: Record<string, string> = {
@@ -177,58 +181,22 @@ export function remainingRoomsExcludingBooking(
   checkOut: string,
   excludeBookingId: number
 ): number {
-  const head = get<{ total_rooms: number; ooo_rooms: number }>(
-    `SELECT
-       (SELECT COUNT(*) FROM rooms r
-         WHERE r.hotel_id = rt.hotel_id AND r.room_type_id = rt.id) AS total_rooms,
-       (SELECT COUNT(*) FROM rooms r
-         WHERE r.hotel_id = rt.hotel_id AND r.room_type_id = rt.id AND r.status = 'OOO') AS ooo_rooms
-     FROM room_types rt
-    WHERE rt.id = ? AND rt.hotel_id = ?`,
-    [roomTypeId, hotelId]
-  );
-  if (!head) return 0;
-
-  /* 1. 在住占用（同一房型的在住单覆盖目标区间）—— 与自己在住的单不可能同时存在（本单还在 PENDING/CONFIRMED） */
-  const stayRows = get<{ n: number }>(
-    `SELECT COUNT(*) AS n
-       FROM stays s
-       JOIN rooms r ON r.id = s.room_id AND r.hotel_id = s.hotel_id
-      WHERE s.hotel_id = ? AND s.status = 'INHOUSE' AND r.room_type_id = ?
-        AND COALESCE(substr(s.check_in_time, 1, 10), '') < ?
-        AND COALESCE(s.expect_check_out, '') > ?`,
-    [hotelId, roomTypeId, checkOut, checkIn]
-  );
-
-  /* 2. 预订明细占用（权威来源；已转入住的明细不重复计） */
-  const detailRows = get<{ n: number }>(
-    `SELECT COUNT(*) AS n
-       FROM booking_rooms br
-       JOIN bookings b ON b.id = br.booking_id AND b.hotel_id = br.hotel_id
-      WHERE br.hotel_id = ? AND br.room_type_id = ?
-        AND br.stay_id IS NULL
-        AND br.status IN ('PENDING', 'CONFIRMED', 'CHECKED_IN')
-        AND b.status IN ('PENDING', 'CONFIRMED', 'CHECKED_IN')
-        AND br.check_in_date < ? AND br.check_out_date > ?
-        AND b.id <> ?`,
-    [hotelId, roomTypeId, checkOut, checkIn, excludeBookingId]
-  );
-
-  /* 3. 没有明细的历史主单兜底（有明细时以明细为准，避免同一间房算两次） */
-  const legacyRows = get<{ n: number }>(
-    `SELECT COALESCE(SUM(COALESCE(b.room_count, 1)), 0) AS n
-       FROM bookings b
-      WHERE b.hotel_id = ? AND b.room_type_id = ?
-        AND b.status IN ('PENDING', 'CONFIRMED', 'CHECKED_IN')
-        AND b.check_in_date < ? AND b.check_out_date > ?
-        AND b.id <> ?
-        AND NOT EXISTS (SELECT 1 FROM booking_rooms br2 WHERE br2.booking_id = b.id)`,
-    [hotelId, roomTypeId, checkOut, checkIn, excludeBookingId]
-  );
-
-  const totalRooms = Number(head.total_rooms ?? 0);
-  const maintenanceRooms = Number(head.ooo_rooms ?? 0);
-  const occupied =
-    Number(stayRows?.n ?? 0) + Number(detailRows?.n ?? 0) + Number(legacyRows?.n ?? 0);
-  return Math.max(0, totalRooms - occupied - maintenanceRooms);
+  /*
+   * 用共享的「按晚」口径算，只是把本单自己排除掉
+   *
+   * 原来这里自己抄了一份旧实现：total − OOO − 区间重叠计数 —
+   *   · 不扣 LOCK（锁房被算成可售 → 改单能改到锁着的房间上）
+   *   · 按区间重叠而不是按每晚（跨日区间被误拒）
+   * PC 建单和小程序下单都已经改用 `@/lib/room-stock-nightly`，
+   * 这一处是最后一个旧口径，现在一起收编（给 lib 加了 excludeBookingId 参数）。
+   */
+  const cap = physicalCapOfType(MINI_STOCK_DB, hotelId, roomTypeId);
+  if (cap <= 0) return 0;
+  const occ = occupiedByNight(MINI_STOCK_DB, hotelId, roomTypeId, checkIn, checkOut, excludeBookingId);
+  let minRemain = cap;
+  for (const [, used] of occ) {
+    const remain = cap - used;
+    if (remain < minRemain) minRemain = remain;
+  }
+  return Math.max(0, minRemain);
 }
